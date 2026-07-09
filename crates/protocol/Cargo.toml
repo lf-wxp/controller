@@ -4,12 +4,23 @@ description = "Pure protocol layer for the ESP32 game controller — Frame / Com
 authors = ["Francisco Wu <franciscowu@example.com>"]
 license = "MIT"
 readme = "README.md"
+repository = "https://github.com/lf-wxp/controller"
+homepage = "https://github.com/lf-wxp/controller/tree/main/crates/protocol"
+documentation = "https://docs.rs/controller-protocol"
 categories = ["embedded", "no-std", "encoding"]
 keywords = ["esp32", "controller", "protocol", "hmac", "no-std"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 build = "build.rs"
+# 显式列出发布到 crates.io 时打包的文件；避免误把 CI/临时产物带进 crate。
+include = [
+  "src/**/*",
+  "build.rs",
+  "Cargo.toml",
+  "README.md",
+  "USAGE.md",
+]
 
 # ============================================================
 # 依赖
