@@ -1,0 +1,36 @@
+# ============================================================
+# controller-protocol —— .cargo/config.toml
+# ============================================================
+#
+# 覆盖仓库根 `.cargo/config.toml` 的 xtensa-esp32 默认设置：
+# - protocol crate 是纯 no_std Rust，无需 xtensa 特定 target
+# - 关闭 build-std 避免与 host 上系统 std 冲突
+#
+# ## 使用方式
+# 在 `crates/protocol/` 目录下（或用 `-p controller-protocol`）：
+#
+# ```bash
+# # 在本 crate 目录内直接跑（Apple Silicon）：
+# cd crates/protocol && cargo test --target aarch64-apple-darwin -- --test-threads=1
+#
+# # 或（Linux CI）：
+# cd crates/protocol && cargo test --target x86_64-unknown-linux-gnu -- --test-threads=1
+#
+# # 从项目根跑（需要传所有 override）：
+# cargo test -p controller-protocol \
+#   --config 'build.target = "aarch64-apple-darwin"' \
+#   --config 'unstable.build-std = []' \
+#   -- --test-threads=1
+# ```
+#
+# 注意 `--test-threads=1`：SESSION_NONCE 是进程全局状态，宿主机多线程测试
+# 会互相干扰（单元测试之间相互覆盖 nonce）。这不是 protocol crate 的 bug，
+# 而是"全局静态状态 + 多线程测试"的固有约束。
+
+# 覆盖顶层的 rustflags（清空 xtensa 专用参数）
+[build]
+rustflags = []
+
+# 关闭 build-std（顶层的 alloc/core 只针对 xtensa target）
+[unstable]
+build-std = []

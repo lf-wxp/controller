@@ -1,0 +1,5 @@
+[toolchain]
+# Dashboard crate 编译到 WASM，需要 wasm32-unknown-unknown target 与 Leptos 支持
+# 的 stable Rust。Trunk 会调用此工具链构建。
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]

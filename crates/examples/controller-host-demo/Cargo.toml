@@ -1,0 +1,25 @@
+[package]
+name = "controller-host-demo"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+# ============================================================
+# 说明：
+# 本 crate 是 controller-protocol 的**纯 host 侧交互演示**（无 esp-hal 依赖）
+#
+# 用途：
+# - 展示"控制端如何组装 Command / 解析 Response"的完整流程
+# - 作为 `docs/esp_now_controller.md` 中示例代码的**可编译镜像**
+# - 通过 `cargo run --bin controller-host-demo` 立即看到协议在动
+# - 通过 `cargo test` 在 CI 里防止 controller.md 里的示例被 API 变更打破
+#
+# 它**不需要**真机 —— 我们在同一进程里同时扮演"主机"和"手柄"两个角色
+# （手柄侧调用 `decode_command` + `encode_response`），模拟完整的空口交互。
+#
+# target：host（默认，跟 protocol crate 一致，走 aarch64 / x86_64）
+# ============================================================
+
+[dependencies]
+controller-protocol = {path = "../../protocol"}

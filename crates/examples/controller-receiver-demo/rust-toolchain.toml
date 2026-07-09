@@ -1,0 +1,4 @@
+[toolchain]
+# controller-receiver-demo 是 std 环境的普通 binary，用 stable toolchain
+# 覆盖仓库根 rust-toolchain.toml 的 esp channel
+channel = "stable"

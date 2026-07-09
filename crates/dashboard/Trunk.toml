@@ -1,0 +1,19 @@
+[build]
+target = "index.html"
+release = false
+# 输出目录
+dist = "dist"
+
+[watch]
+# 监控源码 + 样式变更
+watch = ["src", "style.css", "index.html"]
+
+[serve]
+address = "127.0.0.1"
+port = 8080
+# WebBluetooth 要求 https 或 localhost；127.0.0.1 视为 localhost ✓
+open = false
+
+[tools]
+# Trunk 会自动下载这些工具（版本兼容 leptos 0.8）
+wasm-bindgen = "0.2.100"

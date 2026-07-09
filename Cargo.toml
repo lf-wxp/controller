@@ -1,3 +1,52 @@
+[workspace]
+# ============================================================
+# Cargo Workspace（controller）
+# ============================================================
+#
+# 采用 "root package + workspace members" 布局：
+# - 根目录 [package] = controller（手柄固件 crate，esp32 xtensa target）
+# - crates/protocol  = controller-protocol（纯协议 crate，no_std，跨 target 复用）
+# - crates/dashboard = controller-dashboard（Leptos WASM 前端调试台）
+# - crates/examples/controller-host-demo = 主机侧协议交互 demo（纯 host target，防止文档腐化）
+# - crates/examples/controller-receiver-demo = 接收端状态帧订阅 demo（纯 host target，防止文档腐化）
+#
+# 之所以采用 "root + members" 而不是纯 virtual workspace：
+# 保留 `cargo build`（在根目录）直接编译手柄二进制的工作流，与
+# `.cargo/config.toml` 的默认 `target = "xtensa-esp32-none-elf"` 兼容。
+# ============================================================
+members = [
+  "crates/protocol",
+  "crates/dashboard",
+  "crates/examples/controller-host-demo",
+  "crates/examples/controller-receiver-demo",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+version = "0.1.0"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+# ============================================================
+# N-4：扩充 clippy 分组（rust-skills lint-deny-correctness / lint-warn-*）
+# ============================================================
+# 各 crate 通过 `[lints] workspace = true` 继承。因每条分组内可能包含个别
+# 项目允许的 lint，采用 `priority = -1` 保留后续 `[lints.clippy.<name>] level`
+# 的覆盖能力。
+[workspace.lints.clippy]
+correctness = {level = "deny", priority = -1}
+suspicious = {level = "warn", priority = -1}
+style = {level = "warn", priority = -1}
+complexity = {level = "warn", priority = -1}
+perf = {level = "warn", priority = -1}
+
+# ============================================================
+# 根 package：手柄固件（原位置保持不变）
+# ============================================================
+
 [package]
 edition = "2024"
 name = "controller"
@@ -17,6 +66,9 @@ name = "hello_test"
 test = false
 
 [dependencies]
+# 协议 crate（在 crates/protocol 中），启用 defmt 集成
+controller-protocol = {path = "crates/protocol", features = ["defmt"]}
+
 esp-hal = {version = "~1.1.0", features = ["defmt", "esp32", "unstable"]}
 
 esp-rtos = {version = "0.3.0", features = [
@@ -45,12 +97,15 @@ rtt-target = {version = "0.6.2", features = ["defmt"]}
 # for more networking protocol support see https://crates.io/crates/edge-net
 bt-hci = "0.8.0"
 embassy-executor = {version = "0.10.0", features = ["defmt"]}
+embassy-futures = "0.1"
+embassy-sync = {version = "0.7", features = ["defmt"]}
 embassy-time = {version = "0.5.0", features = ["defmt"]}
 esp-radio = {version = "0.18.0", features = [
   "ble",
   "coex",
   "defmt",
   "esp-alloc",
+  "esp-now",
   "esp32",
   "unstable",
   "wifi",
@@ -68,10 +123,22 @@ smoltcp = {version = "0.13.0", default-features = false, features = [
   "socket-tcp",
   "socket-udp",
 ]}
-trouble-host = {version = "0.6.0", features = ["gatt"]}
+trouble-host = {version = "0.6.0", features = ["gatt", "derive", "peripheral", "default-packet-pool"]}
 
 critical-section = "1.2.0"
 static_cell = "2.1.1"
+nb = "1.1"
+
+# ---- Persistent Storage (P 选项：NVS 真机落盘) ----
+# 通过 esp-storage 直接读写 flash 分区，不经过 ESP-IDF 的 NVS 库。
+# feature `critical-section` 默认开启，确保擦写期间的中断安全。
+esp-storage = {version = "0.9", features = ["esp32", "defmt"]}
+embedded-storage = "0.3"
+
+# ---- OLED UI ----
+embedded-graphics = "0.8"
+heapless = "0.9"
+ssd1306 = "0.10"
 
 [dev-dependencies]
 embedded-test = {version = "0.7.1", features = [
@@ -81,7 +148,11 @@ embedded-test = {version = "0.7.1", features = [
   "xtensa-semihosting",
 ]}
 
+# ============================================================
+# 优化配置：dev/release 编译剖面
+# ============================================================
 # For fine tuning these settings, please refer to https://doc.rust-lang.org/cargo/reference/profiles.html
+
 [profile.dev]
 # The default debug profile is too slow and too big for resource-constrained devices.
 # Always build with some optimizations enabled.
@@ -90,5 +161,22 @@ opt-level = "s"
 [profile.release]
 codegen-units = 1 # LLVM can perform better optimizations using a single thread
 debug = 2 # prefer slower builds but better debugging experience
-lto = 'fat' 
+lto = 'fat'
 opt-level = 's'
+# 显式声明 panic 策略为 abort（而不是依赖隐式 unwind + panic_rtt_target 触发 abort）：
+# 1. 语义明示：整个手柄固件是 `no_std` embedded target，任何 panic 都无法安全 recover，
+#    直接 abort 比"生成 unwind landing pad 然后被 panic_rtt_target 打印后 abort"更清晰
+# 2. 体积/常量表收益：告诉 rustc "不需要 unwind"后，某些依赖会 elide landing pad 生成
+# 3. 与 [profile.wasm-release] 的 `panic = "abort"` 声明保持一致
+panic = "abort"
+
+# ============================================================
+# Dashboard 专用 release profile（WASM 极致体积优化）
+# ============================================================
+[profile.wasm-release]
+inherits = "release"
+opt-level = 'z'
+lto = 'fat'
+codegen-units = 1
+panic = "abort"
+strip = true

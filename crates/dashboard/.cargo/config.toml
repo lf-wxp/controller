@@ -1,0 +1,27 @@
+# ============================================================
+# controller-dashboard —— .cargo/config.toml
+# ============================================================
+#
+# 覆盖仓库根 `.cargo/config.toml` 的 xtensa-esp32 默认设置：
+# - Dashboard 编译到 wasm32-unknown-unknown（浏览器 WASM）
+# - Trunk（`trunk serve` / `trunk build`）会自动使用此配置
+#
+# ## 使用方式
+# ```bash
+# # 首次：装 trunk（一次性）
+# cargo install trunk
+#
+# # 开发模式（热重载 + 本地服务）
+# cd crates/dashboard && trunk serve --open
+#
+# # 生产构建
+# cd crates/dashboard && trunk build --release
+# ```
+
+[build]
+target = "wasm32-unknown-unknown"
+rustflags = []
+
+# 关闭 build-std（顶层的 alloc/core 只针对 xtensa target）
+[unstable]
+build-std = []

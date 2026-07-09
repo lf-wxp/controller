@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark" />
+
+    <!--
+      ============================================================
+      安全头（Web 侧加固）
+      ============================================================
+      Dashboard 是 WebBluetooth 前端：一旦被 XSS 注入，攻击者可以直接调用
+      `send_command` 向真实手柄下发指令。故即便是纯静态调试台也要收紧 CSP。
+
+      注意：
+      - `<meta http-equiv>` 无法设置 `X-Frame-Options` / `Strict-Transport-Security`
+        等仅响应头合法的字段；若部署到自控 Nginx/CDN，请在服务端补齐。
+      - 若日后引入外部 CDN（字体 / 分析），需在此处对应放开 `script-src` /
+        `style-src` / `font-src` 白名单，而不是回退到 `unsafe-inline`。
+    -->
+
+    <!--
+      CSP（Content Security Policy）：白名单模式
+      - default-src 'none'：显式禁用一切，下面按需 opt-in
+      - script-src 'self' 'wasm-unsafe-eval'：
+          'self' 允许加载 Trunk 打包出的 wasm-bindgen glue.js；
+          'wasm-unsafe-eval' 是 W3C 标准，专门放行 WebAssembly.instantiate()
+          （比历史上的 'unsafe-eval' 更收敛，不会放开 eval() 本身）
+      - style-src 'self'：仅允许外部 style.css，无 'unsafe-inline'
+          之所以能这么严：Leptos 0.8 CSR 模式 + `style:height={...}` 是
+          DOM property 赋值（element.style.height = "..."），不生成 <style>
+          标签也不写 style 属性字符串，不受 CSP style-src 限制
+      - img-src 'self' data:：favicon 使用 data:image/svg+xml URI
+      - connect-src 'none'：dashboard 不发 fetch/XHR/WebSocket；
+          WebBluetooth (navigator.bluetooth.*) 不受 connect-src 管辖
+      - base-uri 'none' + form-action 'none' + frame-ancestors 'none' +
+        object-src 'none'：全部收紧，杜绝 base 劫持 / 表单泄漏 / 嵌入 / 插件
+    -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none';
+               script-src 'self' 'wasm-unsafe-eval';
+               style-src 'self';
+               img-src 'self' data:;
+               connect-src 'none';
+               base-uri 'none';
+               form-action 'none';
+               frame-ancestors 'none';
+               object-src 'none'"
+    />
+
+    <!-- 禁 MIME sniff：防止 wasm/js 被浏览器"猜"成别的类型执行 -->
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+
+    <!-- 不泄漏 Referer（页面内无跨域请求，直接切最严策略） -->
+    <meta name="referrer" content="no-referrer" />
+
+    <title>ESP32 Controller Dashboard</title>
+    <link data-trunk rel="css" href="style.css" />
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🎮%3C/text%3E%3C/svg%3E" />
+  </head>
+  <body>
+    <noscript>
+      <p>本 Dashboard 需要浏览器支持 JavaScript + WebAssembly + WebBluetooth。</p>
+      <p>推荐使用 Chrome 或 Edge 最新版。</p>
+    </noscript>
+  </body>
+</html>

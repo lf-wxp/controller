@@ -1,0 +1,14 @@
+{
+	"rust-analyzer.cargo.allTargets": false,
+	"rust-analyzer.cargo.target": "xtensa-esp32-none-elf",
+	"rust-analyzer.server.extraEnv": {
+		"RUSTUP_TOOLCHAIN": "stable"
+	},
+	"rust-analyzer.cargo.extraEnv": {
+		"RUSTUP_TOOLCHAIN": "esp"
+	},
+	// 显式使用 rustup 装的 rust-analyzer（1.96.1，与 stable cargo 版本对齐）
+	// 避免用 homebrew 装的 dev build（0.0.0），dev build 会调用 esp cargo 里
+	// 不支持的 `--lockfile-path` 参数，产生 WARN 日志和潜在的功能异常。
+	"rust-analyzer.server.path": "~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rust-analyzer"
+}

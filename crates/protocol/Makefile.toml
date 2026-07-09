@@ -1,0 +1,77 @@
+# ============================================================
+# controller-protocol —— cargo-make 子任务定义
+# ============================================================
+#
+# 让你可以直接在 `crates/protocol/` 目录里跑：
+# ```bash
+# cd crates/protocol
+# cargo make check
+# cargo make clippy
+# cargo make test
+# ```
+#
+# 这些任务和顶层 Makefile.toml 里的 protocol-* 任务**逻辑对齐**，
+# 只是省略了 `cwd = "crates/protocol"`（因为已经在子目录里）。
+#
+# 如果只想在顶层跑，可以完全无视本文件，用 `cargo make protocol-*`
+# 语义完全等价。
+
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
+[env]
+HOST_TARGET = "${CARGO_MAKE_RUST_TARGET_TRIPLE}"
+
+[tasks.default]
+description = "打印帮助"
+alias = "help"
+
+[tasks.help]
+description = "列出协议 crate 的可用任务"
+script = '''
+echo ""
+echo "🧬 controller-protocol —— cargo-make 任务"
+echo ""
+echo "  cargo make check     cargo check（host target）"
+echo "  cargo make clippy    cargo clippy 严格模式"
+echo "  cargo make test      单元测试 + proptest（--test-threads=1）"
+echo "  cargo make fmt       自动格式化"
+echo ""
+'''
+
+[tasks.check]
+description = "cargo check（host target）"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}"]
+
+[tasks.clippy]
+description = "cargo clippy 严格模式"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--target", "${HOST_TARGET}", "--", "-D", "warnings"]
+
+[tasks.test]
+description = "单元测试 + proptest（--test-threads=1）"
+toolchain = "stable"
+command = "cargo"
+# SESSION_NONCE 是进程全局静态，多线程测试互相干扰
+args = [
+  "test",
+  "--target", "${HOST_TARGET}",
+  "--",
+  "--test-threads=1",
+]
+
+[tasks.fmt]
+description = "自动格式化"
+toolchain = "stable"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-check]
+description = "格式检查"
+toolchain = "stable"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]

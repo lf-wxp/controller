@@ -1,0 +1,58 @@
+[package]
+name = "controller-protocol"
+description = "Pure protocol layer for the ESP32 game controller — Frame / Command / Response / anti-replay / auth. no_std by default."
+authors = ["Francisco Wu <franciscowu@example.com>"]
+license = "MIT"
+readme = "README.md"
+categories = ["embedded", "no-std", "encoding"]
+keywords = ["esp32", "controller", "protocol", "hmac", "no-std"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+build = "build.rs"
+
+# ============================================================
+# 依赖
+# ============================================================
+# 保持 default-features = false 以兼容 no_std 手柄目标；
+# 需要 std 特性时，dashboard/protocol tests 会通过 `std` feature 打开。
+[dependencies]
+hmac = {version = "0.12", default-features = false}
+sha2 = {version = "0.10", default-features = false}
+# 手柄端启用的可选 defmt 集成
+defmt = {version = "1", optional = true}
+# WASM/Dashboard 端启用的可选 serde（跨语言 JSON 交换）
+serde = {version = "1", default-features = false, features = ["derive"], optional = true}
+
+[dev-dependencies]
+# Z 选项：属性测试（宿主机运行；不进入 esp32/WASM 构建）
+proptest = "1"
+
+# ============================================================
+# Features
+# ============================================================
+# - default: 纯 no_std，无任何跨环境依赖，任意 target 都能编译；
+#            **默认启用 embed-default-secrets** 以便开箱即用（开发/调试场景）
+# - std:    启用 alloc + std 相关 API（proptest 测试自动隐式启用）
+# - defmt:  启用 defmt::Format trait 集成（手柄端专用）
+# - serde:  启用 Serialize/Deserialize（WASM/Dashboard 端专用）
+# - debug-auth-bypass:
+#            **危险**：把 AUTH_ENABLED 编译期设为 false，跳过所有 HMAC 校验；
+#            仅限本地调试构造报文时使用，**生产 build 严禁**开启（CI 应当 assert）
+# - embed-default-secrets:
+#            允许 build.rs 在 CONTROLLER_SECRET_V1/V2 环境变量缺失时使用内置
+#            fallback 弱密钥。**只用于开发/CI 冒烟测试**；生产 build 应关闭此
+#            feature 并通过环境变量注入独立高熵密钥。
+[features]
+default = ["embed-default-secrets"]
+std = []
+defmt = ["dep:defmt"]
+serde = ["dep:serde"]
+debug-auth-bypass = []
+embed-default-secrets = []
+
+# ============================================================
+# Lint 门控（继承 workspace lints）
+# ============================================================
+[lints]
+workspace = true

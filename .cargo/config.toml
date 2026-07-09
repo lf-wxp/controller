@@ -1,10 +1,8 @@
 [target.xtensa-esp32-none-elf]
 runner = "probe-rs run --chip=esp32 --preverify --always-print-stacktrace --no-location"
-
-[env]
-DEFMT_LOG = "info"
-
-[build]
+# 只在 xtensa-esp32 target 下应用这些链接参数：
+# - `-nostartfiles`：ESP32 无标准 C runtime，跳过 crt0
+# - `-Z stack-protector=all`：全栈 canary，esp channel nightly 支持
 rustflags = [
   "-C",
   "link-arg=-nostartfiles",
@@ -12,6 +10,13 @@ rustflags = [
   "stack-protector=all",
 ]
 
+[env]
+DEFMT_LOG = "info"
+
+# 默认 target：手柄固件工作流使用
+# 其它 crate（controller-protocol / controller-dashboard）会通过自己的 .cargo/config.toml
+# 或命令行 --target 参数覆盖。
+[build]
 target = "xtensa-esp32-none-elf"
 
 [unstable]

@@ -1,0 +1,27 @@
+[package]
+name = "controller-receiver-demo"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+# ============================================================
+# 说明：
+# 本 crate 是 controller-protocol 的**纯 host 侧状态帧订阅演示**
+# （无 esp-hal 依赖）
+#
+# 用途：
+# - 展示"接收端如何解码 Frame + 拆解 GamepadState + 检测 seq gap"
+# - 作为 `docs/esp_now_receiver.md` 中示例代码的**可编译镜像**
+# - 通过 `cargo run --bin controller-receiver-demo` 立即看到帧在流动
+# - 通过 `cargo test` 在 CI 里防止 receiver.md 里的示例被 API 变更打破
+#
+# 它**不需要**真机 —— 我们在同一进程里同时扮演"发送手柄"和"接收端"
+# 两个角色（发送侧调用 `encode_frame`，接收侧调用 `decode_frame`），
+# 完整模拟空口交互。
+#
+# target：host（默认，跟 protocol crate 一致，走 aarch64 / x86_64）
+# ============================================================
+
+[dependencies]
+controller-protocol = {path = "../../protocol"}

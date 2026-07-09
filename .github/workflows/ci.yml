@@ -1,0 +1,201 @@
+# ============================================================
+# CI workflow —— cargo-make 驱动
+# ============================================================
+#
+# 本项目通过 cargo-make 统一管理构建流程。CI 与本地开发**跑完全一样的命令**：
+#
+# ```bash
+# # 本地
+# cargo make ci
+#
+# # CI（本文件）
+# cargo make ci
+# ```
+#
+# 所有任务定义在项目根 [Makefile.toml](../../Makefile.toml)。
+
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  # 每周一 03:00 UTC 定时扫描依赖漏洞（audit job 使用），无 push 也能感知新披露漏洞
+  schedule:
+    - cron: "0 3 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: cargo make ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # Toolchain 安装
+      # --------------------------------------------------------
+      # 1. esp fork xtensa toolchain（手柄固件用）
+      - name: Install esp-rs xtensa toolchain
+        uses: esp-rs/xtensa-toolchain@v1.6
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: false
+
+      # 2. stable Rust + wasm32 target（protocol / dashboard 用）
+      - name: Install stable Rust + wasm32 target + rustfmt + clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+
+      # --------------------------------------------------------
+      # Cache
+      # --------------------------------------------------------
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-ci
+          cache-on-failure: true
+          # 缓存全部 workspace（root + protocol + dashboard）
+          workspaces: |
+            .
+            crates/protocol
+            crates/dashboard
+
+      # --------------------------------------------------------
+      # cargo-make 安装
+      # --------------------------------------------------------
+      - name: Install cargo-make
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-make
+
+      # --------------------------------------------------------
+      # 一键跑完整 CI
+      # --------------------------------------------------------
+      # cargo make ci 会依次执行：
+      #   fmt-check → 三 crate check → 三 crate clippy → tests-check → protocol proptest
+      - name: cargo make ci
+        run: cargo make ci
+
+  # ============================================================
+  # release-check：生产 build 门禁
+  # ============================================================
+  # 目的：验证 protocol crate 关闭 `embed-default-secrets` 与
+  # `debug-auth-bypass` 双 feature 时，配合仓库 Secret 注入的真实密钥仍能编译。
+  #
+  # 密钥要求：
+  #   - 仓库 Settings → Secrets → Actions 里添加 CONTROLLER_SECRET_V1、
+  #     CONTROLLER_SECRET_V2，都是 32 字节高熵字符串
+  #   - 未配置时该 job 直接 skip（不阻塞 fork PR）
+  #
+  # 与主 `ci` job 并行执行，加密钥变更时能立刻发现兼容性回归。
+  release-check:
+    name: cargo make ci-release (production build gate)
+    runs-on: ubuntu-latest
+    # fork PR 无法读取 Secret；缺失时 skip 而不是失败
+    if: >-
+      github.event_name == 'push' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-check
+          cache-on-failure: true
+          workspaces: |
+            crates/protocol
+
+      - name: Install cargo-make
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-make
+
+      # 缺失 Secret 时给出**清晰的失败原因**（比 build.rs 里的 panic 更靠前，
+      # 也不至于泄漏 build.rs 的错误消息里被误当成正常输出的密钥格式）
+      - name: Assert release secrets are present
+        env:
+          CONTROLLER_SECRET_V1: ${{ secrets.CONTROLLER_SECRET_V1 }}
+          CONTROLLER_SECRET_V2: ${{ secrets.CONTROLLER_SECRET_V2 }}
+        run: |
+          if [[ -z "$CONTROLLER_SECRET_V1" || -z "$CONTROLLER_SECRET_V2" ]]; then
+            echo "::error::CONTROLLER_SECRET_V1/V2 secrets must be configured in repo settings" >&2
+            exit 1
+          fi
+          if [[ ${#CONTROLLER_SECRET_V1} -ne 32 || ${#CONTROLLER_SECRET_V2} -ne 32 ]]; then
+            echo "::error::CONTROLLER_SECRET_V1/V2 must be exactly 32 bytes" >&2
+            exit 1
+          fi
+
+      - name: protocol production build (--no-default-features)
+        env:
+          CONTROLLER_SECRET_V1: ${{ secrets.CONTROLLER_SECRET_V1 }}
+          CONTROLLER_SECRET_V2: ${{ secrets.CONTROLLER_SECRET_V2 }}
+        run: cargo make protocol-production-check
+
+      # 双保险：显式扫 Cargo.lock，确保发布产物不依赖两个 dev-only feature
+      - name: Assert no debug features leak into release
+        run: |
+          set -e
+          for feat in debug-auth-bypass; do
+            if grep -q "\"${feat}\"" Cargo.lock; then
+              echo "::error::Feature '${feat}' must not appear in Cargo.lock for release builds" >&2
+              exit 1
+            fi
+          done
+          echo "OK: no debug features leaked into Cargo.lock"
+
+  # ============================================================
+  # audit：RustSec 依赖漏洞扫描
+  # ============================================================
+  # 目的：周期性扫描依赖树是否引入了 RustSec Advisory DB 里已知的漏洞版本。
+  # 网络栈（smoltcp / embassy-net）、BLE 栈（trouble-host / bt-hci）、
+  # WASM 侧（wasm-bindgen / js-sys）都是漏洞高发区，值得单独门禁。
+  #
+  # 行为策略：
+  # - `push` / 内部 PR：发现漏洞 → fail（阻止合入）
+  # - `schedule`（每周一次）：发现漏洞 → fail 并通过 GitHub Issue 通知
+  # - `pull_request from fork`：跳过（fork 无法读到写入 Issue 的 token）
+  #
+  # 与 `ci` job 并行执行；不依赖 esp-rs toolchain，跑 stable 即可（cargo-audit
+  # 只解析 Cargo.lock，不需要真的编译目标平台）。
+  audit:
+    name: cargo audit (RustSec advisory scan)
+    runs-on: ubuntu-latest
+    # fork PR 缺少写 Issue 的权限，只在推送 / 内部 PR / 定时任务里跑
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'schedule' ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      # audit-check 会在发现漏洞时创建 GitHub Issue，需要 issues:write
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: RustSec advisory scan
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

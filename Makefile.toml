@@ -1,0 +1,518 @@
+# ============================================================
+# controller —— cargo-make 顶层任务编排（Makefile.toml）
+# ============================================================
+#
+# 本文件是 workspace 级的构建统一入口。安装 `cargo-make` 之后，所有
+# 常用构建/测试/CI 流程都通过 `cargo make <task>` 调用，屏蔽三个 crate
+# 各自不同的 target / toolchain / 参数。
+#
+# ## 首次安装
+# ```bash
+# cargo install cargo-make
+# ```
+#
+# ## 常用任务
+# ```bash
+# cargo make quick             # 快速本地校验（controller check + clippy）
+# cargo make check-all         # 三 crate 全部 cargo check
+# cargo make clippy-all        # 三 crate 全部 cargo clippy 严格模式
+# cargo make test              # 协议 crate 单元测试 + proptest（host target）
+# cargo make ci                # 完整 CI 流程（本地跑通 = CI 跑通）
+#
+# cargo make controller-build  # 手柄固件构建
+# cargo make controller-run    # 烧录 + probe-rs 实时日志
+# cargo make dashboard-serve   # Dashboard 开发服务器（trunk serve --open）
+# cargo make dashboard-build   # Dashboard 生产构建（trunk build --release）
+# ```
+#
+# ## 查看所有任务
+# ```bash
+# cargo make --list-all-steps
+# ```
+
+# ============================================================
+# 全局配置
+# ============================================================
+[config]
+# 关闭 cargo-make 内置的默认任务（audit / outdated / build-doc 等），
+# 我们完全自主定义任务集，避免污染 --list-all-steps 输出
+skip_core_tasks = true
+# 不自动在 workspace 成员上传播根任务 —— 我们的三个 crate 有不同
+# target/toolchain，必须显式管理，不能"一键 cargo build 广播"
+default_to_workspace = false
+# 关闭在每个任务前打印时间戳（保持输出干净）
+reduce_output = false
+
+[env]
+# Host target —— 供协议 crate 单元测试指定
+# Apple Silicon = aarch64-apple-darwin
+# Intel Mac    = x86_64-apple-darwin
+# Linux        = x86_64-unknown-linux-gnu
+# 使用 cargo-make 内置变量自动检测
+HOST_TARGET = "${CARGO_MAKE_RUST_TARGET_TRIPLE}"
+
+# ============================================================
+# 默认任务（cargo make 无参数）
+# ============================================================
+[tasks.default]
+description = "打印帮助信息（列出所有任务）"
+category = "General"
+alias = "help"
+
+[tasks.help]
+description = "列出所有可用任务及说明"
+category = "General"
+script = '''
+echo ""
+echo "🎮 controller —— cargo-make 任务列表"
+echo ""
+echo "常用："
+echo "  cargo make quick             快速本地校验（手柄 check + clippy）"
+echo "  cargo make ci                完整 CI 流程（三 crate 全部检查）"
+echo ""
+echo "手柄固件（controller / xtensa-esp32）："
+echo "  cargo make controller-check"
+echo "  cargo make controller-clippy"
+echo "  cargo make controller-build"
+echo "  cargo make controller-run    烧录 + probe-rs 日志"
+echo ""
+echo "协议 crate（controller-protocol / host）："
+echo "  cargo make protocol-check"
+echo "  cargo make protocol-clippy"
+echo "  cargo make protocol-test     单元测试 + proptest"
+echo ""
+echo "Dashboard（controller-dashboard / wasm32）："
+echo "  cargo make dashboard-check"
+echo "  cargo make dashboard-clippy"
+echo "  cargo make dashboard-serve   trunk serve --open"
+echo "  cargo make dashboard-build   trunk build --release"
+echo ""
+echo "格式化："
+echo "  cargo make fmt               自动格式化"
+echo "  cargo make fmt-check         格式检查（CI 使用）"
+echo ""
+echo "聚合："
+echo "  cargo make check-all         三 crate check"
+echo "  cargo make clippy-all        三 crate clippy"
+echo ""
+echo "更多任务见 cargo make --list-all-steps"
+echo ""
+'''
+
+# ============================================================
+# 手柄固件（controller，xtensa-esp32-none-elf）
+# ============================================================
+# 顶层 .cargo/config.toml 已配置 target = "xtensa-esp32-none-elf"
+# 所以在项目根直接 cargo <cmd> 就会自动用 xtensa target + esp fork toolchain
+
+[tasks.controller-check]
+description = "手柄固件 cargo check（xtensa-esp32-none-elf）"
+category = "Controller"
+command = "cargo"
+args = ["check", "--lib", "--bins"]
+
+[tasks.controller-clippy]
+description = "手柄固件 cargo clippy 严格模式"
+category = "Controller"
+command = "cargo"
+args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
+
+[tasks.controller-build]
+description = "手柄固件 cargo build（release 需加 --release）"
+category = "Controller"
+command = "cargo"
+args = ["build", "--bin", "controller"]
+
+[tasks.controller-build-release]
+description = "手柄固件 release 构建（LTO + opt-level=s）"
+category = "Controller"
+command = "cargo"
+args = ["build", "--bin", "controller", "--release"]
+
+[tasks.controller-run]
+description = "烧录并启动 probe-rs 实时日志"
+category = "Controller"
+command = "cargo"
+args = ["run", "--bin", "controller"]
+
+[tasks.controller-test-check]
+description = "手柄 embedded-test harness 静态检查（不真机运行）"
+category = "Controller"
+command = "cargo"
+args = ["check", "--tests"]
+
+# ============================================================
+# 协议 crate（controller-protocol，host target）
+# ============================================================
+# 子目录内有独立的 .cargo/config.toml 覆盖 xtensa 默认设置
+# 通过 cwd 切换到子目录执行，让子目录 config 自动生效
+
+[tasks.protocol-check]
+description = "协议 crate cargo check（host target）"
+category = "Protocol"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}"]
+cwd = "crates/protocol"
+
+[tasks.protocol-clippy]
+description = "协议 crate cargo clippy 严格模式（host target）"
+category = "Protocol"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--target", "${HOST_TARGET}", "--", "-D", "warnings"]
+cwd = "crates/protocol"
+
+[tasks.protocol-test]
+description = "协议 crate 单元测试 + proptest（host target，单线程）"
+category = "Protocol"
+toolchain = "stable"
+command = "cargo"
+# --test-threads=1：SESSION_NONCE 是进程全局静态，多线程互相干扰
+args = [
+  "test",
+  "--target", "${HOST_TARGET}",
+  "--",
+  "--test-threads=1",
+]
+cwd = "crates/protocol"
+
+# ------------------------------------------------------------
+# 生产 build 门禁（release production check）
+# ------------------------------------------------------------
+# **目的**：验证 protocol crate 在关闭 `embed-default-secrets` +
+# `debug-auth-bypass` 双 feature 时，配合环境变量注入的真实密钥仍能编译。
+#
+# 触发时机：
+#   - 本地：`cargo make protocol-production-check`（先 export 环境变量）
+#   - CI：`.github/workflows/ci.yml` 里 release job 会在 secrets 就位后运行
+#
+# 环境变量要求（缺失即编译失败，符合预期）：
+#   CONTROLLER_SECRET_V1 = 32 字节高熵字符串
+#   CONTROLLER_SECRET_V2 = 32 字节高熵字符串
+[tasks.protocol-production-check]
+description = "protocol crate 生产 build 门禁（禁用弱密钥 fallback + 认证后门）"
+category = "Protocol"
+toolchain = "stable"
+command = "cargo"
+args = [
+  "check",
+  "--target", "${HOST_TARGET}",
+  "--no-default-features",
+  # 允许 std / defmt / serde 由调用方按需再加 --features，但**绝不**允许
+  # embed-default-secrets 与 debug-auth-bypass 进入 release 产物。
+]
+cwd = "crates/protocol"
+
+# 快捷别名
+[tasks.test]
+description = "协议单元测试 + proptest（cargo make protocol-test 别名）"
+category = "Protocol"
+alias = "protocol-test"
+
+# ============================================================
+# Dashboard（controller-dashboard，wasm32-unknown-unknown）
+# ============================================================
+# 子目录内有独立的 .cargo/config.toml 已设置 target = "wasm32-unknown-unknown"
+# 无需再显式传 --target
+
+[tasks.dashboard-check]
+description = "Dashboard cargo check（wasm32-unknown-unknown）"
+category = "Dashboard"
+toolchain = "stable"
+command = "cargo"
+args = ["check"]
+cwd = "crates/dashboard"
+
+[tasks.dashboard-clippy]
+description = "Dashboard cargo clippy 严格模式"
+category = "Dashboard"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--bin", "controller-dashboard", "--", "-D", "warnings"]
+cwd = "crates/dashboard"
+
+[tasks.dashboard-serve]
+description = "Dashboard 开发服务器（trunk serve --open，热重载）"
+category = "Dashboard"
+# 若未装 trunk 会自动 cargo install
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["serve", "--open"]
+cwd = "crates/dashboard"
+
+[tasks.dashboard-build]
+description = "Dashboard 生产构建（wasm-opt + LTO，输出 dist/）"
+category = "Dashboard"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["build", "--release"]
+cwd = "crates/dashboard"
+
+[tasks.dashboard-clean]
+description = "清理 Dashboard 产物目录 dist/"
+category = "Dashboard"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["clean"]
+cwd = "crates/dashboard"
+
+# ============================================================
+# Examples（仅 host target，作为文档可编译镜像）
+# ============================================================
+#
+# `controller-host-demo`：主机侧协议交互完整演示，无需真机。
+# 作为 docs/esp_now_controller.md 示例代码的可编译镜像，CI 自动验证防文档腐化。
+
+[tasks.example-host-demo-check]
+description = "controller-host-demo 类型检查（host target）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/controller-host-demo"
+
+[tasks.example-host-demo-clippy]
+description = "controller-host-demo cargo clippy 严格模式"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--target", "${HOST_TARGET}", "--", "-D", "warnings"]
+cwd = "crates/examples/controller-host-demo"
+
+[tasks.example-host-demo-test]
+description = "controller-host-demo 单元测试"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["test", "--target", "${HOST_TARGET}", "--", "--test-threads=1"]
+cwd = "crates/examples/controller-host-demo"
+
+[tasks.example-host-demo]
+description = "运行 controller-host-demo（完整協议交互演示）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["run", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/controller-host-demo"
+
+# ------------------------------------------------------------
+# controller-receiver-demo：接收端状态帧订阅演示，无需真机。
+# 作为 docs/esp_now_receiver.md 示例代码的可编译镜像，CI 自动验证防文档腐化。
+
+[tasks.example-receiver-demo-check]
+description = "controller-receiver-demo 类型检查（host target）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/controller-receiver-demo"
+
+[tasks.example-receiver-demo-clippy]
+description = "controller-receiver-demo cargo clippy 严格模式"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--target", "${HOST_TARGET}", "--", "-D", "warnings"]
+cwd = "crates/examples/controller-receiver-demo"
+
+[tasks.example-receiver-demo-test]
+description = "controller-receiver-demo 单元测试"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["test", "--target", "${HOST_TARGET}", "--", "--test-threads=1"]
+cwd = "crates/examples/controller-receiver-demo"
+
+[tasks.example-receiver-demo]
+description = "运行 controller-receiver-demo（状态帧订阅演示）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["run", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/controller-receiver-demo"
+
+# ============================================================
+# 格式化（三 crate 共用 rustfmt.toml）
+# ============================================================
+
+[tasks.fmt]
+description = "自动格式化全部 crate 源码"
+category = "Format"
+dependencies = [
+  "fmt-controller",
+  "fmt-protocol",
+  "fmt-dashboard",
+  "fmt-example-host-demo",
+  "fmt-example-receiver-demo",
+]
+
+[tasks.fmt-controller]
+description = "格式化手柄固件源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-protocol]
+description = "格式化协议 crate 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/protocol"
+
+[tasks.fmt-dashboard]
+description = "格式化 Dashboard 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/dashboard"
+
+[tasks.fmt-example-host-demo]
+description = "格式化 controller-host-demo 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/examples/controller-host-demo"
+
+[tasks.fmt-example-receiver-demo]
+description = "格式化 controller-receiver-demo 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/examples/controller-receiver-demo"
+
+[tasks.fmt-check]
+description = "格式检查（不修改文件，CI 使用）"
+category = "Format"
+dependencies = [
+  "fmt-check-controller",
+  "fmt-check-protocol",
+  "fmt-check-dashboard",
+  "fmt-check-example-host-demo",
+  "fmt-check-example-receiver-demo",
+]
+
+[tasks.fmt-check-controller]
+description = "手柄固件 fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+[tasks.fmt-check-protocol]
+description = "协议 crate fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/protocol"
+
+[tasks.fmt-check-dashboard]
+description = "Dashboard fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/dashboard"
+
+[tasks.fmt-check-example-host-demo]
+description = "controller-host-demo fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/examples/controller-host-demo"
+
+[tasks.fmt-check-example-receiver-demo]
+description = "controller-receiver-demo fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/examples/controller-receiver-demo"
+
+# ============================================================
+# 聚合任务
+# ============================================================
+
+[tasks.check-all]
+description = "全部 crate cargo check"
+category = "Aggregate"
+dependencies = [
+  "controller-check",
+  "protocol-check",
+  "dashboard-check",
+  "example-host-demo-check",
+  "example-receiver-demo-check",
+]
+
+[tasks.clippy-all]
+description = "全部 crate cargo clippy 严格模式"
+category = "Aggregate"
+dependencies = [
+  "controller-clippy",
+  "protocol-clippy",
+  "dashboard-clippy",
+  "example-host-demo-clippy",
+  "example-receiver-demo-clippy",
+]
+
+[tasks.quick]
+description = "快速本地校验（手柄 check + clippy，30 秒内）"
+category = "Aggregate"
+dependencies = ["controller-check", "controller-clippy"]
+
+[tasks.ci]
+description = "完整 CI 流程 —— 与 .github/workflows/ci.yml 逻辑对齐"
+category = "Aggregate"
+dependencies = [
+  # 1. 格式先行（避免因为格式问题后续 clippy 报噪音）
+  "fmt-check",
+  # 2. 全部 crate check
+  "controller-check",
+  "protocol-check",
+  "dashboard-check",
+  "example-host-demo-check",
+  "example-receiver-demo-check",
+  # 3. 全部 crate clippy 严格模式
+  "controller-clippy",
+  "protocol-clippy",
+  "dashboard-clippy",
+  "example-host-demo-clippy",
+  "example-receiver-demo-clippy",
+  # 4. 手柄 tests harness 静态检查
+  "controller-test-check",
+  # 5. 协议 crate 单元测试 + proptest
+  "protocol-test",
+  # 6. Example 单元测试（防止 controller.md / receiver.md 示例代码腐化）
+  "example-host-demo-test",
+  "example-receiver-demo-test",
+]
+
+# ------------------------------------------------------------
+# 生产 CI：release-ready 门禁（在标准 ci 基础上追加）
+# ------------------------------------------------------------
+# 相对 `cargo make ci`：多跑一次 protocol crate 的生产 build 门禁，
+# 验证真实密钥能编译、弱密钥 fallback 已被关闭。
+#
+# 使用：
+# ```bash
+# CONTROLLER_SECRET_V1=<32B> CONTROLLER_SECRET_V2=<32B> cargo make ci-release
+# ```
+[tasks.ci-release]
+description = "生产 CI 流程（在 `ci` 基础上追加 protocol 生产 build 门禁）"
+category = "Aggregate"
+dependencies = [
+  "ci",
+  "protocol-production-check",
+]
+
+# ============================================================
+# 清理
+# ============================================================
+
+[tasks.clean]
+description = "清理所有构建产物（target/ + dashboard/dist/）"
+category = "Clean"
+dependencies = ["clean-workspace", "dashboard-clean"]
+
+[tasks.clean-workspace]
+description = "清理 cargo target 目录"
+category = "Clean"
+command = "cargo"
+args = ["clean"]

@@ -1,0 +1,77 @@
+# ============================================================
+# controller-dashboard —— cargo-make 子任务定义
+# ============================================================
+#
+# 让你可以直接在 `crates/dashboard/` 目录里跑：
+# ```bash
+# cd crates/dashboard
+# cargo make serve         # trunk serve --open
+# cargo make build         # trunk build --release
+# ```
+#
+# 这些任务和顶层 Makefile.toml 里的 dashboard-* 任务**逻辑对齐**。
+
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
+[tasks.default]
+description = "打印帮助"
+alias = "help"
+
+[tasks.help]
+description = "列出 Dashboard 的可用任务"
+script = '''
+echo ""
+echo "🎨 controller-dashboard —— cargo-make 任务"
+echo ""
+echo "  cargo make check     cargo check（wasm32）"
+echo "  cargo make clippy    cargo clippy 严格模式"
+echo "  cargo make serve     开发服务器（trunk serve --open）"
+echo "  cargo make build     生产构建（trunk build --release）"
+echo "  cargo make fmt       自动格式化"
+echo "  cargo make clean     清理 dist/"
+echo ""
+'''
+
+[tasks.check]
+description = "cargo check（wasm32-unknown-unknown）"
+toolchain = "stable"
+command = "cargo"
+args = ["check"]
+
+[tasks.clippy]
+description = "cargo clippy 严格模式"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--bin", "controller-dashboard", "--", "-D", "warnings"]
+
+[tasks.serve]
+description = "开发服务器（trunk serve --open）"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["serve", "--open"]
+
+[tasks.build]
+description = "生产构建（trunk build --release，wasm-opt + LTO）"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["build", "--release"]
+
+[tasks.clean]
+description = "清理 dist/ 目录"
+install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
+command = "trunk"
+args = ["clean"]
+
+[tasks.fmt]
+description = "自动格式化"
+toolchain = "stable"
+command = "cargo"
+args = ["fmt", "--all"]
+
+[tasks.fmt-check]
+description = "格式检查"
+toolchain = "stable"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
