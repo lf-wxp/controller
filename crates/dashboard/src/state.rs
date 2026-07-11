@@ -122,12 +122,12 @@ impl ConnState {
     }
   }
 
-  /// 用于状态点的 CSS class
-  pub const fn dot_class(self) -> &'static str {
+  /// 用于状态药丸（连接状态区）的 CSS class
+  pub const fn css_state(self) -> &'static str {
     match self {
-      Self::Disconnected => "dot-off",
-      Self::Connecting => "dot-warn",
-      Self::Connected => "dot-ok",
+      Self::Disconnected => "conn-off",
+      Self::Connecting => "conn-connecting",
+      Self::Connected => "conn-on",
     }
   }
 }
@@ -156,6 +156,8 @@ pub struct AppState {
   pub last_response: RwSignal<Option<(u32, ResponseBody)>>,
   /// 事件日志（环形缓冲，最新在末尾）
   pub events: RwSignal<VecDeque<EventEntry>>,
+  /// 已发现的接收方目录（由 `AnnounceReply` 经 BLE 转发上报后填充）
+  pub receivers: RwSignal<Vec<PeerInfo>>,
 }
 
 impl AppState {
@@ -171,6 +173,7 @@ impl AppState {
       tx_counter: RwSignal::new(0),
       last_response: RwSignal::new(None),
       events: RwSignal::new(VecDeque::with_capacity(EVENT_LOG_MAX_LEN)),
+      receivers: RwSignal::new(Vec::with_capacity(MAX_PEERS)),
     };
     state.push_event(EventEntry::info("Dashboard 已启动，等待连接手柄"));
     state
@@ -219,5 +222,111 @@ pub const fn error_code_label(code: ErrorCode) -> &'static str {
     ErrorCode::InvalidArgument => "参数不合法",
     ErrorCode::Unsupported => "命令暂不支持",
     ErrorCode::Busy => "内部忙",
+  }
+}
+
+// ============================================================
+// 接收方目录（Receiver Registry）
+// ============================================================
+
+/// 支持的最大接收方数量（对应协议 `dest_mask: u32` 的 32 个 bit）
+pub const MAX_PEERS: usize = 32;
+
+/// role_tag 定长字节数（对应协议 AnnounceReply payload 里的 `role_tag: [u8; 3]`）
+pub const ROLE_TAG_LEN: usize = 3;
+
+/// MAC-48 长度
+pub const MAC_LEN: usize = 6;
+
+/// 未知 RSSI 的哨兵值（渲染时判定为"未知"跳过）。
+///
+/// 与协议侧 `AnnounceReply.rssi_dbm` 的未知约定保持一致：协议文档
+/// （`crates/protocol/src/response.rs`）规定 `-127` 表示未知。
+pub const RSSI_UNKNOWN: i8 = -127;
+
+/// 一个已发现接收方的展示信息
+///
+/// 字段刻意与控制器侧 `peer_registry::PeerInfo` 保持一致（单一真相来源），
+/// 便于两边语义对齐：`receiver_id` 自动分配（0..32），`role` 为定长 3 字节
+/// ASCII（不足右侧补 `\0`），UI 显示时用 [`Self::role_str`] 去尾零。
+///
+/// 注意：不含 `Eq`——`last_seen_ms: f64` 不实现 `Eq`（仅 `PartialEq`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PeerInfo {
+  /// 逻辑接收器 ID（0..32）；用于 `dest_mask` 位映射
+  pub receiver_id: u8,
+  /// MAC-48
+  pub mac: [u8; MAC_LEN],
+  /// 展示用的角色标签（ASCII 3 字节；'\0' 填充未使用位）
+  pub role: [u8; ROLE_TAG_LEN],
+  /// 最近一次接收到的信号强度（dBm，负数）；[`RSSI_UNKNOWN`] 表示未知
+  pub rssi_dbm: i8,
+  /// 最近一次收到该 peer 消息的时间戳（`performance.now()` 起点，毫秒）
+  pub last_seen_ms: f64,
+}
+
+impl PeerInfo {
+  /// 借用有效的 role 字节切片（去掉尾部的 `\0` 填充）
+  pub fn role_bytes(&self) -> &[u8] {
+    let end = self
+      .role
+      .iter()
+      .position(|&b| b == 0)
+      .unwrap_or(ROLE_TAG_LEN);
+    &self.role[..end]
+  }
+
+  /// role 的 UTF-8 字符串视图（用于 UI 渲染）
+  pub fn role_str(&self) -> &str {
+    core::str::from_utf8(self.role_bytes()).unwrap_or("???")
+  }
+
+  /// MAC 的 `aa:bb:cc:dd:ee:ff` 表示
+  pub fn mac_str(&self) -> String {
+    self
+      .mac
+      .iter()
+      .map(|b| format!("{b:02x}"))
+      .collect::<Vec<_>>()
+      .join(":")
+  }
+}
+
+impl AppState {
+  /// 把一个接收方的 `AnnounceReply` 记入 receivers 目录
+  ///
+  /// 与控制器 `peer_registry::upsert` 语义对齐：MAC 已存在则只更新
+  /// `role`/`rssi`/`last_seen`；否则分配一个最低的空闲 `receiver_id` 后插入。
+  pub fn upsert_receiver(&self, mac: [u8; MAC_LEN], role: [u8; ROLE_TAG_LEN], rssi_dbm: i8) {
+    // `rssi_dbm` 直接来自协议解码（负数），无需调用方合成未知值：协议侧约定
+    // `-127` 表示未知（见 [`RSSI_UNKNOWN`]），会原样透传而来，切勿传 0。
+    let now = now_ms();
+    self.receivers.update(|list| {
+      // 已存在：只更新可变字段
+      if let Some(peer) = list.iter_mut().find(|p| p.mac == mac) {
+        peer.role = role;
+        peer.rssi_dbm = rssi_dbm;
+        peer.last_seen_ms = now;
+        return;
+      }
+      // 新 MAC：分配一个最低的空闲 id（trailing_ones 给出最低的 0 位位置）
+      let used_mask: u32 = list
+        .iter()
+        .filter(|p| p.receiver_id < 32)
+        .fold(0u32, |mask, p| mask | (1u32 << p.receiver_id));
+      let free_bit = used_mask.trailing_ones();
+      if free_bit >= 32 {
+        return; // 32 个 slot 已满：静默丢弃（只读面板不持久化，可接受）
+      }
+      list.push(PeerInfo {
+        receiver_id: free_bit as u8,
+        mac,
+        role,
+        rssi_dbm,
+        last_seen_ms: now,
+      });
+      // 按 receiver_id 升序排列，与控制器 peer_registry 行为对齐（稳定 UI 显示顺序）
+      list.sort_by_key(|p| p.receiver_id);
+    });
   }
 }

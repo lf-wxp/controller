@@ -9,7 +9,7 @@ use leptos::prelude::*;
 use crate::bluetooth::StoredHandles;
 use crate::components::{
   command_panel::CommandPanel, event_log::EventLog, gamepad_visual::GamepadVisual,
-  status_panel::StatusPanel,
+  receiver_panel::ReceiverPanel, status_panel::StatusPanel,
 };
 use crate::state::AppState;
 
@@ -35,6 +35,7 @@ pub fn App() -> impl IntoView {
       <main class="app-main">
         <GamepadVisual />
         <CommandPanel handles />
+        <ReceiverPanel />
         <EventLog />
       </main>
 

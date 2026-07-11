@@ -235,6 +235,9 @@ cwd = "crates/dashboard"
 [tasks.dashboard-serve]
 description = "Dashboard 开发服务器（trunk serve --open，热重载）"
 category = "Dashboard"
+# 覆盖根目录 rust-toolchain.toml（esp）为 stable，否则 trunk 子进程会沿用 esp
+# 工具链，而 esp 未安装 wasm32-unknown-unknown 的预编译 std，导致编译失败。
+toolchain = "stable"
 # 若未装 trunk 会自动 cargo install
 install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
 command = "trunk"
@@ -244,6 +247,9 @@ cwd = "crates/dashboard"
 [tasks.dashboard-build]
 description = "Dashboard 生产构建（wasm-opt + LTO，输出 dist/）"
 category = "Dashboard"
+# 覆盖根目录 rust-toolchain.toml（esp）为 stable，否则 trunk 子进程会沿用 esp
+# 工具链，而 esp 未安装 wasm32-unknown-unknown 的预编译 std，导致编译失败。
+toolchain = "stable"
 install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
 command = "trunk"
 args = ["build", "--release"]

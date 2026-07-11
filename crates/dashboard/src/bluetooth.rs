@@ -458,7 +458,11 @@ async fn subscribe_response(
             rssi_dbm,
             role_tag,
           } => {
-            // dashboard 只作展示：把 MAC / RSSI / role 拼成一行事件
+            // 落进 receivers 目录（自动分配 id；字段对齐控制器 peer_registry）
+            // mac / role_tag 已是定长数组引用（&[u8; N]），直接解引用拷贝即可
+            state.upsert_receiver(*mac, *role_tag, *rssi_dbm);
+
+            // 同时保留一行可读事件日志
             let role_str = core::str::from_utf8(role_tag).unwrap_or("???");
             format!(
               "AnnounceReply mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}dBm role={}",
