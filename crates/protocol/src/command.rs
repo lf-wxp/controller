@@ -1,28 +1,19 @@
-//! # Control Command 协议 v4（Host → 手柄，反向通道）
+//! # Control Command 协议（Host → 手柄，反向通道）
 //!
-//! ## 帧格式（固定 20 字节，v4 含 HMAC 认证 + 抗重放 seq + 密钥轮换 key_id）
+//! ## 帧格式（固定 24 字节，含 HMAC 认证 + 抗重放 seq + 密钥轮换 key_id + 10B payload）
 //! ```text
 //!  offset | size | field
 //!  -------+------+-------------
 //!    0    |  2   | magic (0xCB01, LE)
 //!    2    |  1   | version_byte:
 //!         |      |    bits[7..4] = key_id (0..=15)   —— O 选项
-//!         |      |    bits[3..0] = protocol_version  (= 4)
+//!         |      |    bits[3..0] = protocol_version  (= 5)
 //!    3    |  1   | kind (u8)
 //!    4    |  4   | seq (u32 LE)
-//!    8    |  6   | payload
-//!   14    |  4   | hmac —— HMAC-SHA256(SHARED_SECRETS[key_id], nonce || bytes[0..14])[..4]
-//!   18    |  2   | crc16_ibm(bytes[0..18]) (LE)
+//!    8    | 10   | payload
+//!   18    |  4   | hmac —— HMAC-SHA256(SHARED_SECRETS[key_id], nonce || bytes[0..18])[..4]
+//!    22    |  2   | crc16_ibm(bytes[0..22]) (LE)
 //! ```
-//!
-//! ## 版本历史
-//! - **v1**（已废弃）：12 字节，无认证
-//! - **v2**（已废弃）：16 字节，含 HMAC 但无抗重放
-//! - **v3**（已废弃）：20 字节，HMAC + seq 抗重放，但 version 字节无 key_id
-//! - **v4**（当前）：20 字节，version 字节拆分为 key_id(4bit) + version(4bit)，支持密钥轮换
-//!
-//! 帧长度与 v3 相同，而且 magic 也不变；**版本字段的低 4 位**变为 4
-//! 以区分版本。v3 Host 发的包 version=0x03 会被 v4 手柄绝对拒绝。
 //!
 //! ## seq 语义
 //! - Host 端维护 `tx_counter`，每次发命令前 `+1`，从 1 开始（**0 保留**为无效值）
@@ -36,11 +27,13 @@
 //! - `SetSensitivity { .. }` —— 修改摇杆 / 旋钮灵敏度（0..=1000 定点数）
 //! - `ShowToast { .. }`    —— OLED 底部弹出一段短提示（最多 5 ASCII 字节）
 //! - `SetBatteryMode { .. }` —— 切换电池模拟 / 真实模式
+//! - `Announce`            —— Peer 发现广播，payload 全 0
+//! - `AssignId { .. }`     —— 向指定 MAC 的 receiver 分配一个 receiver_id
 //!
 //! ## 校验顺序（decode 侧）
 //! 1. 长度（`COMMAND_LEN`）
 //! 2. Magic（快速过滤非 Command 帧）
-//! 3. version_byte 拆分：version == 4？key_id 在 [`KEY_SLOTS`] 范围内？
+//! 3. version_byte 拆分：version == 5？key_id 在 [`KEY_SLOTS`] 范围内？
 //! 4. CRC（数据完整性；便宜过滤随机噪声）
 //! 5. HMAC（身份认证；抗得伪造，根据 key_id 选密钥）
 //! 6. Kind + payload 语义
@@ -58,8 +51,8 @@ use crate::config::keyring::KEY_SLOTS;
 
 /// Command 协议魔数
 pub const COMMAND_MAGIC: u16 = 0xCB01;
-/// Command 协议版本（v4 起 version 字段拆分为 key_id(4bit) + version(4bit)）
-pub const COMMAND_VERSION: u8 = 4;
+/// Command 协议版本（payload 扩展到 10B，新增 Announce/AssignId）
+pub const COMMAND_VERSION: u8 = 5;
 
 /// 版本字段低 4 位掩码：bits[3..0] = protocol_version
 const VERSION_NIBBLE_MASK: u8 = 0x0F;
@@ -70,10 +63,10 @@ const HEADER_LEN: usize = 2 + 1 + 1;
 /// seq 长度（bytes）
 const SEQ_LEN: usize = 4;
 /// payload 长度（bytes）
-const PAYLOAD_LEN: usize = 6;
+pub const PAYLOAD_LEN: usize = 10;
 /// crc 长度（bytes）
 const CRC_LEN: usize = 2;
-/// 完整 Command 帧字节数（20 = header 4 + seq 4 + payload 6 + hmac 4 + crc 2）
+/// 完整 Command 帧字节数（24 = header 4 + seq 4 + payload 10 + hmac 4 + crc 2）
 pub const COMMAND_LEN: usize = HEADER_LEN + SEQ_LEN + PAYLOAD_LEN + HMAC_TAG_LEN + CRC_LEN;
 
 // 各字段编译期偏移
@@ -82,7 +75,7 @@ const PAYLOAD_OFFSET: usize = SEQ_OFFSET + SEQ_LEN;
 const HMAC_OFFSET: usize = PAYLOAD_OFFSET + PAYLOAD_LEN;
 const CRC_OFFSET: usize = HMAC_OFFSET + HMAC_TAG_LEN;
 
-const _: () = assert!(COMMAND_LEN == 20);
+const _: () = assert!(COMMAND_LEN == 24);
 
 // ============================================================
 // CommandKind —— 命令种类枚举
@@ -94,14 +87,19 @@ const _: () = assert!(COMMAND_LEN == 20);
 pub enum CommandKind {
   /// 空命令（心跳）
   Nop = 0x00,
-  /// LED 闪烁：`payload = [led_idx, count, period_lo, period_hi, 0, 0]`
+  /// LED 闪烁：`payload = [led_idx, count, period_lo, period_hi, 0, 0, 0, 0, 0, 0]`
   LedBlink = 0x01,
-  /// 设置灵敏度：`payload = [joy_lo, joy_hi, knob_lo, knob_hi, 0, 0]`
+  /// 设置灵敏度：`payload = [joy_lo, joy_hi, knob_lo, knob_hi, 0, 0, 0, 0, 0, 0]`
   SetSensitivity = 0x02,
-  /// 显示 Toast：`payload = [len (0..=5), b0, b1, b2, b3, b4]`
+  /// 显示 Toast：`payload = [len (0..=5), b0, b1, b2, b3, b4, 0, 0, 0, 0]`
   ShowToast = 0x03,
-  /// 切换电池模式：`payload = [simulate (0 = real, 非 0 = simulate), 0, 0, 0, 0, 0]`
+  /// 切换电池模式：`payload = [simulate (0 = real, 非 0 = simulate), 0, 0, 0, 0, 0, 0, 0, 0, 0]`
   SetBatteryMode = 0x04,
+  /// Peer 发现广播（controller 进入 Selecting 时广播）：payload 全 0
+  Announce = 0x05,
+  /// 向指定 MAC 的 receiver 分配 receiver_id：
+  /// `payload = [receiver_id, mac[0..6], 0, 0, 0]`（MAC 共 6B，reserved 3B）
+  AssignId = 0x06,
 }
 
 impl CommandKind {
@@ -113,6 +111,8 @@ impl CommandKind {
       0x02 => Some(Self::SetSensitivity),
       0x03 => Some(Self::ShowToast),
       0x04 => Some(Self::SetBatteryMode),
+      0x05 => Some(Self::Announce),
+      0x06 => Some(Self::AssignId),
       _ => None,
     }
   }
@@ -170,6 +170,15 @@ pub enum CommandBody {
     /// true = 模拟递减；false = 真实测量
     simulate: bool,
   },
+  /// Peer 发现广播（payload 全 0，手柄广播邀请 receivers 回发 AnnounceReply）
+  Announce,
+  /// 向指定 MAC 的 receiver 分配 receiver_id（广播下发，接收方自行匹配本机 MAC）
+  AssignId {
+    /// 目标 receiver 的 MAC-48 地址
+    mac: [u8; 6],
+    /// 手柄分配给该 receiver 的逻辑 ID（0..=31）
+    receiver_id: u8,
+  },
 }
 
 impl CommandBody {
@@ -181,6 +190,8 @@ impl CommandBody {
       Self::SetSensitivity { .. } => CommandKind::SetSensitivity,
       Self::ShowToast { .. } => CommandKind::ShowToast,
       Self::SetBatteryMode { .. } => CommandKind::SetBatteryMode,
+      Self::Announce => CommandKind::Announce,
+      Self::AssignId { .. } => CommandKind::AssignId,
     }
   }
 }
@@ -308,7 +319,7 @@ const fn unpack_version_byte(byte: u8) -> (u8, u8) {
 fn encode_payload(body: &CommandBody) -> [u8; PAYLOAD_LEN] {
   let mut payload = [0_u8; PAYLOAD_LEN];
   match *body {
-    CommandBody::Nop => {}
+    CommandBody::Nop | CommandBody::Announce => {}
     CommandBody::LedBlink {
       led_idx,
       count,
@@ -331,6 +342,11 @@ fn encode_payload(body: &CommandBody) -> [u8; PAYLOAD_LEN] {
     }
     CommandBody::SetBatteryMode { simulate } => {
       payload[0] = u8::from(simulate);
+    }
+    CommandBody::AssignId { mac, receiver_id } => {
+      // payload[0..6] = mac；payload[6] = receiver_id；payload[7..10] 保留
+      payload[0..6].copy_from_slice(&mac);
+      payload[6] = receiver_id;
     }
   }
   payload
@@ -424,6 +440,17 @@ fn decode_body(kind: CommandKind, payload: &[u8]) -> Result<CommandBody, Command
     CommandKind::SetBatteryMode => Ok(CommandBody::SetBatteryMode {
       simulate: payload[0] != 0,
     }),
+    CommandKind::Announce => Ok(CommandBody::Announce),
+    CommandKind::AssignId => {
+      let mut mac = [0_u8; 6];
+      mac.copy_from_slice(&payload[0..6]);
+      let receiver_id = payload[6];
+      if receiver_id >= 32 {
+        // receiver_id 必须在 dest_mask u32 位图可寻址范围内
+        return Err(CommandDecodeError::InvalidPayload);
+      }
+      Ok(CommandBody::AssignId { mac, receiver_id })
+    }
   }
 }
 
@@ -433,9 +460,9 @@ mod tests {
   use crate::config::auth::AUTH_ENABLED;
 
   #[test]
-  fn frame_length_is_20() {
+  fn frame_length_is_24() {
     let bytes = encode_command(&Command::new(1, CommandBody::Nop));
-    assert_eq!(bytes.len(), 20);
+    assert_eq!(bytes.len(), 24);
   }
 
   #[test]
@@ -566,8 +593,59 @@ mod tests {
   }
 
   #[test]
+  fn v4_is_rejected() {
+    // version_byte 低 4 位 protocol_version = 4，与当前协议版本（COMMAND_VERSION）不符，应被拒绝
+    let mut bytes = encode_command(&Command::new(1, CommandBody::Nop));
+    bytes[2] = 0x04; // 伪造 v4
+    match decode_command(&bytes) {
+      Err(CommandDecodeError::UnsupportedVersion(0x04)) => {}
+      other => panic!("expected UnsupportedVersion(0x04), got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn roundtrip_announce() {
+    let cmd = Command::new(11, CommandBody::Announce);
+    let bytes = encode_command(&cmd);
+    assert_eq!(decode_command(&bytes), Ok(cmd));
+  }
+
+  #[test]
+  fn roundtrip_assign_id() {
+    let cmd = Command::new(
+      12,
+      CommandBody::AssignId {
+        mac: [0x24, 0x0A, 0xC4, 0x11, 0x22, 0x33],
+        receiver_id: 7,
+      },
+    );
+    let bytes = encode_command(&cmd);
+    assert_eq!(decode_command(&bytes), Ok(cmd));
+  }
+
+  #[test]
+  fn assign_id_rejects_receiver_id_out_of_range() {
+    // 手工构造 receiver_id = 32 的包 → InvalidPayload
+    let mut buf = [0_u8; COMMAND_LEN];
+    buf[0..2].copy_from_slice(&COMMAND_MAGIC.to_le_bytes());
+    buf[2] = pack_version_byte(KeyId::DEFAULT, COMMAND_VERSION);
+    buf[3] = CommandKind::AssignId as u8;
+    buf[SEQ_OFFSET..SEQ_OFFSET + SEQ_LEN].copy_from_slice(&1_u32.to_le_bytes());
+    // payload[0..6] = mac 全 0；payload[6] = 32 超出范围
+    buf[PAYLOAD_OFFSET + 6] = 32;
+    let tag = compute_hmac_tag(&buf[..HMAC_OFFSET], KeyId::DEFAULT).unwrap();
+    buf[HMAC_OFFSET..HMAC_OFFSET + HMAC_TAG_LEN].copy_from_slice(&tag);
+    let crc = crc16_ibm(&buf[..CRC_OFFSET]);
+    buf[CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
+    assert_eq!(
+      decode_command(&buf),
+      Err(CommandDecodeError::InvalidPayload)
+    );
+  }
+
+  #[test]
   fn v3_is_rejected() {
-    // 旧 v3 Host 发的包 version_byte = 0x03→低 4 位 protocol_version = 3，当前固件仅接受 4
+    // 古老 v3 Host 发的包也必须拒绝
     let mut bytes = encode_command(&Command::new(1, CommandBody::Nop));
     bytes[2] = 0x03; // 伪造 v3
     match decode_command(&bytes) {

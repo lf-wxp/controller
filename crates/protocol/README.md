@@ -8,9 +8,10 @@ ESP32 游戏手柄的**纯协议层** —— 无硬件依赖、可跨 target 复
 
 | 特性 | 说明 |
 |------|------|
-| **Frame** (21B, magic 0xC71E) | 手柄→Host 广播摇杆状态，无认证（只读） |
-| **Command** (20B, magic 0xCB01, v4) | Host→手柄反向命令，HMAC + seq 抗重放 + 4-bit key_id 密钥轮换 |
-| **CommandResponse** (20B, magic 0xCB02, v4) | 手柄→Host 反馈（Ack / Error / Battery / NonceHello） |
+| **Frame** (25B, magic 0xC71E) | 手柄→接收方广播摇杆状态 + `dest_mask` 位图寻址，无认证（只读） |
+| **Command** (24B, magic 0xCB01) | 手柄→接收方反向命令（含 Announce/AssignId），HMAC + seq 抗重放 + 4-bit key_id 密钥轮换 |
+| **CommandResponse** (24B, magic 0xCB02) | 接收方→手柄反馈（Ack / Error / Battery / NonceHello / **AnnounceReply**） |
+| **32-peer 位图寻址** | Frame 携带 `dest_mask: u32`，广播/单播/多播共享同一空口路径 |
 | **CRC-16-IBM** | 抗随机噪声 |
 | **HMAC-SHA256/4** | 抗签名伪造，nonce 混入抵抗密钥泄漏 |
 | **64-bit Anti-Replay window** | 抗抓包重发（per-key-id 独立窗口） |
@@ -20,11 +21,12 @@ ESP32 游戏手柄的**纯协议层** —— 无硬件依赖、可跨 target 复
 
 | 类型             | 长度 | Magic  | 版本 | 认证 | 抗重放           | 密钥轮换                    | 方向             |
 |------------------|------|--------|------|------|------------------|-----------------------------|------------------|
-| Frame            | 21 B | 0xC71E | 1    | 无   | 无               | 无                          | 手柄 → Host 广播 |
-| Command          | 20 B | 0xCB01 | 4    | HMAC | seq+per-key 窗口 | 4-bit key_id → SHARED_SECRETS | Host → 手柄      |
-| CommandResponse  | 20 B | 0xCB02 | 4    | HMAC | req_seq          | 同上                        | 手柄 → Host      |
+| Frame            | 25 B | 0xC71E | 2    | 无   | 无               | 无                          | 手柄 → 接收方广播 (带 dest_mask) |
+| Command          | 24 B | 0xCB01 | 5    | HMAC | seq+per-key 窗口 | 4-bit key_id → SHARED_SECRETS | 手柄 ⇄ 接收方      |
+| CommandResponse  | 24 B | 0xCB02 | 5    | HMAC | req_seq          | 同上                        | 接收方 → 手柄      |
 
-> Frame 是只读广播，伪造只能让 Host 看到假状态，不会让手柄执行动作，因此无需签名。
+> Frame 是只读广播，伪造只能让接收方看到假状态，不会让手柄执行动作，因此无需签名；
+> 但 Frame 携带 `dest_mask: u32`，接收方可在 CRC 校验后、HMAC 之前短路丢弃不寻址自己的帧。
 > Command / Response 才是"控制面"，必须 HMAC 签名 + 抗重放。
 > 完整字节布局见 [`docs/protocol_air.md`](../../docs/protocol_air.md)。
 
@@ -34,10 +36,10 @@ ESP32 游戏手柄的**纯协议层** —— 无硬件依赖、可跨 target 复
 crates/protocol/src/
 ├── lib.rs        # 公共 API 面（re-export）+ 设计原则
 ├── state.rs      # GamepadState（12B）+ ButtonBits 位图
-├── frame.rs      # Frame 编解码（21B）
-├── command.rs    # Command 编解码（20B）+ 5 种 CommandBody
-├── response.rs   # CommandResponse 编解码（20B）+ 4 种 ResponseBody
-├── codec.rs      # transmit_frame 的无 HMAC 路径 + DecodeError
+├── frame.rs      # Frame 结构（25B）+ dest_mask + BROADCAST_DEST_MASK
+├── command.rs    # Command 编解码（24B）+ 7 种 CommandBody（含 Announce/AssignId）
+├── response.rs   # CommandResponse 编解码（24B）+ 5 种 ResponseBody（含 AnnounceReply）
+├── codec.rs      # Frame 编解码（含 CRC）+ DecodeError
 ├── auth.rs       # HMAC-SHA256 计算 + session nonce + KeyId newtype
 ├── replay.rs     # AntiReplayWindow（64-bit 滑动窗）
 ├── crc.rs        # crc16_ibm
@@ -99,7 +101,7 @@ cargo test --target aarch64-apple-darwin -- --test-threads=1   # macOS
 cargo test --features std proptest
 ```
 
-- 72 个单元测试 + 8 组 proptest 往返测试，覆盖 3 种帧的 encode→decode 对称性、CRC/HMAC 校验失败路径、抗重放窗口边界。
+- 82 个单元测试 + 8 组 proptest 往返测试，覆盖 3 种帧的 encode→decode 对称性、CRC/HMAC 校验失败路径、抗重放窗口边界、`dest_mask` 往返不变性。
 
 ## 作为依赖复用
 

@@ -26,7 +26,7 @@
 ```toml
 # 下游项目的 Cargo.toml
 [dependencies]
-controller-protocol = { git = "https://github.com/lf-wxp/controller", tag = "protocol-v0.1.0", default-features = false }
+controller-protocol = { git = "https://github.com/lf-wxp/controller", tag = "protocol-v0.2.0", default-features = false }
 ```
 
 - **必须**加 `tag`（或 `rev`），不要用裸 `branch`，否则每次 `cargo update` 都可能出现协议漂移。
@@ -116,19 +116,25 @@ cargo build --release --no-default-features --features std,serde
 ### 4.1 接收 & 解码 Frame（手柄状态广播）
 
 ```rust
-use controller_protocol::{DecodeError, Frame, GamepadState, decode_frame};
+use controller_protocol::{DecodeError, FRAME_LEN, Frame, GamepadState, decode_frame};
 
-/// 假设 `bytes` 是从 ESP-NOW / BLE / UART 收到的 21 字节报文
-fn handle_incoming(bytes: &[u8]) {
+/// 假设 `bytes` 是从 ESP-NOW / BLE / UART 收到的 `FRAME_LEN`（25）字节报文
+fn handle_incoming(bytes: &[u8], my_receiver_id: u8) {
     match decode_frame(bytes) {
-        Ok(Frame { header, state }) => {
-            // header.seq 递增；state 是 12B GamepadState
-            log_state(header.seq, &state);
+        Ok(frame) => {
+            // Frame 有三个字段：header / payload / dest_mask
+            // dest_mask 是位图寻址：bit-i = 1 表示 receiver_id == i 应处理该帧
+            if !frame.is_addressed_to(my_receiver_id) {
+                // 广播帧（dest_mask == u32::MAX）永远匹配；
+                // 目标不含本机时静默丢弃，是接收端过滤的核心
+                return;
+            }
+            log_state(frame.header.seq, &frame.payload);
         }
-        Err(DecodeError::BadLength) => { /* 丢包 / 未对齐 */ }
-        Err(DecodeError::BadMagic)  => { /* 不是本协议报文 */ }
-        Err(DecodeError::BadCrc)    => { /* 噪声位翻转 */ }
-        Err(err)                    => { /* 版本 / 其它 */ let _ = err; }
+        Err(DecodeError::BadLength)              => { /* 丢包 / 未对齐 */ }
+        Err(DecodeError::BadMagic)               => { /* 不是本协议报文 */ }
+        Err(DecodeError::BadCrc { .. })          => { /* 噪声位翻转 */ }
+        Err(DecodeError::UnsupportedVersion(_))  => { /* 不兼容的协议版本 */ }
     }
 }
 
@@ -137,14 +143,20 @@ fn log_state(seq: u32, state: &GamepadState) {
 }
 ```
 
+> **`Frame` 字段说明**：`Frame` 由 `header` / `payload` / `dest_mask` 三个字段组成，
+> `dest_mask: u32` 用于位图寻址（bit-i = 1 表示 `receiver_id == i` 应处理该帧）。
+> 访问字段使用 `frame.header` / `frame.payload` / `frame.dest_mask`；广播场景
+> 可直接使用 `Frame::new(seq, state)`（默认 `dest_mask = u32::MAX`，即广播）。
+
 ### 4.2 发送 & 签名 Command（控制端反向命令）
 
 ```rust
 use controller_protocol::{
-    Command, CommandBody, KeyId, encode_command, init_session_nonce,
+    COMMAND_LEN, Command, CommandBody, KeyId, encode_command, init_session_nonce,
 };
 
-fn send_led_blink(seq: u32) -> [u8; 20] {
+/// Command wire size = `COMMAND_LEN`（24 字节；payload 为 10B）
+fn send_led_blink(seq: u32) -> [u8; COMMAND_LEN] {
     // 会话初始化只需一次；nonce 参与 HMAC，务必用真随机 seed
     init_session_nonce(0x1234_5678_ABCD_EF01);
 
@@ -158,6 +170,10 @@ fn send_led_blink(seq: u32) -> [u8; 20] {
     encode_command(&cmd)
 }
 ```
+
+> **重要**：返回类型请**始终**用 `[u8; COMMAND_LEN]` 常量而非 `[u8; 24]`
+> 硬编码，避免与协议实际字节长度脱节。同理 `Response`
+> 使用 `[u8; RESPONSE_LEN]`。
 
 ### 4.3 解码 & 校验 Command（接收端）
 
@@ -186,6 +202,110 @@ enum OnCommandError {
 
 > `AntiReplayWindow` **每个 `key_id` 独立一份**（`KEY_SLOTS` 个窗口），不要用同一个窗口跨 slot 校验，也不要在重启后从零开始——建议持久化窗口高水位到 NVS/flash。
 
+### 4.4 单播 / 组播：使用 `dest_mask`（v2）
+
+```rust
+use controller_protocol::{Frame, GamepadState};
+
+/// 单播到 `receiver_id == 3` 的接收方
+fn build_unicast_frame(seq: u32, state: GamepadState) -> Frame {
+    let dest_mask = 1_u32 << 3;
+    Frame::with_dest(seq, state, dest_mask)
+}
+
+/// 组播到多个接收方（比如 id=1, 5, 9）
+fn build_multicast_frame(seq: u32, state: GamepadState) -> Frame {
+    let dest_mask = (1_u32 << 1) | (1_u32 << 5) | (1_u32 << 9);
+    Frame::with_dest(seq, state, dest_mask)
+}
+
+/// 广播（`Frame::new` 的默认行为，等价于 `dest_mask = u32::MAX`）
+fn build_broadcast_frame(seq: u32, state: GamepadState) -> Frame {
+    Frame::new(seq, state)
+}
+```
+
+接收端过滤只需一行：
+
+```rust
+if !frame.is_addressed_to(my_receiver_id) {
+    return; // 目标不含本机，静默丢弃
+}
+```
+
+> `receiver_id` 取值范围 `[0, 31]`，与 `dest_mask` 的 32 个 bit 一一对应；
+> 大于 31 的 `receiver_id` 恒返回 `false`（`is_addressed_to` 已做边界处理）。
+
+### 4.5 Peer 发现：Announce / AnnounceReply / AssignId
+
+**Controller 侧**：广播 `Announce`，等待 receivers 回 `AnnounceReply`：
+
+```rust
+use controller_protocol::{
+    Command, CommandBody, KeyId, encode_command,
+};
+
+/// Controller：广播 Announce，让所有 receivers 上报自己
+fn broadcast_announce(seq: u32) -> [u8; 24] {
+    let cmd = Command::with_key(seq, KeyId::DEFAULT, CommandBody::Announce);
+    encode_command(&cmd)
+}
+
+/// Controller：单播 AssignId 给某个 receiver（payload 携带目标 mac + 分配的 id）
+fn assign_id(seq: u32, mac: [u8; 6], receiver_id: u8) -> [u8; 24] {
+    let cmd = Command::with_key(
+        seq,
+        KeyId::DEFAULT,
+        CommandBody::AssignId { mac, receiver_id },
+    );
+    encode_command(&cmd)
+}
+```
+
+**Receiver 侧**：收到 `Announce` 后回 `AnnounceReply`；收到 `AssignId` 后校验 mac 与自身一致再持久化 id：
+
+```rust
+use controller_protocol::{
+    Command, CommandBody, CommandResponse, KeyId, ResponseBody,
+    decode_command, encode_response,
+};
+
+fn on_command(bytes: &[u8], my_mac: [u8; 6]) -> Option<[u8; 24]> {
+    let cmd = decode_command(bytes).ok()?;
+    match cmd.kind {
+        CommandBody::Announce => {
+            // 上报自己：mac / rssi / role_tag
+            let reply = CommandResponse::announce_reply(
+                cmd.seq,
+                cmd.key_id,
+                my_mac,
+                -50,       // 占位：真机上从 ESP-NOW rx_control 提取
+                *b"led",   // 3 字节 role_tag；不足右侧补 0
+            );
+            Some(encode_response(&reply))
+        }
+        CommandBody::AssignId { mac, receiver_id } => {
+            if mac != my_mac {
+                return None; // 不是给我的，静默忽略
+            }
+            persist_receiver_id(receiver_id);
+            let ack = CommandResponse::ack_with_key(cmd.seq, cmd.key_id);
+            Some(encode_response(&ack))
+        }
+        _ => None,
+    }
+}
+
+fn persist_receiver_id(id: u8) {
+    // 落盘到 NVS / flash / EEPROM，重启后从这里恢复
+    let _ = id;
+}
+```
+
+> **`AnnounceReply.payload` 布局**：`[mac(6B), rssi_dbm(1B), role_tag(3B)]`
+> —— MAC 是接收方**自报**的地址（不依赖无线层 src_mac，避免中继/桥接改写）；
+> `rssi_dbm` 若未知可填 `i8::MIN`；`role_tag` 是 3 字节 ASCII 展示标签。
+
 ---
 
 ## 5. `no_std` / `wasm32` / `host` 目标差异
@@ -209,7 +329,15 @@ enum OnCommandError {
   - `0.1.x`：Bug 修复，字节布局**不变**
   - `0.2.x`：可能引入新的 `CommandKind` / `ResponseKind`，向后兼容解码器
   - `1.0`：字节布局稳定承诺
-- **跨版本互通**：`Frame` / `Command` / `CommandResponse` 均带 magic + version 字段，接入方**必须**校验版本，遇到未知版本报 `WrongVersion` 并丢弃，不要盲目解析。
+- **跨版本互通**：`Frame` / `Command` / `CommandResponse` 均带 magic + version 字段，接入方**必须**校验版本，遇到未知版本报 `UnsupportedVersion` 并丢弃，不要盲目解析。
+
+### 6.1 当前版本
+
+| 消息类型         | wire size | version | Magic    | 关键特性                                 |
+|-----------------|-----------|---------|----------|------------------------------------------|
+| `Frame`         | **25 B**  | **2**   | `0xC71E` | `dest_mask: u32`（位图寻址）             |
+| `Command`       | **24 B**  | **5**   | `0xCB01` | `Announce` / `AssignId` 命令             |
+| `CommandResponse` | **24 B**  | **5**   | `0xCB02` | `AnnounceReply` 响应                     |
 
 ---
 
@@ -223,6 +351,9 @@ enum OnCommandError {
 | WASM 打包体积异常大 | 误开了 `["defmt"]` | WASM 端只开 `["serde"]` |
 | 反复出现 `Replay` 错误 | 用了单个共享 `AntiReplayWindow` 跨 key_id | 每 slot 一个窗口，重启时从持久化中恢复 |
 | `cargo publish` 失败 `missing repository field` | metadata 不全 | 已在 `Cargo.toml` 中补齐 `repository` / `homepage` / `documentation` |
+| receiver 收到帧全部丢弃 | 未处理 `dest_mask` 字段 | 用 `frame.payload`（而非旧 `.state`），并调用 `frame.is_addressed_to(my_id)` 做过滤 |
+| receiver 无法被 controller 发现 | 未响应 `CommandBody::Announce` | 在 `on_command` 里为 `Announce` 分支回 `CommandResponse::announce_reply(...)` |
+| Receiver 重启后 `receiver_id` 丢失 | 收到 `AssignId` 未落盘 | 在 `AssignId` 分支持久化 `receiver_id` 到 NVS/flash，开机时恢复 |
 
 ---
 

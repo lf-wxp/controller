@@ -453,6 +453,18 @@ async fn subscribe_response(
             state.session_nonce.set(Some(*nonce));
             format!("NonceHello=0x{nonce:08x}")
           }
+          ResponseBody::AnnounceReply {
+            mac,
+            rssi_dbm,
+            role_tag,
+          } => {
+            // dashboard 只作展示：把 MAC / RSSI / role 拼成一行事件
+            let role_str = core::str::from_utf8(role_tag).unwrap_or("???");
+            format!(
+              "AnnounceReply mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} rssi={}dBm role={}",
+              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi_dbm, role_str
+            )
+          }
         };
         state.last_response.set(Some((resp.req_seq, resp.body)));
         state.push_event(EventEntry::rx(summary, bytes.clone()));

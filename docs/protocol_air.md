@@ -15,9 +15,10 @@
 
 - [📑 目录](#-目录)
 - [📡 空气中的 3 种帧](#-空气中的-3-种帧)
-- [1. 🎮 Frame（状态帧，21 B）](#1--frame状态帧21-b)
-- [2. 🕹️ Command（控制命令，20 B）](#2-️-command控制命令20-b)
-- [3. 📨 Response（命令响应 + Nonce 广播，20 B）](#3--response命令响应--nonce-广播20-b)
+- [1. 🎮 Frame（状态帧，25 B）](#1--frame状态帧25-b)
+- [2. 🕹️ Command（控制命令，24 B）](#2-️-command控制命令24-b)
+- [3. 📨 Response（命令响应 + Nonce 广播 + AnnounceReply，24 B）](#3--response命令响应--nonce-广播--announcereply24-b)
+- [4. 🎯 多接收方寻址（`dest_mask` + Announce/AssignId 三步握手）](#4--多接收方寻址dest_mask--announceassignid-三步握手)
 - [🛡️ 安全模型](#️-安全模型)
 - [手柄的空口时间表](#手柄的空口时间表)
 - [版本与部署要点](#版本与部署要点)
@@ -31,23 +32,37 @@
 
 | Magic | 帧类型 | 方向 | 长度 | 鉴权 | 序列号 | 抗重放 |
 | ----- | ------ | ---- | ---- | ---- | ------ | ------ |
-| `0xC71E` | Frame | 手柄 → 主机 | 21 B | CRC-16 | 有 | 无 |
-| `0xCB01` | Command | 主机 → 手柄 | 20 B | HMAC-SHA256 | 有 | ✅ 64 位滑动窗 |
-| `0xCB02` | Response | 手柄 → 主机 | 20 B | HMAC-SHA256 | 有 | 无 |
+| `0xC71E` | Frame | 手柄 → 主机 | **25 B** | CRC-16 | 有 | 无 |
+| `0xCB01` | Command | 主机 → 手柄 / 手柄 → receiver | **24 B** | HMAC-SHA256 | 有 | ✅ 64 位滑动窗 |
+| `0xCB02` | Response | 手柄 → 主机 / receiver → 手柄 | **24 B** | HMAC-SHA256 | 有 | 无 |
 
-## 1. 🎮 Frame（状态帧，21 B）
+> [!IMPORTANT]
+> Frame 携带 `dest_mask: u32` 位图寻址（4 B），wire size 为 25 B；Command/Response 携带 Announce/AssignId/AnnounceReply 通道，payload 为 10 B，wire size 为 24 B。
 
-**用途**：手柄每 33 ms（约 30 Hz）广播一次实时状态（按键 / 摇杆 / 旋钮）。
+## 1. 🎮 Frame（状态帧，25 B）
+
+**用途**：手柄每 33 ms（约 30 Hz）广播一次实时状态（按键 / 摇杆 / 旋钮）+ 目标寻址位图。
 
 ```text
  offset | size | field
  -------+------+-----------
    0    |  2   | magic = 0xC71E (LE)
-   2    |  1   | version = 1
+   2    |  1   | version = 2
    3    |  4   | seq (LE, u32)
    7    | 12   | payload (GamepadState)
-  19    |  2   | crc16_ibm(bytes[0..19]) (LE)
+  19    |  4   | dest_mask (LE, u32)
+  23    |  2   | crc16_ibm(bytes[0..23]) (LE)
 ```
+
+**`dest_mask` 语义** —— 32 位目标寻址位图：
+
+| 值 | 含义 | 用途 |
+| --- | --- | --- |
+| `0xFFFF_FFFF` | 广播（`BROADCAST_DEST_MASK`） | 默认；所有 receiver 处理该帧 |
+| `1 << N` | 仅 `receiver_id == N` 处理 | 单播/多播；bit-i 对应 `receiver_id == i` 的 receiver |
+| `0` | 静默丢弃 | 暂停下发（保持空口时序但没有 receiver 处理） |
+
+接收端一行代码判定：`frame.is_addressed_to(my_receiver_id)`，未命中即静默丢帧。
 
 **GamepadState (12 B)** —— 见 [`crates/protocol/src/state.rs`](../crates/protocol/src/state.rs)：
 
@@ -81,63 +96,69 @@
 > - **仅 CRC**：状态帧允许丢包（下一帧 33 ms 就到），无需完整性保证
 > - **单向**：手柄绝不"应答"任何状态帧，因此不占空口
 
-## 2. 🕹️ Command（控制命令，20 B）
+## 2. 🕹️ Command（控制命令，24 B）
 
-**用途**：主机（Dashboard / 自定义控制端）主动下发命令给手柄。
+**用途**：
+- 主机（Dashboard / 自定义控制端）主动下发命令给手柄
+- 手柄主动下发 Announce/AssignId 到 receiver
 
 ```text
  offset | size | field
  -------+------+---------
    0    |  2   | magic = 0xCB01 (LE)
    2    |  1   | version_byte
-        |      |   ↳ 低 4 位 = protocol_version (=4)
+        |      |   ↳ 低 4 位 = protocol_version (=5)
         |      |   ↳ 高 4 位 = key_id (0..=15)
    3    |  1   | kind
    4    |  4   | seq (LE, u32)
-   8    |  6   | payload
-  14    |  4   | hmac tag (SHA256 截断 4B)
-  18    |  2   | crc16_ibm(bytes[0..18])
+   8    | 10   | payload
+  18    |  4   | hmac tag (SHA256 截断 4B)
+  22    |  2   | crc16_ibm(bytes[0..22])
 ```
 
-**5 种 CommandKind** —— 见 [`crates/protocol/src/command.rs`](../crates/protocol/src/command.rs)：
+**7 种 CommandKind** —— 见 [`crates/protocol/src/command.rs`](../crates/protocol/src/command.rs)：
 
-| kind | 名称              | payload                                   | 语义                     |
-| ---- | ----------------- | ----------------------------------------- | ------------------------ |
-| 0x00 | `Nop`             | ―                                         | 心跳 / 连接性检查        |
-| 0x01 | `LedBlink`        | `led_idx: u8, count: u8, period_ms: u16`  | LED 闪烁 N 次            |
-| 0x02 | `SetSensitivity`  | `joy_scale: u16, knob_scale: u16` (0..=1000) | 摇杆 / 旋钮定点缩放     |
-| 0x03 | `ShowToast`       | `len: u8, bytes: [u8; 5]`（ASCII）        | OLED 底部弹提示（≤5 字节） |
-| 0x04 | `SetBatteryMode`  | `simulate: bool`                          | 电池模拟 / 真实模式切换  |
+| kind | 名称              | payload                                     | 语义                          |
+| ---- | ----------------- | ------------------------------------------- | ----------------------------- |
+| 0x00 | `Nop`             | ―                                           | 心跳 / 连接性检查             |
+| 0x01 | `LedBlink`        | `led_idx: u8, count: u8, period_ms: u16`    | LED 闪烁 N 次                 |
+| 0x02 | `SetSensitivity`  | `joy_scale: u16, knob_scale: u16` (0..=1000) | 摇杆 / 旋钮定点缩放           |
+| 0x03 | `ShowToast`       | `len: u8, bytes: [u8; 5]`（ASCII）          | OLED 底部弹提示（≤5 字节）    |
+| 0x04 | `SetBatteryMode`  | `simulate: bool`                            | 电池模拟 / 真实模式切换       |
+| 0x05 | `Announce` ⭐     | `payload` 全 0                              | 广播发现请求；所有在线 receiver 应回 `AnnounceReply` |
+| 0x06 | `AssignId` ⭐     | `mac: [u8; 6], receiver_id: u8`             | 分配逻辑 ID；receiver 校验 `mac == 自身` 才吃下 |
 
 **校验顺序**（`decode_command`）：`长度 → magic → version → key_id → CRC → HMAC → payload`。
 任一失败立即返回对应 [`CommandDecodeError`](../crates/protocol/src/command.rs)。
 
-## 3. 📨 Response（命令响应 + Nonce 广播，20 B）
+## 3. 📨 Response（命令响应 + Nonce 广播 + AnnounceReply，24 B）
 
 **用途**：
 - 手柄回执命令执行结果（Ack / Error / BatterySnapshot）
 - 手柄**主动**广播 K3 Session Nonce（`NonceHello`）供控制端反重放
+- receiver 响应手柄的 `Announce`（`AnnounceReply`）
 
 ```text
  offset | size | field
  -------+------+---------
    0    |  2   | magic = 0xCB02 (LE)
-   2    |  1   | version_byte（同 Command）
-   3    |  4   | req_seq（对应 Command.seq；NonceHello 时为 0）
+   2    |  1   | version_byte（同 Command，protocol_version=5）
+   3    |  4   | req_seq（对应 Command.seq；NonceHello/AnnounceReply 时为 0）
    7    |  1   | kind
-   8    |  6   | payload
-  14    |  4   | hmac tag
-  18    |  2   | crc16_ibm(bytes[0..18])
+   8    | 10   | payload
+  18    |  4   | hmac tag
+  22    |  2   | crc16_ibm(bytes[0..22])
 ```
 
-**4 种 ResponseKind** —— 见 [`crates/protocol/src/response.rs`](../crates/protocol/src/response.rs)：
+**5 种 ResponseKind** —— 见 [`crates/protocol/src/response.rs`](../crates/protocol/src/response.rs)：
 
-| kind | 名称                | payload                    | 语义                          |
-| ---- | ------------------- | -------------------------- | ----------------------------- |
-| 0x00 | `Ack`               | ―                          | 命令成功执行                  |
-| 0x01 | `Error`             | `code: ErrorCode`          | 命令执行失败                  |
-| 0x02 | `BatterySnapshot`   | `percent: u8` (0..=100)    | 电量快照                      |
-| 0x03 | `NonceHello`        | `nonce: u32` (LE)          | K3 主动广播，`req_seq = 0`    |
+| kind | 名称                | payload                                    | 语义                          |
+| ---- | ------------------- | ------------------------------------------ | ----------------------------- |
+| 0x00 | `Ack`               | ―                                          | 命令成功执行                  |
+| 0x01 | `Error`             | `code: ErrorCode`                          | 命令执行失败                  |
+| 0x02 | `BatterySnapshot`   | `percent: u8` (0..=100)                    | 电量快照                      |
+| 0x03 | `NonceHello`        | `nonce: u32` (LE)                          | K3 主动广播，`req_seq = 0`    |
+| 0x04 | `AnnounceReply` ⭐  | `mac: [u8; 6], rssi_dbm: i8, role_tag: [u8; 3]` | receiver 上报自身身份 |
 
 **ErrorCode**：
 
@@ -146,6 +167,40 @@
 | 0x01 | `InvalidArgument` | 参数越界（如 `led_idx = 99`）        |
 | 0x02 | `Unsupported`     | 手柄不认识该命令                     |
 | 0x03 | `Busy`            | 内部忙（如 LED 特效队列已满）        |
+
+## 4. 🎯 多接收方寻址（`dest_mask` + Announce/AssignId 三步握手）
+
+通过 3 步握手让手柄可以在同一空口下**精准选择**要发给哪些 receiver：
+
+```text
+ Step 1  手柄 → 广播  Command { kind: Announce }             (24 B)
+ Step 2  receiver → 广播  Response { kind: AnnounceReply,     (24 B)
+                       mac, rssi_dbm, role_tag }
+         └─ 手柄 upsert peer_registry：给未知 mac 分配最小可用 receiver_id (0..32)
+ Step 3  手柄 → 广播  Command { kind: AssignId,               (24 B)
+                       mac, receiver_id }
+         └─ receiver 校验 payload.mac == 自身 → 记住 receiver_id 到 NVS
+```
+
+完成后手柄发 Frame 时用 `dest_mask` 选择接收方：
+
+```text
+ Frame { dest_mask: 0xFFFF_FFFF }        → 所有 receiver 处理（广播）
+ Frame { dest_mask: 1 << 3 }             → 只有 receiver_id=3 处理
+ Frame { dest_mask: (1<<1)|(1<<5)|(1<<9) } → receiver_id ∈ {1,5,9} 处理
+ Frame { dest_mask: 0 }                  → 无人处理（暂停下发）
+```
+
+receiver 侧的过滤逻辑（推荐）：`if !frame.is_addressed_to(my_receiver_id) { continue; }`。
+物理层仍是广播——**只在软件层做位图过滤**，好处：
+- 单一广播任务同时服务所有 receiver，无需 ESP-NOW peer 表管理
+- receiver 数量增减无需协商 —— 上电即 Announce，掉电即静默
+- receiver_id 复用（离线 slot 会被下一个 Announce 的新 receiver 回收）
+
+> [!TIP]
+> **peer_registry 容量**：32 slot，对应 `dest_mask` 32 bit。多于 32 的 receiver 需要
+> 升 `dest_mask` 到 `u64` —— 见 [`crates/protocol/src/frame.rs`](../crates/protocol/src/frame.rs)
+> 的 `BROADCAST_DEST_MASK` 与 `is_addressed_to` 上限。
 
 ## 🛡️ 安全模型
 
@@ -172,11 +227,17 @@ pub const SHARED_SECRETS: [Option<&'static [u8; 32]>; 4] =
  t (s)  event
  -----  ----------------------------
   0     手柄上电，SESSION_NONCE 随机初始化
-  0.1   Frame 首帧广播（seq=1）
+  0.1   Frame 首帧广播（seq=1, dest_mask=0xFFFF_FFFF）
   0.13  Frame（seq=2）
   ...   每 33 ms 一帧 ≈ 30 Hz
   5     NonceHello 广播（第一次）
   10    NonceHello 广播（第二次，每 5 s 一次）
+
+【用户长按 Switch 进入 Selecting 模式的额外事件】
+  T     Command { kind: Announce, seq++ } 广播（手柄发起 peer 发现）
+ T+ε    receiver 陆续回  Response { kind: AnnounceReply }
+ T+ε'   手柄单播 Command { kind: AssignId, mac, receiver_id } 到新 receiver
+ T'     用户再次长按 Switch 退出 → 后续 Frame 的 dest_mask 更新为选中的 peer 位图
 ```
 
 **控制端上电后**：
@@ -189,13 +250,12 @@ pub const SHARED_SECRETS: [Option<&'static [u8; 32]>; 4] =
 
 | 帧 | `version` 字段 | 常量 | 说明 |
 |----|----------------|------|------|
-| Frame | `PROTOCOL_VERSION = 1` | `frame::PROTOCOL_VERSION` | 状态帧版本，当前固定 1 |
-| Command | `COMMAND_VERSION = 4` | `command::COMMAND_VERSION` | 控制面版本（含 HMAC / 抗重放） |
-| CommandResponse | `RESPONSE_VERSION = 4` | `response::RESPONSE_VERSION` | 与 Command 对齐 |
+| Frame | `PROTOCOL_VERSION = 2` | `frame::PROTOCOL_VERSION` | 状态帧；携带 `dest_mask` 位图寻址 |
+| Command | `COMMAND_VERSION = 5` | `command::COMMAND_VERSION` | 控制面；含 Announce/AssignId |
+| CommandResponse | `RESPONSE_VERSION = 5` | `response::RESPONSE_VERSION` | 与 Command 对齐；含 AnnounceReply |
 
 `version_byte` 的低 4 位存 protocol version，高 4 位存 `key_id`（见 Command 布局）。
-解码时若版本不匹配会返回对应 `DecodeError` / `CommandDecodeError`，旧主机/新手柄可据此
-优雅降级或报错，而非静默误解字节。
+解码时若版本不匹配会返回对应 `DecodeError` / `CommandDecodeError`。
 
 ### 密钥注入（生产必读）
 

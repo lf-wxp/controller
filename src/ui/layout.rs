@@ -27,6 +27,7 @@ use crate::config::display::{LINE_H, OLED_HEIGHT, OLED_WIDTH};
 use crate::hal::battery::BatteryLevel;
 use crate::protocol::state::ButtonBits;
 
+use super::selector::{BROADCAST_MASK, PeerInfo, SelectorSnapshot, VISIBLE_ROWS};
 use super::{Toast, UiState};
 
 /// 单行最大字符缓冲：留一些余量避免 `write!` 溢出
@@ -46,7 +47,23 @@ where
 
   let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
 
-  // ---- 第 0 行：标题 + 连接状态 + 电量 ----
+  // ---- Selecting 模式：整屏面板接管，不画稳态内容 ----
+  //
+  // 不与稳态元素（摇杆值、Btn、Seq）共存——避免面板中看到摇杆读数
+  // 在变化带来的认知干扰；底部仍保留电量告警边框 & Toast 叠加。
+  if state.mode.is_selecting() {
+    draw_selector_panel(target, style, &state.selector)?;
+
+    if state.battery_level.is_alert() {
+      draw_low_battery_border(target, state.battery_level)?;
+    }
+    if let Some(toast) = state.toast.as_ref() {
+      draw_toast(target, style, toast)?;
+    }
+    return Ok(());
+  }
+
+  // ---- 第 0 行：标题 + 连接状态 + 目标 + 电量 ----
   draw_header(target, style, state)?;
 
   // ---- 第 1 行：分割线 ----
@@ -97,7 +114,13 @@ where
   Ok(())
 }
 
-/// 顶部标题栏：`ESP32-Ctrl BLE:● NOW:● 99%`
+/// 顶部标题栏：`Ctl B●N●H● >#03 99%`
+///
+/// 布局分区（x 坐标）：
+/// - `Ctl`（3 char，0..18）
+/// - `B● N● H●`（三个状态灯，22..57）
+/// - 目标指示器 `>#XX` / `>ALL` / `>---`（4 char，右对齐到电量前）
+/// - `99%`（电量，右对齐到 128px）
 fn draw_header<D>(
   target: &mut D,
   style: MonoTextStyle<'_, BinaryColor>,
@@ -123,12 +146,61 @@ where
   draw_status_dot(target, base_x + 32, 3, state.host_heartbeat_alive)?;
 
   // 电量文字（右对齐到 128px 边缘）
-  let mut buf = LineBuf::new();
-  let _ = write!(&mut buf, "{:3}%", state.battery);
-  let text_w = buf.len() as i32 * 6;
-  let x = OLED_WIDTH as i32 - text_w;
-  draw_text(target, style, &buf, x, 0)?;
+  let mut battery_buf = LineBuf::new();
+  let _ = write!(&mut battery_buf, "{:3}%", state.battery);
+  let battery_w = battery_buf.len() as i32 * 6;
+  let battery_x = OLED_WIDTH as i32 - battery_w;
+  draw_text(target, style, &battery_buf, battery_x, 0)?;
 
+  // 目标指示器：介于 H 灯（x=54, 宽 6px → 60）与电量之间
+  // 提前 2px 预留间隙；可用宽度 = battery_x - 62
+  let indicator_x = base_x + 38;
+  let indicator_max_w = battery_x - indicator_x - 2;
+  if indicator_max_w >= 24 {
+    draw_target_indicator(target, style, state.active_dest_mask, indicator_x)?;
+  }
+
+  Ok(())
+}
+
+/// 在标题栏绘制目标指示器——根据 `dest_mask` 选择显示样式。
+///
+/// 样式规则（四档，均固定宽度 ≤ 24px）：
+/// - `mask == BROADCAST_MASK`  → `>ALL`
+/// - `mask == 0`               → `>---`
+/// - `mask.count_ones() == 1`  → `>#03`（唯一位置的 id）
+/// - 其它                     → `>#*N`（N = 选中数量）
+fn draw_target_indicator<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+  mask: u32,
+  x: i32,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  let mut buf = LineBuf::new();
+  match mask {
+    BROADCAST_MASK => {
+      let _ = write!(&mut buf, ">ALL");
+    }
+    0 => {
+      let _ = write!(&mut buf, ">---");
+    }
+    _ => {
+      let count = mask.count_ones();
+      if count == 1 {
+        // trailing_zeros 上限为 31（count_ones == 1 不可能全 0），不会返回 32
+        let id = mask.trailing_zeros();
+        let _ = write!(&mut buf, ">#{:02}", id);
+      } else {
+        // 多选 → `>#*N`；N 最大 32，两位十进制足够
+        let n = count.min(99);
+        let _ = write!(&mut buf, ">#*{:1}", n);
+      }
+    }
+  }
+  draw_text(target, style, &buf, x, 0)?;
   Ok(())
 }
 
@@ -310,6 +382,208 @@ where
   )
   .into_styled(stroke)
   .draw(target)?;
+
+  Ok(())
+}
+
+// ============================================================
+// Target Selector 面板（长按 Switch 进入的选择模式）
+// ============================================================
+
+/// 面板每行高度（含 1px 行间距）
+const SELECTOR_ROW_H: i32 = LINE_H + 2;
+
+/// 光标标识字符宽度（`>` 一字符 = 6px + 1px 间距）
+const SELECTOR_MARK_W: i32 = 7;
+
+/// 面板 y 起点（跳过顶部标题 + 分割线）
+const SELECTOR_HEADER_Y: i32 = 0;
+const SELECTOR_LIST_TOP_Y: i32 = LINE_H + 3;
+
+/// 绘制 Selecting 模式下的选择器面板（全屏覆盖 Normal 内容）
+///
+/// # 布局（128×64）
+/// ```text
+///  y=0  : Select Target        1/5
+///  y=11 : ─────────────────────────
+///  y=13 : > #01 motor  -42dBm  *      ← 光标行反色
+///  y=25 :   #03 led    -55dBm
+///  y=37 :   #05 servo  -60dBm  *
+///  y=49 : ─────────────────────────
+///  y=51 : Jy^v B1+ B2-  Sw exit
+/// ```
+///
+/// - `>` = 当前光标
+/// - `*` = pending_mask 已选中
+/// - 列表按 [`VISIBLE_ROWS`] 分页，光标始终在可见窗口内
+///
+/// # Errors
+/// 传递底层 [`DrawTarget`] 的错误。
+fn draw_selector_panel<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+  snap: &SelectorSnapshot,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  // ---- 顶部标题：Select Target + N/M 计数 ----
+  draw_text(target, style, "Select Target", 0, SELECTOR_HEADER_Y)?;
+  draw_selector_header_counter(target, style, snap)?;
+
+  // ---- 分割线 ----
+  let sep_y = LINE_H + 1;
+  Line::new(
+    Point::new(0, sep_y),
+    Point::new(OLED_WIDTH as i32 - 1, sep_y),
+  )
+  .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+  .draw(target)?;
+
+  // ---- 候选行 ----
+  if snap.candidates.is_empty() {
+    draw_selector_empty_state(target, style)?;
+  } else {
+    draw_selector_rows(target, style, snap)?;
+  }
+
+  // ---- 底部操作提示（贴屏幕底部）----
+  let footer_y = OLED_HEIGHT as i32 - LINE_H;
+  draw_text(target, style, "Jy^v B1+ B2- SwExit", 0, footer_y)?;
+
+  Ok(())
+}
+
+/// 面板右上角：`光标索引/总数`（例如 `2/5`）
+fn draw_selector_header_counter<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+  snap: &SelectorSnapshot,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  if snap.candidates.is_empty() {
+    return Ok(());
+  }
+  let mut buf = LineBuf::new();
+  // cursor 1-based 显示更符合用户直觉（"第几个"）
+  let cur_1based = usize::from(snap.cursor).saturating_add(1);
+  let _ = write!(&mut buf, "{}/{}", cur_1based, snap.candidates.len());
+  let w = buf.len() as i32 * 6;
+  let x = OLED_WIDTH as i32 - w;
+  draw_text(target, style, &buf, x, SELECTOR_HEADER_Y)
+}
+
+/// 候选列表为空时的引导文案（居中显示）
+fn draw_selector_empty_state<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  // 三行文案，从 y=SELECTOR_LIST_TOP_Y 起
+  let lines: [&str; 3] = ["No receivers found.", "Waiting for peers", "to announce..."];
+  for (idx, text) in lines.iter().enumerate() {
+    let y = SELECTOR_LIST_TOP_Y + SELECTOR_ROW_H * idx as i32;
+    draw_text(target, style, text, 0, y)?;
+  }
+  Ok(())
+}
+
+/// 绘制可见窗口内的候选行 + 高亮光标行
+fn draw_selector_rows<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+  snap: &SelectorSnapshot,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  let total = snap.candidates.len();
+  let cursor = usize::from(snap.cursor).min(total.saturating_sub(1));
+
+  // 计算可见窗口起点：让光标始终落在 [top, top + VISIBLE_ROWS) 内；
+  // 优先"光标居中"，光标靠边时贴边显示。
+  let visible = VISIBLE_ROWS.min(total);
+  let half = visible / 2;
+  let top = cursor
+    .saturating_sub(half)
+    .min(total.saturating_sub(visible));
+
+  for row_idx in 0..visible {
+    let idx = top + row_idx;
+    let Some(peer) = snap.candidates.get(idx) else {
+      break;
+    };
+    let y = SELECTOR_LIST_TOP_Y + SELECTOR_ROW_H * row_idx as i32;
+    let is_cursor = idx == cursor;
+    draw_selector_row(target, style, peer, y, is_cursor, snap.pending_mask)?;
+  }
+  Ok(())
+}
+
+/// 绘制一行候选：`> #ID role  RSSIdBm  *`
+fn draw_selector_row<D>(
+  target: &mut D,
+  style: MonoTextStyle<'_, BinaryColor>,
+  peer: &PeerInfo,
+  y: i32,
+  is_cursor: bool,
+  pending_mask: u32,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  // 光标行画反色背景（整行 128×10 反色矩形）
+  if is_cursor {
+    Rectangle::new(
+      Point::new(0, y - 1),
+      Size::new(OLED_WIDTH as u32, LINE_H as u32 + 1),
+    )
+    .into_styled(PrimitiveStyle::with_fill(BinaryColor::On))
+    .draw(target)?;
+  }
+
+  let effective_style = if is_cursor {
+    MonoTextStyle::new(&FONT_6X10, BinaryColor::Off)
+  } else {
+    style
+  };
+
+  // 光标标记
+  if is_cursor {
+    draw_text(target, effective_style, ">", 0, y)?;
+  }
+
+  // `#ID` —— 2 位十进制
+  let mut id_buf = LineBuf::new();
+  let _ = write!(&mut id_buf, "#{:02}", peer.receiver_id);
+  draw_text(target, effective_style, &id_buf, SELECTOR_MARK_W, y)?;
+
+  // role 名称 —— UTF-8 反解；非法字节整段跳过
+  let role_slice = peer.role_bytes();
+  if let Ok(role_str) = core::str::from_utf8(role_slice) {
+    draw_text(target, effective_style, role_str, SELECTOR_MARK_W + 20, y)?;
+  }
+
+  // RSSI（可选：<-127 表示"未知"，跳过绘制）
+  if peer.rssi_dbm > i8::MIN {
+    let mut rssi_buf = LineBuf::new();
+    let _ = write!(&mut rssi_buf, "{}dBm", peer.rssi_dbm);
+    // 右对齐到 118px（给 `*` 留 10px）
+    let text_w = rssi_buf.len() as i32 * 6;
+    let x = OLED_WIDTH as i32 - text_w - 10;
+    draw_text(target, effective_style, &rssi_buf, x, y)?;
+  }
+
+  // 已选标记 `*`
+  let mask_bit = 1u32.wrapping_shl(u32::from(peer.receiver_id));
+  if pending_mask & mask_bit != 0 {
+    let star_x = OLED_WIDTH as i32 - 6;
+    draw_text(target, effective_style, "*", star_x, y)?;
+  }
 
   Ok(())
 }

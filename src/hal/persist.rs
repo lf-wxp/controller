@@ -14,7 +14,7 @@
 //! 切换后端无需修改业务代码（[`crate::transport::control`] 只调 `mark_dirty()`）。
 //!
 //! ## 数据布局
-//! [`PersistentConfig`] 用 `#[repr(C)]` 定长 60 字节（v2，U 选项启用）：
+//! [`PersistentConfig`] 用 `#[repr(C)]` 定长 60 字节（U 选项启用）：
 //! 未来若要新增字段，务必在**尾部追加**并升 [`PERSIST_VERSION`]，通过版本
 //! 号区分老/新布局做迁移。
 //!
@@ -31,9 +31,9 @@
 //!   58    |  2   | crc16_ibm(bytes[0..58])
 //! ```
 //!
-//! ## v1 → v2 升级
-//! **不兼容式实现**：decode 遇到 v1 直接 `UnsupportedVersion`，回退到
-//! [`Default`]。一次固件升级会丢一次配置，可接受。
+//! ## 版本不兼容处理
+//! **不兼容式实现**：decode 遇到不兼容的旧版本配置直接 `UnsupportedVersion`，
+//! 回退到 [`Default`]。一次固件升级会丢一次配置，可接受。
 //!
 //! ## 使用节奏（磨损考虑）
 //! Flash 有写入寿命（NOR flash ≈ 10^5 次/扇区）。**不能每条命令都写**。
@@ -67,7 +67,7 @@ pub const PERSIST_VERSION: u8 = 2;
 
 /// 持久化数据总长度（bytes）
 ///
-/// v2 布局（U 选项）：version(1) + battery_simulated(1) + joy_sensitivity(2) +
+/// 布局（U 选项）：version(1) + battery_simulated(1) + joy_sensitivity(2) +
 /// knob_sensitivity(2) + last_seq(4) + replay_windows(4 × 12 = 48) + crc(2) = 60
 pub const PERSIST_LEN: usize = 60;
 
@@ -503,7 +503,6 @@ mod tests {
 
   #[test]
   fn detect_v1_rejected() {
-    // U 选项：旧 v1 布局（长度 12）不能直接被 v2 接受
     let v1_bytes = [1_u8; 12]; // 长度不一致，应先报 BadLength
     assert_eq!(
       PersistentConfig::decode(&v1_bytes),

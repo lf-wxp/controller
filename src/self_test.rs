@@ -131,7 +131,7 @@ fn check_hmac_roundtrip() {
   }
 }
 
-/// 校验 4：Frame encode → decode 无损，且长度恒等于 21
+/// 校验 4：Frame encode → decode 无损，且长度恒等于 25
 fn check_frame_roundtrip() {
   let frame = Frame::new(0xDEAD_BEEF, GamepadState::EMPTY);
   let bytes = encode_frame(&frame);
@@ -142,8 +142,8 @@ fn check_frame_roundtrip() {
     "encoded frame length must equal FRAME_LEN"
   );
   assert_eq!(
-    FRAME_LEN, 21,
-    "wire protocol frame size must remain 21 bytes"
+    FRAME_LEN, 25,
+    "wire protocol frame size must remain 25 bytes"
   );
 
   let decoded = decode_frame(&bytes).expect("self-test frame must decode");

@@ -5,9 +5,9 @@
 //! ## 职责
 //! 定义"输入状态"与"传输帧"及二者的编解码，包括：
 //! - [`state::GamepadState`]：摇杆/按钮/旋钮的完整快照
-//! - [`frame::Frame`]：手柄 → Host 的广播帧（21 字节）
-//! - [`command::Command`]：Host → 手柄的反向命令（20 字节，HMAC 签名）
-//! - [`response::CommandResponse`]：手柄 → Host 的命令回执（20 字节，HMAC 签名）
+//! - [`frame::Frame`]：手柄 → Host 的广播帧（25 字节）
+//! - [`command::Command`]：Host → 手柄的反向命令（24 字节，HMAC 签名）
+//! - [`response::CommandResponse`]：手柄 → Host 的命令回执（24 字节，HMAC 签名）
 //! - [`replay::AntiReplayWindow`]：64-bit 滑动窗口抗重放
 //! - [`auth`]：HMAC-SHA256 计算 + session nonce
 //! - [`crc::crc16_ibm`]：CRC-16-IBM 校验
@@ -32,9 +32,9 @@
 //! ## 三种协议帧
 //! | 类型             | 长度 | Magic  | 版本 | 认证 | 抗重放           | 密钥轮换                    | 方向             |
 //! |------------------|------|--------|------|------|------------------|-----------------------------|------------------|
-//! | Frame            | 21 B | 0xC71E | 1    | 无   | 无               | 无                          | 手柄 → Host 广播 |
-//! | Command          | 20 B | 0xCB01 | 4    | HMAC | seq+per-key 窗口 | 4-bit key_id → SHARED_SECRETS | Host → 手柄      |
-//! | CommandResponse  | 20 B | 0xCB02 | 4    | HMAC | req_seq          | 同上                        | 手柄 → Host      |
+//! | Frame            | 25 B | 0xC71E | 2    | 无   | 无               | 无                          | 手柄 → Host 广播 |
+//! | Command          | 24 B | 0xCB01 | 5    | HMAC | seq+per-key 窗口 | 4-bit key_id → SHARED_SECRETS | Host → 手柄      |
+//! | CommandResponse  | 24 B | 0xCB02 | 5    | HMAC | req_seq          | 同上                        | 手柄 → Host      |
 //!
 //! Frame（手柄状态）不需要 HMAC/防重放 —— 它是**只读广播**，攻击者伪造 Frame
 //! 只能让 Host 看到假状态，不会让手柄执行动作。Command / Response 才是"控制面"，

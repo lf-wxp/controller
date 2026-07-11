@@ -10,7 +10,7 @@
 //! - **HID (0x1812)** —— 手柄核心，Report Map 描述形状，Report 承载数据（6 字节缩放值）
 //! - **Battery (0x180F)** —— 电量（当前固定 100%）
 //! - **Device Information (0x180A)** —— 厂商名，让手机显示"ESP32 by Rust"
-//! - **Custom Controller (自定义 128-bit UUID)** —— 完整 21 字节协议帧，
+//! - **Custom Controller (自定义 128-bit UUID)** —— 完整 25 字节协议帧，
 //!   自研 App / Python 客户端可以拿到 `seq / CRC / 未缩放的 i16 / u16 原始值`
 //!
 //! # 为什么"双轨并行"？
@@ -132,9 +132,9 @@ const MANUFACTURER_NAME: [u8; 16] = *b"Rust Controller\0";
 //
 // # UUID 分配
 // - Service:          c7000001-... —— 主服务
-// - FrameStream:      c7000002-... —— 完整帧（21 字节）
-// - ControlCommand:   c7000003-... —— Host 反向下发命令（20 字节 v3）
-// - ControlResponse:  c7000004-... —— 手柄→Host 命令回执 / NonceHello（20 字节 v3，N 选项）
+// - FrameStream:      c7000002-... —— 完整帧（25 字节）
+// - ControlCommand:   c7000003-... —— Host 反向下发命令（24 字节，含 HMAC）
+// - ControlResponse:  c7000004-... —— 手柄→Host 命令回执 / NonceHello（24 字节，N 选项）
 //
 // # 字节数组表示
 // trouble-host 的 `Uuid::new_long` 期望 **大端序** 16 字节。
@@ -162,7 +162,7 @@ const FRAME_STREAM_UUID: u128 = 0xc700_0002_1e00_4000_8000_0000_0000_00cc;
 
 /// Control Command Characteristic UUID —— `c7000003-1e00-4000-8000-0000000000cc`
 ///
-/// 反向通道：Host 通过 `write` 或 `write_without_response` 下发 12 字节的
+/// 反向通道：Host 通过 `write` 或 `write_without_response` 下发 24 字节的
 /// [`crate::protocol::Command`] 帧，手柄侧解码后执行。
 const CONTROL_COMMAND_UUID: u128 = 0xc700_0003_1e00_4000_8000_0000_0000_00cc;
 
@@ -177,18 +177,18 @@ const CONTROL_COMMAND_UUID: u128 = 0xc700_0003_1e00_4000_8000_0000_0000_00cc;
 /// BLE notify 与 ESP-NOW 广播发出，Host 任选一条链路接收。
 const CONTROL_RESPONSE_UUID: u128 = 0xc700_0004_1e00_4000_8000_0000_0000_00cc;
 
-/// Command 帧长度（20 字节）—— 供 `#[characteristic]` 宏的 `value = [0u8; N]` 使用
+/// Command 帧长度（24 字节）—— 供 `#[characteristic]` 宏的 `value = [0u8; N]` 使用
 use crate::protocol::COMMAND_LEN;
 
-/// Response 帧长度（20 字节）—— 同上；与 Command 同长但方向不同，magic 区分
+/// Response 帧长度（24 字节）—— 同上；与 Command 同长但方向不同，magic 区分
 use crate::protocol::RESPONSE_LEN;
 
-/// 自定义控制器服务 —— 双向：完整 21 字节协议帧 + 20 字节反向控制命令（v3 含 HMAC 认证 + 抗重放 seq）
+/// 自定义控制器服务 —— 双向：完整 25 字节协议帧 + 24 字节反向控制命令（含 HMAC 认证 + 抗重放 seq）
 ///
 /// # Characteristics
-/// - `frame_stream`（`read + notify`）：手柄 → Host，完整 21 字节协议帧（30 Hz）
-/// - `control_command`（`write + write_without_response`）：Host → 手柄，20 字节命令帧（v3 含 HMAC + seq 抗重放）
-/// - `control_response`（`read + notify`）：手柄 → Host，20 字节响应帧（N 选项：Ack / Error / NonceHello）
+/// - `frame_stream`（`read + notify`）：手柄 → Host，完整 25 字节协议帧（30 Hz）
+/// - `control_command`（`write + write_without_response`）：Host → 手柄，24 字节命令帧（含 HMAC + seq 抗重放）
+/// - `control_response`（`read + notify`）：手柄 → Host，24 字节响应帧（N 选项：Ack / Error / NonceHello）
 ///
 /// # 特点
 /// - **零缩放**：完全保留 `i16 [-1000..+1000]` 和 `u16 [0..1000]` 的原始精度

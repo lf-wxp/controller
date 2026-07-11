@@ -1,32 +1,26 @@
-//! # Command Response 协议 v4（手柄 → Host，反向反馈）
+//! # Command Response 协议（手柄 → Host，反向反馈）
 //!
-//! ## 帧格式（固定 20 字节，v4 含 HMAC 认证 + key_id）
+//! ## 帧格式（固定 24 字节，含 HMAC 认证 + key_id + 10B payload）
 //! ```text
 //!  offset | size | field
 //!  -------+------+-------------
 //!    0    |  2   | magic (0xCB02, LE)
 //!    2    |  1   | version_byte:
 //!         |      |    bits[7..4] = key_id (0..=15)  —— O 选项
-//!         |      |    bits[3..0] = protocol_version (= 4)
+//!         |      |    bits[3..0] = protocol_version (= 5)
 //!    3    |  4   | req_seq (LE) —— 对应 Command 的 seq（无对应时为 0，如 NonceHello）
 //!    7    |  1   | kind (u8) —— Response 种类
-//!    8    |  6   | payload —— 按 kind 解释
-//!   14    |  4   | hmac —— HMAC-SHA256(SHARED_SECRETS[key_id], nonce || bytes[0..14])[..4]
-//!   18    |  2   | crc16_ibm(bytes[0..18]) (LE)
+//!    8    | 10   | payload —— 按 kind 解释
+//!   18    |  4   | hmac —— HMAC-SHA256(SHARED_SECRETS[key_id], nonce || bytes[0..18])[..4]
+//!   22    |  2   | crc16_ibm(bytes[0..22]) (LE)
 //! ```
 //!
 //! ## 消息类型对照
 //! | 类型             | 长度 | Magic  | 版本低位 | 方向               |
 //! |------------------|------|--------|-----------|--------------------|
-//! | Frame            | 21 B | 0xC71E |  1        | 手柄 → Host 广播   |
-//! | Command          | 20 B | 0xCB01 |  4        | Host → 手柄        |
-//! | CommandResponse  | 20 B | 0xCB02 |  4        | 手柄 → Host（反馈）|
-//!
-//! ## 版本历史
-//! - **v1**（已废弃）：16 字节，无认证
-//! - **v2**（已废弃）：20 字节，含 HMAC
-//! - **v3**（已废弃）：20 字节，与 Command v3 版本对齐
-//! - **v4**（当前）：20 字节，version 字节拆分为 key_id + version，支持密钥轮换
+//! | Frame            | 25 B | 0xC71E |  2        | 手柄 → Host 广播   |
+//! | Command          | 24 B | 0xCB01 |  5        | Host → 手柄        |
+//! | CommandResponse  | 24 B | 0xCB02 |  5        | 手柄 → Host（反馈）|
 //!
 //! ## `req_seq` 的语义
 //! `req_seq` **直接取自请求 Command 的 seq 字段**（不再是手柄侧独立计数器）。
@@ -37,9 +31,11 @@
 //! - `Error(code)`     —— 命令执行失败，payload[0] = 错误码
 //! - `BatterySnapshot` —— 电量快照，payload[0] = 电量 %
 //! - `NonceHello`      —— K3：session nonce 主动广播（`req_seq = 0`）
+//! - `AnnounceReply`   —— receiver 回应 controller 的 Announce：
+//!   `payload = [mac[0..6], rssi_dbm(i8), role_tag[3]]`
 //!
 //! ## key_id 语义（O 选项）
-//! - **回执类响应**（Ack / Error / BatterySnapshot）使用**请求 Command 的 key_id**
+//! - **回执类响应**（Ack / Error / BatterySnapshot / AnnounceReply）使用**请求 Command 的 key_id**
 //!   —— Host 用同一份密钥就能验签
 //! - **主动广播**（NonceHello）使用 [`crate::config::keyring::DEFAULT_KEY_ID`]
 //!
@@ -47,7 +43,7 @@
 //! 手柄启动 + 每 [`crate::config::auth::NONCE_BROADCAST_INTERVAL_MS`] 广播一次：
 //! - `req_seq = 0`（保留值，表示"非请求响应"）
 //! - `payload[0..4] = session_nonce.to_le_bytes()`
-//! - `payload[4..6]` 保留，填 0
+//! - `payload[4..10]` 保留，填 0
 //!
 //! Host 侧收到后：
 //! 1. 若 nonce 变了（手柄重启）→ 更新缓存 + 重置 `tx_counter`
@@ -61,8 +57,8 @@ use crate::config::keyring::KEY_SLOTS;
 
 /// Response 协议魔数
 pub const RESPONSE_MAGIC: u16 = 0xCB02;
-/// Response 协议版本（v4 与 Command v4 对齐）
-pub const RESPONSE_VERSION: u8 = 4;
+/// Response 协议版本
+pub const RESPONSE_VERSION: u8 = 5;
 
 /// version 字段低 4 位掩码：bits[3..0] = protocol_version
 const VERSION_NIBBLE_MASK: u8 = 0x0F;
@@ -70,15 +66,16 @@ const VERSION_NIBBLE_MASK: u8 = 0x0F;
 const KEY_ID_SHIFT: u8 = 4;
 
 const HEADER_LEN: usize = 2 + 1 + 4 + 1;
-const PAYLOAD_LEN: usize = 6;
+/// payload 长度
+pub const PAYLOAD_LEN: usize = 10;
 const CRC_LEN: usize = 2;
-/// 完整 Response 帧字节数（20 = header 8 + payload 6 + hmac 4 + crc 2）
+/// 完整 Response 帧字节数（24 = header 8 + payload 10 + hmac 4 + crc 2）
 pub const RESPONSE_LEN: usize = HEADER_LEN + PAYLOAD_LEN + HMAC_TAG_LEN + CRC_LEN;
 
 const HMAC_OFFSET: usize = HEADER_LEN + PAYLOAD_LEN;
 const CRC_OFFSET: usize = HMAC_OFFSET + HMAC_TAG_LEN;
 
-const _: () = assert!(RESPONSE_LEN == 20);
+const _: () = assert!(RESPONSE_LEN == 24);
 
 // ============================================================
 // ResponseKind
@@ -96,6 +93,8 @@ pub enum ResponseKind {
   BatterySnapshot = 0x02,
   /// K3 Session Nonce 广播 —— payload[0..4] = nonce LE，剩余保留
   NonceHello = 0x03,
+  /// receiver 回应 controller Announce —— payload = [mac(6B), rssi(1B), role_tag(3B)]
+  AnnounceReply = 0x04,
 }
 
 impl ResponseKind {
@@ -106,6 +105,7 @@ impl ResponseKind {
       0x01 => Some(Self::Error),
       0x02 => Some(Self::BatterySnapshot),
       0x03 => Some(Self::NonceHello),
+      0x04 => Some(Self::AnnounceReply),
       _ => None,
     }
   }
@@ -167,6 +167,16 @@ pub enum ResponseBody {
   BatterySnapshot { percent: u8 },
   /// K3：Session nonce 广播（`req_seq` 应为 0，表示"非命令响应"）
   NonceHello { nonce: u32 },
+  /// receiver 对 controller Announce 的应答
+  ///
+  /// - `mac`：RPC 侧 receiver 自己的 MAC-48，controller 侧以其为唯一标识
+  /// - `rssi_dbm`：保留位（可选），-127 表示未知
+  /// - `role_tag`：3 字节 ASCII 角色标签，如 `mot`/`led`/`srv`，不足右侧补 0
+  AnnounceReply {
+    mac: [u8; 6],
+    rssi_dbm: i8,
+    role_tag: [u8; 3],
+  },
 }
 
 impl ResponseBody {
@@ -177,6 +187,7 @@ impl ResponseBody {
       Self::Error(_) => ResponseKind::Error,
       Self::BatterySnapshot { .. } => ResponseKind::BatterySnapshot,
       Self::NonceHello { .. } => ResponseKind::NonceHello,
+      Self::AnnounceReply { .. } => ResponseKind::AnnounceReply,
     }
   }
 }
@@ -242,6 +253,28 @@ impl CommandResponse {
       req_seq: 0,
       key_id: KeyId::DEFAULT,
       body: ResponseBody::NonceHello { nonce },
+    }
+  }
+
+  /// 便捷构造：Announce 回复
+  ///
+  /// `req_seq` 取自触发广播的 `Announce` 的 seq（方便 controller 相关性处理）。
+  #[must_use]
+  pub const fn announce_reply(
+    req_seq: u32,
+    key_id: KeyId,
+    mac: [u8; 6],
+    rssi_dbm: i8,
+    role_tag: [u8; 3],
+  ) -> Self {
+    Self {
+      req_seq,
+      key_id,
+      body: ResponseBody::AnnounceReply {
+        mac,
+        rssi_dbm,
+        role_tag,
+      },
     }
   }
 }
@@ -366,8 +399,18 @@ fn encode_payload(body: &ResponseBody) -> [u8; PAYLOAD_LEN] {
     ResponseBody::Error(code) => payload[0] = code as u8,
     ResponseBody::BatterySnapshot { percent } => payload[0] = percent.min(100),
     ResponseBody::NonceHello { nonce } => {
-      // nonce 占 payload[0..4]（LE），payload[4..6] 保留为 0
+      // nonce 占 payload[0..4]（LE），payload[4..10] 保留为 0
       payload[0..4].copy_from_slice(&nonce.to_le_bytes());
+    }
+    ResponseBody::AnnounceReply {
+      mac,
+      rssi_dbm,
+      role_tag,
+    } => {
+      // payload[0..6] = mac；payload[6] = rssi；payload[7..10] = role_tag
+      payload[0..6].copy_from_slice(&mac);
+      payload[6] = rssi_dbm as u8;
+      payload[7..10].copy_from_slice(&role_tag);
     }
   }
   payload
@@ -430,6 +473,18 @@ pub fn decode_response(buf: &[u8]) -> Result<CommandResponse, ResponseDecodeErro
     ResponseKind::NonceHello => ResponseBody::NonceHello {
       nonce: u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]),
     },
+    ResponseKind::AnnounceReply => {
+      let mut mac = [0_u8; 6];
+      mac.copy_from_slice(&payload[0..6]);
+      let rssi_dbm = payload[6] as i8;
+      let mut role_tag = [0_u8; 3];
+      role_tag.copy_from_slice(&payload[7..10]);
+      ResponseBody::AnnounceReply {
+        mac,
+        rssi_dbm,
+        role_tag,
+      }
+    }
   };
 
   Ok(CommandResponse {
@@ -445,9 +500,9 @@ mod tests {
   use crate::config::auth::AUTH_ENABLED;
 
   #[test]
-  fn frame_length_is_20() {
+  fn frame_length_is_24() {
     let bytes = encode_response(&CommandResponse::ack(0));
-    assert_eq!(bytes.len(), 20);
+    assert_eq!(bytes.len(), 24);
   }
 
   #[test]
@@ -563,13 +618,38 @@ mod tests {
 
   #[test]
   fn v3_response_rejected() {
-    // 伪造 v3（version_byte = 0x03），当前 v4 处理器应拒绝
+    // 伪造 v3（version_byte = 0x03），
     let mut bytes = encode_response(&CommandResponse::ack(1));
     bytes[2] = 0x03;
     match decode_response(&bytes) {
       Err(ResponseDecodeError::UnsupportedVersion(0x03)) => {}
       other => panic!("expected UnsupportedVersion(0x03), got {:?}", other),
     }
+  }
+
+  #[test]
+  fn v4_response_rejected() {
+    // version_byte 低 4 位 protocol_version = 4，与当前协议版本（RESPONSE_VERSION）不符，应被拒绝
+    let mut bytes = encode_response(&CommandResponse::ack(1));
+    bytes[2] = 0x04;
+    match decode_response(&bytes) {
+      Err(ResponseDecodeError::UnsupportedVersion(0x04)) => {}
+      other => panic!("expected UnsupportedVersion(0x04), got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn roundtrip_announce_reply() {
+    let resp = CommandResponse::announce_reply(
+      42,
+      KeyId::DEFAULT,
+      [0x24, 0x0A, 0xC4, 0x11, 0x22, 0x33],
+      -55,
+      *b"mot",
+    );
+    let bytes = encode_response(&resp);
+    let decoded = decode_response(&bytes).unwrap();
+    assert_eq!(decoded, resp);
   }
 
   #[test]

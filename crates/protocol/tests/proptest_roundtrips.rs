@@ -95,6 +95,9 @@ fn any_command_body() -> impl Strategy<Value = CommandBody> {
       CommandBody::ShowToast { len, bytes }
     }),
     any::<bool>().prop_map(|simulate| CommandBody::SetBatteryMode { simulate }),
+    Just(CommandBody::Announce),
+    (any::<[u8; 6]>(), 0_u8..32_u8)
+      .prop_map(|(mac, receiver_id)| CommandBody::AssignId { mac, receiver_id }),
   ]
 }
 
@@ -119,6 +122,13 @@ fn any_response_body() -> impl Strategy<Value = ResponseBody> {
     .prop_map(ResponseBody::Error),
     (0_u8..=100).prop_map(|percent| ResponseBody::BatterySnapshot { percent }),
     any::<u32>().prop_map(|nonce| ResponseBody::NonceHello { nonce }),
+    (any::<[u8; 6]>(), any::<i8>(), any::<[u8; 3]>()).prop_map(|(mac, rssi_dbm, role_tag)| {
+      ResponseBody::AnnounceReply {
+        mac,
+        rssi_dbm,
+        role_tag,
+      }
+    }),
   ]
 }
 
@@ -142,6 +152,7 @@ proptest! {
   fn frame_roundtrip_preserves_state(
     payload in any_gamepad_state(),
     seq in any::<u32>(),
+    dest_mask in any::<u32>(),
   ) {
     // Arrange
     let frame = Frame {
@@ -151,6 +162,7 @@ proptest! {
         seq,
       },
       payload,
+      dest_mask,
     };
 
     // Act
@@ -159,6 +171,7 @@ proptest! {
 
     // Assert
     prop_assert_eq!(decoded.header.seq, seq);
+    prop_assert_eq!(decoded.dest_mask, dest_mask);
     prop_assert_eq!(decoded.payload.buttons, payload.buttons);
     prop_assert_eq!(decoded.payload.joy_x, payload.joy_x);
     prop_assert_eq!(decoded.payload.joy_y, payload.joy_y);
@@ -170,7 +183,7 @@ proptest! {
   fn frame_single_bit_flip_breaks_crc(
     payload in any_gamepad_state(),
     seq in any::<u32>(),
-    flip_offset in 0_usize..21,
+    flip_offset in 0_usize..25,
     flip_bit in 0_u8..8,
   ) {
     // Arrange: encode 一个合法帧
@@ -181,6 +194,7 @@ proptest! {
         seq,
       },
       payload,
+      dest_mask: u32::MAX,
     };
     let mut encoded = encode_frame(&frame);
 
@@ -242,6 +256,14 @@ proptest! {
       ) => {
         prop_assert_eq!(a1, b1);
       }
+      (CommandBody::Announce, CommandBody::Announce) => {}
+      (
+        CommandBody::AssignId { mac: a1, receiver_id: a2 },
+        CommandBody::AssignId { mac: b1, receiver_id: b2 },
+      ) => {
+        prop_assert_eq!(a1, b1);
+        prop_assert_eq!(a2, b2);
+      }
       _ => prop_assert!(false, "body variant mismatch after roundtrip"),
     }
   }
@@ -261,6 +283,8 @@ proptest! {
       CommandBody::SetSensitivity { .. } => CommandKind::SetSensitivity,
       CommandBody::ShowToast { .. } => CommandKind::ShowToast,
       CommandBody::SetBatteryMode { .. } => CommandKind::SetBatteryMode,
+      CommandBody::Announce => CommandKind::Announce,
+      CommandBody::AssignId { .. } => CommandKind::AssignId,
     };
     prop_assert_eq!(encoded[3], expected_kind as u8);
   }
@@ -299,6 +323,14 @@ proptest! {
         ResponseBody::NonceHello { nonce: b },
       ) => {
         prop_assert_eq!(a, b);
+      }
+      (
+        ResponseBody::AnnounceReply { mac: a1, rssi_dbm: a2, role_tag: a3 },
+        ResponseBody::AnnounceReply { mac: b1, rssi_dbm: b2, role_tag: b3 },
+      ) => {
+        prop_assert_eq!(a1, b1);
+        prop_assert_eq!(a2, b2);
+        prop_assert_eq!(a3, b3);
       }
       _ => prop_assert!(false, "response body variant mismatch"),
     }

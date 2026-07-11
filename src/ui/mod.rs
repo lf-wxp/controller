@@ -23,8 +23,26 @@
 //! ## Toast
 //! 接收到 [`crate::transport::control`] 分发的 `ShowToast` 命令时，通过
 //! [`TOAST_SIGNAL`] 将短提示传递到 `oled_task`，底部显示 3 秒后自动消失。
+//!
+//! ## 接收方选择器（Target Selector）
+//! 见 [`selector`] 子模块：长按 Switch 进入 Selecting 模式，通过摇杆 + Btn1/Btn2
+//! 在候选接收方列表里选择当前 Frame 广播目标，选中的目标以 `dest_mask` 位图
+//! 形式暴露给发送侧（[`selector::active_dest_mask`]）。
 
 pub mod layout;
+pub mod selector;
+
+// ============================================================
+// 公共 re-export（proj-pub-use-reexport）
+// ============================================================
+//
+// 让 main.rs / bin 层通过 `crate::ui::UiMode` 直接拿到关键类型，
+// 不用记住 selector 子模块路径。
+
+pub use selector::{
+  SelectorInput, SelectorOutcome, SelectorSnapshot, UiMode, active_dest_mask, current_mode,
+  handle_input as handle_selector_input, snapshot as selector_snapshot,
+};
 
 use core::convert::Infallible;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
@@ -161,12 +179,15 @@ pub type UiFrameSignal = Signal<CriticalSectionRawMutex, Frame>;
 
 /// UI 渲染所需状态（一次绘屏的完整数据）
 ///
-/// 来自两处：
+/// 来自三处：
 /// - **payload**：当前手柄输入（`Frame.payload` + `Frame.seq`）
 /// - **health**：连接/电量（从 `AtomicBool`/`AtomicU8` 读取快照）
+/// - **selector**：接收方选择器模式 + 快照（由 [`selector`] 提供）
 ///
-/// 使用值语义 `Copy`，避免共享借用带来的复杂度。
-#[derive(Debug, Clone, Copy)]
+/// 使用值语义 `Copy` 语义——除 `selector` 字段外都是 `Copy`；`selector` 内含
+/// `heapless::Vec<PeerInfo, MAX_PEERS>` 是 `Clone` 但不是 `Copy`，因此
+/// `UiState` 也只 derive `Clone`。
+#[derive(Debug, Clone)]
 pub struct UiState {
   /// 当前展示的手柄帧
   pub frame: Frame,
@@ -182,11 +203,19 @@ pub struct UiState {
   pub battery_level: BatteryLevel,
   /// 当前活跃的 Toast（未过期时不为 None）
   pub toast: Option<Toast>,
+  /// 当前 UI 模式（Normal / Selecting）
+  pub mode: UiMode,
+  /// 选择器快照（Selecting 模式下用于绘面板；Normal 时仍带 `pending_mask`
+  /// 与 `candidates` 供标题栏渲染目标指示器）
+  pub selector: SelectorSnapshot,
+  /// 当前**已生效**的目标 mask（Normal 稳态标题栏渲染 `→#XX` / `→ALL` 用）
+  pub active_dest_mask: u32,
 }
 
 impl UiState {
   /// 从最新 Frame + 共享状态 + 当前 Toast 构造一个快照
   pub fn snapshot(frame: Frame, toast: Option<Toast>) -> Self {
+    let now = embassy_time::Instant::now();
     Self {
       frame,
       ble_connected: BLE_CONNECTED.load(Ordering::Relaxed),
@@ -195,6 +224,9 @@ impl UiState {
       battery: BATTERY_LEVEL.load(Ordering::Relaxed),
       battery_level: battery_level_state(),
       toast,
+      mode: current_mode(),
+      selector: selector_snapshot(now),
+      active_dest_mask: active_dest_mask(),
     }
   }
 }

@@ -282,7 +282,7 @@ fn maybe_persist_replay(key_id: KeyId) {
 /// - 每次进入都会调用 [`touch_host_heartbeat`] 刷新心跳时间戳
 /// - 每次完成分发若 [`AUTO_ACK`] 为 true，则往双链路（ESP-NOW + BLE）广播
 ///   [`CommandResponse::Ack`]，其中：
-///   - `req_seq` **直接采用 Command 的 seq**（v3 起）
+///   - `req_seq` **直接采用 Command 的 seq**（回执与命令严格对应）
 ///   - `key_id`  **直接采用 Command 的 key_id**（O 选项）—— Host 可用同一密钥验签
 pub fn handle_command(src: CommandSource, cmd: Command) {
   // 收到任意（已通过校验的）命令都算 Host "还活着"
@@ -382,6 +382,23 @@ fn execute(src: CommandSource, cmd: &Command) -> Result<(), ErrorCode> {
       );
       mark_persist_dirty();
       Ok(())
+    }
+    // Announce / AssignId 是"手柄 → 接收方"方向的命令：controller 自身仅作为
+    // 发送方，不会主动接收该 kind。若确实收到，说明 host 端错误地把本机也
+    // 当成 receiver 广播 —— 回 Unsupported 错误码，让上层日志能定位问题。
+    CommandBody::Announce => {
+      info!(
+        "[CTRL] Announce received on controller from {} (ignored, controller is not a receiver)",
+        src
+      );
+      Err(ErrorCode::Unsupported)
+    }
+    CommandBody::AssignId { .. } => {
+      info!(
+        "[CTRL] AssignId received on controller from {} (ignored, controller is not a receiver)",
+        src
+      );
+      Err(ErrorCode::Unsupported)
     }
   }
 }

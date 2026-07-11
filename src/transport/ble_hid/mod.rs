@@ -1,7 +1,7 @@
 //! # BLE HID Gamepad + Custom Controller Transport
 //!
 //! 让本设备被手机 / PC / iPad 直接识别为**标准游戏手柄**的同时，
-//! 通过一个自定义 GATT 服务向自研 App / Python 客户端暴露**完整 21 字节协议帧**。
+//! 通过一个自定义 GATT 服务向自研 App / Python 客户端暴露**完整 25 字节协议帧**。
 //!
 //! ## 架构（生产者-消费者，双消费点）
 //! ```text
@@ -114,7 +114,7 @@ pub fn signal_response(resp: CommandResponse) {
 /// 把当前 `Frame` 写进 Signal，让 BLE 任务在其自己的时序里推送。
 ///
 /// # 为什么 Signal 里存 `Frame` 而不是编码后的字节？
-/// - `Frame` 只有 21 字节负载 + `Copy`，开销可忽略
+/// - `Frame` 只有 25 字节负载 + `Copy`，开销可忽略
 /// - BLE 任务侧才知道每个 characteristic 需要什么样的编码
 /// - main 侧不需要感知底层协议，保持传输层职责纯净
 pub struct BleHidTransport {
@@ -216,7 +216,7 @@ pub async fn ble_gamepad_task(
 /// 3. 拿到 [`GattConnection`] 后进入内层循环：
 ///    - `select(conn.next(), signal.wait())` 谁先来处理谁
 ///    - 前者：处理 read/write 事件（Host 读 Report Map、订阅 CCCD 等）
-///    - 后者：把新的 Frame 分别编码成 HID 6 字节 + Custom 21 字节，各自 `notify`
+///    - 后者：把新的 Frame 分别编码成 HID 6 字节 + Custom 25 字节，各自 `notify`
 ///
 /// # 错误处理
 /// 任何底层 BLE 错误都通过 log 汇报，然后**继续重试广播**——避免一次抖动导致

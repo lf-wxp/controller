@@ -12,7 +12,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use bt_hci::controller::ExternalController;
 use defmt::info;
 use embassy_executor::Spawner;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::Blocking;
 use esp_hal::analog::adc::{Adc, AdcConfig, Attenuation};
 use esp_hal::clock::CpuClock;
@@ -46,7 +46,9 @@ use controller::transport::esp_now::{
   nonce_broadcast_task,
 };
 use controller::transport::{CompositeTransport, Transport};
-use controller::ui::{OledDisplay, UiFrameSignal, UiTransport, oled_task};
+use controller::ui::{
+  OledDisplay, SelectorInput, UiFrameSignal, UiTransport, handle_selector_input, oled_task,
+};
 
 extern crate alloc;
 
@@ -398,6 +400,11 @@ async fn main(spawner: Spawner) -> ! {
 
   let mut seq: u32 = 0;
   let mut tick: u32 = 0;
+  // Announce 命令独立 seq 计数器（不与 Frame seq 共享）
+  //
+  // 反重放窗口按 (key_id, seq) 独立维护，因此 Announce/AssignId 不能借用
+  // Frame 的 seq —— 否则会导致空口上 seq 空间跳跃、窗口频繁失步。
+  let mut announce_seq: u32 = 1;
   loop {
     // ---- 采样 + 本地反馈（LED 位图写入 AtomicU8，effect task 应用到硬件）----
     let mut sample = sampler.poll(&mut adc);
@@ -406,16 +413,39 @@ async fn main(spawner: Spawner) -> ! {
     // ---- 应用灵敏度缩放（可能被 Host 命令动态修改）----
     apply_sensitivity(&mut sample.state);
 
-    // ---- 每 TRANSMIT_EVERY_N 次采样发一帧 ----
-    if tick.is_multiple_of(TRANSMIT_EVERY_N) {
-      let frame = Frame::new(seq, sample.state);
+    // ---- 驱动接收方选择器：长按 Switch 切换模式、摇杆 Y 移光标、Btn1/Btn2 加减目标 ----
+    //
+    // Selecting 模式下选择器会把 `suppress_frame_send` 置 true，此时下面的
+    // `transport.send(&frame)` 会被跳过，避免摇杆游走干扰接收端。
+    let selector_outcome = handle_selector_input(SelectorInput {
+      switch_on: sample.switch_on,
+      btn1_just_pressed: sample.buttons[0] == controller::hal::button::ButtonState::JustPressed,
+      btn2_just_pressed: sample.buttons[1] == controller::hal::button::ButtonState::JustPressed,
+      joy_y: sample.joystick.y,
+      now: Instant::now(),
+    });
+
+    // ---- 首次进入 Selecting：广播 Announce，让所有 receiver 上报 AnnounceReply ----
+    //
+    // 独立 `announce_seq` 计数器（不与 Frame seq 共享），保证反重放窗口按需
+    // 独立推进。计数溢出概率极低（32 位），此处不做额外保护。
+    if selector_outcome.just_entered {
+      controller::transport::esp_now::broadcast_announce(announce_seq);
+      announce_seq = announce_seq.wrapping_add(1);
+    }
+
+    // ---- 每 TRANSMIT_EVERY_N 次采样发一帧，Selecting 时静默不发 ----
+    if tick.is_multiple_of(TRANSMIT_EVERY_N) && !selector_outcome.suppress_frame_send {
+      // dest_mask 从选择器的已生效目标位图取——Normal 模式下默认为广播
+      // (BROADCAST_DEST_MASK)，Selecting 退出后会替换为用户选中的候选 peer 位图。
+      let frame = Frame::with_dest(seq, sample.state, controller::ui::active_dest_mask());
       // 类型级 Infallible 断言：当前四条 transport（BLE/ESP-NOW/UI/defmt）的
       // `Error` 都是 [`core::convert::Infallible`]，`CompositeTransport` 组合
       // 后 `Error = CompositeError<Infallible, CompositeError<Infallible, Infallible>>`
-      // 是"不可构造"的类型 —— 用 `match e {}` 做空模式穷举比 `.unwrap()` 更严谨：
+      // 是"不可构造"的类型—— 用 `match e {}` 做空模式穷举比 `.unwrap()` 更严谨：
       //
       // - `.unwrap()`：语义暗示"可能 panic"，且未来任一 transport 变成可失败时会
-      //   静默把编译期不变量降级成运行时 panic
+      //   静默把编译期不变量降级为运行时 panic
       // - `match e {}`：编译器要求穷举所有变体；一旦 transport 引入可失败 `Error`
       //   变体，此处立刻编译失败，强迫显式处理
       if let Err(e) = transport.send(&frame) {

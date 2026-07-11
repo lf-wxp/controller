@@ -1,6 +1,6 @@
 # Receiver 项目引用 `controller-protocol` 的最小示例
 
-本文件配合 tag [`protocol-v0.1.0`](https://github.com/lf-wxp/controller/releases/tag/protocol-v0.1.0) 使用，
+本文件配合 tag [`protocol-v0.2.0`](https://github.com/lf-wxp/controller/releases/tag/protocol-v0.2.0) 使用，
 展示**另一个 receiver 项目**如何以 Git 依赖方式复用本 crate，**无需拷贝源码**。
 
 > 详细的 feature 组合矩阵、密钥注入契约、常见坑请见 [`../USAGE.md`](../USAGE.md)。
@@ -11,8 +11,8 @@
 ## 0. Tag 快照
 
 ```text
-tag:    protocol-v0.1.0
-commit: 5eda0a8        # git rev-parse protocol-v0.1.0^{}
+tag:    protocol-v0.2.0
+commit: 5eda0a8        # git rev-parse protocol-v0.2.0^{}
 crate:  controller-protocol
 repo:   https://github.com/lf-wxp/controller
 path:   crates/protocol         # Cargo 会自动在 workspace 中定位
@@ -33,7 +33,7 @@ rust-version = "1.88"
 [dependencies]
 controller-protocol = {
   git = "https://github.com/lf-wxp/controller",
-  tag = "protocol-v0.1.0",
+  tag = "protocol-v0.2.0",
   default-features = false,      # 关掉 embed-default-secrets，强制注入真密钥
   features = ["defmt"],          # 仅启用 defmt::Format 集成
 }
@@ -50,7 +50,7 @@ defmt     = "1"
 [dependencies]
 controller-protocol = {
   git = "https://github.com/lf-wxp/controller",
-  tag = "protocol-v0.1.0",
+  tag = "protocol-v0.2.0",
   default-features = false,
   features = ["std", "serde"],   # std：alloc/vec；serde：跨语言 JSON
 }
@@ -63,7 +63,7 @@ tokio = { version = "1", features = ["full"] }
 [dependencies]
 controller-protocol = {
   git = "https://github.com/lf-wxp/controller",
-  tag = "protocol-v0.1.0",
+  tag = "protocol-v0.2.0",
   default-features = false,
   features = ["serde"],
 }
@@ -80,7 +80,7 @@ wasm-bindgen = "0.2"
 
 ## 2. 最小接收端代码（no_std / ESP-NOW）
 
-只做一件事：**收 21B `Frame` 广播 → 打印摇杆状态**。
+只做一件事：**收 25B `Frame` 广播 → 打印摇杆状态**。
 
 ```rust
 #![no_std]
@@ -89,7 +89,7 @@ wasm-bindgen = "0.2"
 use controller_protocol::{Frame, GamepadState, DecodeError};
 use defmt::info;
 
-/// ESP-NOW 回调里拿到的原始 21 字节 payload
+/// ESP-NOW 回调里拿到的原始 25 字节 payload
 pub fn on_espnow_frame(payload: &[u8]) {
   // 早退：长度不对直接丢弃（协议是定长）
   if payload.len() != Frame::LEN {
@@ -191,15 +191,15 @@ cargo build --release
 
 ---
 
-## 5. 升级流程（未来有 `protocol-v0.2.0` 时）
+## 5. 版本与依赖
 
-Receiver 项目端只需两步：
+Receiver 项目直接引用当前版本即可：
 
 ```toml
 # Cargo.toml
 controller-protocol = {
   git = "https://github.com/lf-wxp/controller",
-  tag = "protocol-v0.2.0",   # ← 换 tag
+  tag = "protocol-v0.2.0",
   default-features = false,
   features = ["defmt"],
 }
@@ -210,9 +210,8 @@ cargo update -p controller-protocol
 cargo build --release
 ```
 
-**Semver 契约**：本 crate 承诺遵守 [SemVer](https://semver.org/)：
-- `0.1.x → 0.1.y`：仅 bugfix / doc / 向后兼容的新 API
-- `0.1.x → 0.2.0`：可能出现 breaking change（帧格式/公共类型），必须读 CHANGELOG
+本 crate 的字节布局以 crate 内 `PROTOCOL_VERSION` / `COMMAND_VERSION` / `RESPONSE_VERSION` 常量为准，
+接入方无需在业务代码里硬编码版本号。
 
 ---
 
@@ -220,7 +219,7 @@ cargo build --release
 
 打完 tag、receiver 侧拉下来后，先跑一遍这五条：
 
-- [ ] `cargo tree -p controller-protocol` 显示 tag 匹配 `protocol-v0.1.0`
+- [ ] `cargo tree -p controller-protocol` 显示 tag 匹配 `protocol-v0.2.0`
 - [ ] `cargo tree -e features -p controller-protocol` **不含** `embed-default-secrets` / `debug-auth-bypass`
 - [ ] `env | grep CONTROLLER_SECRET_V` 两条都是 32 字节
 - [ ] 空跑一次 `Frame::decode(&[0u8; 21])` → 应返回 `Err(BadMagic)`（证明协议 crate 真的被链接进来了）

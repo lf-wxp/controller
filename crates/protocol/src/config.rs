@@ -43,7 +43,7 @@ pub mod auth {
   /// HMAC 截断长度（字节）
   ///
   /// 完整的 HMAC-SHA256 是 32 字节；我们截断到前 4 字节。理由：
-  /// - Command / Response 帧长度固定为 20 字节，无空间放 32B tag
+  /// - Command / Response 帧长度固定为 24 字节，无空间放 32B tag
   /// - 4 字节 = 32-bit 空间；即使攻击者尝试爆破，也需要 2^32 次尝试
   /// - 每次爆破需要一整轮 CRC + HMAC 计算，实际成本极高
   pub const HMAC_TAG_LEN: usize = 4;

@@ -43,7 +43,9 @@ use controller_protocol::{
   auth::{KeyId, init_session_nonce, session_nonce},
   command::{Command, CommandBody, CommandDecodeError, decode_command, encode_command},
   replay::AntiReplayWindow,
-  response::{CommandResponse, ErrorCode, ResponseBody, decode_response, encode_response},
+  response::{
+    CommandResponse, ErrorCode, RESPONSE_LEN, ResponseBody, decode_response, encode_response,
+  },
 };
 
 /// 演示用的固定初始 nonce（真实手柄会用硬件 RNG 生成）
@@ -64,7 +66,7 @@ impl SimulatedGamepad {
   }
 
   /// 模拟手柄开机：初始化 SESSION_NONCE 并广播 NonceHello
-  fn boot() -> ([u8; 20], u32) {
+  fn boot() -> ([u8; RESPONSE_LEN], u32) {
     init_session_nonce(DEMO_INITIAL_NONCE);
     let nonce = session_nonce();
     let hello = CommandResponse::nonce_hello(nonce);
@@ -72,8 +74,8 @@ impl SimulatedGamepad {
     (bytes, nonce)
   }
 
-  /// 手柄侧处理入站 Command，返回 20 字节 Response
-  fn handle_command(&mut self, wire_bytes: &[u8]) -> [u8; 20] {
+  /// 手柄侧处理入站 Command，返回 24 字节 Response
+  fn handle_command(&mut self, wire_bytes: &[u8]) -> [u8; RESPONSE_LEN] {
     // Step 1: 解码（自动校验 CRC + HMAC + version + key_id）
     let cmd = match decode_command(wire_bytes) {
       Ok(cmd) => cmd,
@@ -127,12 +129,18 @@ impl SimulatedGamepad {
         );
         CommandResponse::ack_with_key(cmd.seq, cmd.key_id)
       }
+      // Announce / AssignId 是 controller→receiver 方向的命令；host-demo
+      // 模拟的是手柄本体，收到这两种 kind 属于协议误用，回 Unsupported。
+      CommandBody::Announce | CommandBody::AssignId { .. } => {
+        println!("  [gamepad] 收到 Announce/AssignId（协议方向错误，忽略）");
+        CommandResponse::err_with_key(cmd.seq, cmd.key_id, ErrorCode::Unsupported)
+      }
     };
 
     encode_response(&resp)
   }
 
-  fn reject(&self, req_seq: u32, code: ErrorCode) -> [u8; 20] {
+  fn reject(&self, req_seq: u32, code: ErrorCode) -> [u8; RESPONSE_LEN] {
     let resp = CommandResponse::err_with_key(req_seq, KeyId::DEFAULT, code);
     encode_response(&resp)
   }
@@ -256,6 +264,11 @@ fn main() {
           println!("  ← [host] 电量：{}%", percent)
         }
         ResponseBody::NonceHello { .. } => unreachable!("NonceHello only on boot"),
+        ResponseBody::AnnounceReply { .. } => {
+          // host demo 不与 Announce/Reply 交互（那是 controller↔receiver 方向的事），
+          // 上下文理论上不会到达。为严谨起见回删除而不 panic。
+          println!("[host] unexpected AnnounceReply ignored");
+        }
       },
       Err(err) => println!("  ← [host] 解码失败：{:?}", err),
     }
@@ -368,15 +381,17 @@ mod tests {
   }
 
   #[test]
-  fn wire_bytes_length_is_20() {
+  fn wire_bytes_length_matches_protocol_constants() {
+    use controller_protocol::{COMMAND_LEN, RESPONSE_LEN};
+
     init_session_nonce(DEMO_INITIAL_NONCE);
     let cmd = Command::with_key(1, KeyId::DEFAULT, CommandBody::Nop);
     let bytes = encode_command(&cmd);
-    assert_eq!(bytes.len(), 20);
+    assert_eq!(bytes.len(), COMMAND_LEN);
 
     let resp = CommandResponse::ack_with_key(1, KeyId::DEFAULT);
     let bytes = encode_response(&resp);
-    assert_eq!(bytes.len(), 20);
+    assert_eq!(bytes.len(), RESPONSE_LEN);
   }
 
   #[test]

@@ -6,7 +6,7 @@
 //! ```text
 //! 手柄侧                                     接收端
 //!   │                                         │
-//!   │─── ① Frame (0xC71E, 21B) ──────────────▶│
+//!   │─── ① Frame (0xC71E, 25B) ──────────────▶│
 //!   │    encode_frame(seq=1)                  │
 //!   │                                         │  decode_frame
 //!   │                                         │  ├─ 校验 magic
@@ -223,7 +223,7 @@ fn main() {
   // ────────────────────────────────────────────────────────────────
   println!();
   println!("④ 干扰帧演示：Command 帧 (0xCB01) 在同一广播频道上，接收端应忽略");
-  // 构造一个假的 Command 帧（20B）—— magic = 0xCB01
+  // 构造一个假的 Command 帧（COMMAND_LEN 字节）—— magic = 0xCB01
   let mut fake_command = [0_u8; FRAME_LEN];
   fake_command[0] = 0x01;
   fake_command[1] = 0xCB;
@@ -234,8 +234,53 @@ fn main() {
     other => println!("   意外结果：{:?}", other),
   }
 
+  // ────────────────────────────────────────────────────────────────
+  // Phase 5: Frame `dest_mask` 过滤演示
+  // ────────────────────────────────────────────────────────────────
   println!();
-  println!("✅ 演示完成。Frame 编解码 + seq gap 检测 + 错误处理全部验证通过。");
+  println!("⑤ dest_mask 过滤演示（Frame）：");
+  demo_dest_mask_filtering();
+
+  println!();
+  println!("✅ 演示完成。Frame 编解码 + seq gap 检测 + 错误处理 + dest_mask 过滤全部验证通过。");
+}
+
+/// 模拟本机 receiver 的逻辑 ID（由 AssignId 命令在真机上下发）
+const DEMO_RECEIVER_ID: u8 = 3;
+
+/// 演示 `dest_mask` 位图过滤：模拟一个 `receiver_id = 3` 的接收方，
+/// 依次接收 3 帧：广播帧、寻址到自己的帧、寻址到别人的帧，
+/// 只有前两帧会被处理。
+fn demo_dest_mask_filtering() {
+  // 1) 广播帧（默认 dest_mask = 0xFFFF_FFFF）
+  let broadcast = Frame::new(10, GamepadState::EMPTY);
+  print_dest_mask_result("广播帧", &broadcast);
+
+  // 2) 单播到本机 (bit-3)
+  let mine_mask = 1_u32 << DEMO_RECEIVER_ID;
+  let mine = Frame::with_dest(11, GamepadState::EMPTY, mine_mask);
+  print_dest_mask_result("单播到本机", &mine);
+
+  // 3) 单播到别的 receiver (bit-7)
+  let others_mask = 1_u32 << 7;
+  let others = Frame::with_dest(12, GamepadState::EMPTY, others_mask);
+  print_dest_mask_result("单播到 receiver_id=7", &others);
+}
+
+/// 辅助函数：编码 → 解码 → 判断 `is_addressed_to(DEMO_RECEIVER_ID)`
+fn print_dest_mask_result(label: &str, frame: &Frame) {
+  let wire = encode_frame(frame);
+  let decoded = decode_frame(&wire).expect("decode ok");
+  let addressed = decoded.is_addressed_to(DEMO_RECEIVER_ID);
+  let outcome = if addressed {
+    "✓ 处理"
+  } else {
+    "✗ 丢弃"
+  };
+  println!(
+    "   {} seq={} dest_mask=0x{:08x} → receiver_id={} {}",
+    outcome, decoded.header.seq, decoded.dest_mask, DEMO_RECEIVER_ID, label
+  );
 }
 
 /// 演示 [`DecodeError`] 的 4 种失败场景（编译期覆盖所有变体）
@@ -243,7 +288,7 @@ fn demo_decode_errors() {
   // 1. BadLength：长度不对
   let short = [0_u8; 10];
   match decode_frame(&short) {
-    Err(DecodeError::BadLength) => println!("   ✓ BadLength（长度 10 ≠ 21）"),
+    Err(DecodeError::BadLength) => println!("   ✓ BadLength（长度 10 ≠ {FRAME_LEN}）"),
     other => println!("   意外结果：{:?}", other),
   }
 
@@ -317,10 +362,9 @@ mod tests {
   }
 
   #[test]
-  fn frame_wire_length_is_21() {
+  fn frame_wire_length_matches_protocol_constant() {
     let wire = encode_frame(&Frame::new(1, GamepadState::EMPTY));
-    assert_eq!(wire.len(), 21);
-    assert_eq!(FRAME_LEN, 21);
+    assert_eq!(wire.len(), FRAME_LEN);
   }
 
   #[test]
@@ -379,5 +423,55 @@ mod tests {
     state.set_button(ButtonBits::Btn3, true);
     let text = describe_state(&state);
     assert!(text.contains("Btn1+Btn3"));
+  }
+
+  #[test]
+  fn broadcast_frame_is_addressed_to_all_receivers() {
+    // 默认构造的 Frame 应等价于广播
+    let frame = Frame::new(1, GamepadState::EMPTY);
+    for rid in 0..32_u8 {
+      assert!(
+        frame.is_addressed_to(rid),
+        "broadcast frame must address receiver_id={rid}",
+      );
+    }
+  }
+
+  #[test]
+  fn unicast_frame_addresses_only_target_receiver() {
+    // dest_mask = 1<<3 应只寻址到 receiver_id=3
+    let frame = Frame::with_dest(1, GamepadState::EMPTY, 1_u32 << 3);
+    assert!(frame.is_addressed_to(3));
+    for rid in (0..32_u8).filter(|r| *r != 3) {
+      assert!(
+        !frame.is_addressed_to(rid),
+        "unicast should not address receiver_id={rid}",
+      );
+    }
+  }
+
+  #[test]
+  fn multicast_mask_addresses_selected_subset() {
+    // dest_mask = bit-1 | bit-5 | bit-9
+    let mask = (1_u32 << 1) | (1_u32 << 5) | (1_u32 << 9);
+    let frame = Frame::with_dest(1, GamepadState::EMPTY, mask);
+    for rid in [1_u8, 5, 9] {
+      assert!(frame.is_addressed_to(rid), "expected to address {rid}");
+    }
+    for rid in [0_u8, 2, 6, 10, 31] {
+      assert!(
+        !frame.is_addressed_to(rid),
+        "did not expect to address {rid}",
+      );
+    }
+  }
+
+  #[test]
+  fn dest_mask_survives_roundtrip() {
+    let mask = 0xDEAD_BEEF;
+    let frame = Frame::with_dest(42, GamepadState::EMPTY, mask);
+    let wire = encode_frame(&frame);
+    let decoded = decode_frame(&wire).expect("decode ok");
+    assert_eq!(decoded.dest_mask, mask);
   }
 }
