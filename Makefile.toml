@@ -51,6 +51,11 @@ reduce_output = false
 # 使用 cargo-make 内置变量自动检测
 HOST_TARGET = "${CARGO_MAKE_RUST_TARGET_TRIPLE}"
 
+# 串口烧录端口：ESP32 以 USB-UART 连接时的设备节点（macOS 命名 /dev/cu.usbserial-*）。
+# 端口由系统动态分配，重插可能变化；可用 `ls /dev/cu.usbserial*` 确认当前端口，
+# 或用环境变量覆盖：ESP_PORT=/dev/cu.usbserial-11 cargo make controller-flash
+ESP_PORT = "/dev/cu.usbserial-110"
+
 # ============================================================
 # 默认任务（cargo make 无参数）
 # ============================================================
@@ -74,7 +79,9 @@ echo "手柄固件（controller / xtensa-esp32）："
 echo "  cargo make controller-check"
 echo "  cargo make controller-clippy"
 echo "  cargo make controller-build"
-echo "  cargo make controller-run    烧录 + probe-rs 日志"
+echo "  cargo make controller-run    烧录 + probe-rs 实时日志（需 JTAG 探针）"
+echo "  cargo make controller-flash  串口烧录（espflash，无需 JTAG 探针）"
+echo "  cargo make controller-monitor 串口实时日志（espflash monitor）"
 echo ""
 echo "协议 crate（controller-protocol / host）："
 echo "  cargo make protocol-check"
@@ -130,10 +137,40 @@ command = "cargo"
 args = ["build", "--bin", "controller", "--release"]
 
 [tasks.controller-run]
-description = "烧录并启动 probe-rs 实时日志"
+description = "烧录并启动 probe-rs 实时日志（需要 JTAG 调试探针，如 ESP-Prog / FTDI）"
 category = "Controller"
 command = "cargo"
 args = ["run", "--bin", "controller"]
+
+# 串口烧录：原始 ESP32 没有内置 USB-JTAG，仅以 USB-UART（如 /dev/cu.usbserial-*）连接时，
+# probe-rs 找不到探针会报 "No connected probes were found"，此时改用 espflash 串口烧录。
+# 端口由环境变量 ESP_PORT 指定（默认 /dev/cu.usbserial-10）；不指定时 espflash 自动选唯一的串口。
+#
+# 注意：dependencies 声明确保每次烧录前都会先 `cargo build --bin controller`，
+# 避免"改了源码但只跑 espflash 结果烧到旧固件"的隐蔽坑。
+[tasks.controller-flash]
+description = "构建 + espflash 串口烧录固件（自动先 build，无需 JTAG 探针）"
+category = "Controller"
+dependencies = ["controller-build"]
+command = "espflash"
+args = ["flash", "--port", "${ESP_PORT}", "target/xtensa-esp32-none-elf/debug/controller"]
+
+[tasks.controller-monitor]
+description = "通过 espflash 监听串口 defmt 实时日志（无需 JTAG 探针）"
+category = "Controller"
+# --elf 让 espflash 从 ELF 的 .espressif.metadata 段读到 LOG_FORMAT="defmt-espflash"
+# 并加载 defmt symbol table 解码 rzcobs 二进制日志帧。
+# 依赖 controller-build 是为了保证 ELF 与实际烧录的 flash 内容一致——
+# 否则源码改了但没重新 build，defmt frame index 不匹配会打印乱码。
+dependencies = ["controller-build"]
+command = "espflash"
+args = [
+  "monitor",
+  "--port",
+  "${ESP_PORT}",
+  "--elf",
+  "target/xtensa-esp32-none-elf/debug/controller",
+]
 
 [tasks.controller-test-check]
 description = "手柄 embedded-test harness 静态检查（不真机运行）"
