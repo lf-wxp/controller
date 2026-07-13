@@ -88,6 +88,18 @@ pub mod tuning {
   pub const AXIS_RANGE: i16 = 1000;
   /// ADC 移动平均滤波窗口大小（越大越稳但越迟钝）
   pub const ADC_FILTER_WINDOW: usize = 4;
+  /// 摇杆上电校准采样次数
+  ///
+  /// 启动时对每个轴连续采样求平均，作为该轴的真实静止中值 `zero_offset`。
+  /// 32 次采样在 ADC 白噪声 ±10 的量级下，均值 stderr 约 ±1.8，足够稳定。
+  pub const JOYSTICK_CALIBRATION_SAMPLES: u16 = 32;
+  /// 摇杆校准拒绝阈值（ADC 原始值）
+  ///
+  /// 上电时若用户已经把摇杆推歪，采样均值会远离 [`ADC_MID`]。为避免把
+  /// 错误的中值写入 `zero_offset`，此偏离超过该阈值时拒绝校准，
+  /// 回退到理论中值 [`ADC_MID`]。选 500 ≈ 满量程的 12%，覆盖典型个体
+  /// 差异（一般 <10%），又能识别明显的推杆。
+  pub const JOYSTICK_CALIBRATION_MAX_OFFSET: u16 = 500;
 
   // ==== 按键消抖 ====
   /// 按键消抖时长（毫秒）

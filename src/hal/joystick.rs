@@ -67,6 +67,21 @@ where
     Self { x, y, button }
   }
 
+  /// 上电校准：把当前静止读数作为 X/Y 轴的 `zero_offset`
+  ///
+  /// # 前置条件
+  /// 调用时摇杆必须**物理居中**（用户没有按住或推歪）。
+  ///
+  /// # 返回
+  /// `(x_zero, y_zero)` 生效后的两轴零点，主要用于日志/诊断。
+  ///
+  /// 参见 [`AnalogInput::calibrate`] 了解拒绝策略与 fallback 行为。
+  pub fn calibrate(&mut self, adc: &mut Adc<'d, ADC1<'d>, Blocking>) -> (u16, u16) {
+    let x_zero = self.x.calibrate(adc);
+    let y_zero = self.y.calibrate(adc);
+    (x_zero, y_zero)
+  }
+
   /// 采样一次，返回完整读数
   ///
   /// 需要传入共享的 ADC1 引用（同时轮询多路 ADC 时用得到）

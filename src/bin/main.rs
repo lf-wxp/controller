@@ -329,7 +329,18 @@ async fn main(spawner: Spawner) -> ! {
 
   let joystick_x = AnalogInput::new(joystick_x_pin, JOYSTICK_DEADZONE);
   let joystick_y = AnalogInput::new(joystick_y_pin, JOYSTICK_DEADZONE);
-  let joystick = Joystick::new(joystick_x, joystick_y, joystick_btn);
+  let mut joystick = Joystick::new(joystick_x, joystick_y, joystick_btn);
+
+  // ---- 摇杆上电校准 ----
+  //
+  // 摇杆电位器的机械居中位置往往不严格对应电气 3V3/2，直接以 ADC_MID=2048
+  // 作中值会导致静止时轴输出偏几个单位（例如 +0..+5 抖动）。此处采样均值
+  // 作为 zero_offset，运行时按此扣减。
+  //
+  // 前置条件：上电时用户不能推着摇杆；若均值偏离 ADC_MID 超过阈值，
+  // AnalogInput::calibrate 会拒绝并回退到 ADC_MID，同时打 warn 日志。
+  let (joy_x_zero, joy_y_zero) = joystick.calibrate(&mut adc);
+  info!("[JOY] calibrated zero: x={} y={}", joy_x_zero, joy_y_zero);
 
   let knob_1 = AnalogInput::new(knob_1_pin, /* deadzone = */ 0);
   let knob_2 = AnalogInput::new(knob_2_pin, 0);
