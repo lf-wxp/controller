@@ -21,7 +21,12 @@ use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_radio::ble::controller::BleConnector;
-use panic_rtt_target as _;
+// Panic handler + defmt global logger（走 UART，espflash monitor 可解码）：
+// - `esp_backtrace`：提供 `#[panic_handler]`，panic 时通过 defmt::error! 打印
+// - `esp_println`：以 `#[defmt::global_logger]` 注册全局 defmt logger，输出到 UART
+// 两个 crate 都只需 `as _` 触发链接期注册，无需显式调用 init。
+use esp_backtrace as _;
+use esp_println as _;
 use ssd1306::rotation::DisplayRotation;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
@@ -61,7 +66,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 )]
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-  rtt_target::rtt_init_defmt!();
+  // defmt global logger 由 `esp_println` 通过 `#[defmt::global_logger]` 在链接期
+  // 静态注册，此处无需显式 init。（原 `rtt_target::rtt_init_defmt!()` 已移除。）
 
   let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
   let peripherals = esp_hal::init(config);

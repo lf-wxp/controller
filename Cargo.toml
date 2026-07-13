@@ -92,8 +92,30 @@ embassy-net = {version = "0.9.1", features = [
 embedded-io = {version = "0.7.1", features = ["defmt"]}
 embedded-io-async = {version = "0.7.0", features = ["defmt"]}
 esp-alloc = {version = "0.10.0", features = ["defmt"]}
-panic-rtt-target = {version = "0.2.0", features = ["defmt"]}
-rtt-target = {version = "0.6.2", features = ["defmt"]}
+# ---- defmt 日志：走 UART + espflash 解码（无需 JTAG 探针） ----
+#
+# 原方案：`rtt-target` + `panic-rtt-target`，日志走 RTT，需要 probe-rs / JTAG 探针
+# 才能读取。原始 ESP32 无内置 USB-Serial-JTAG，仅以 USB-UART 连接开发机时无法看日志。
+#
+# 现方案：
+# - `esp-println/defmt-espflash`：以 `#[defmt::global_logger]` 注册全局 logger，
+#   把 defmt 帧 rzcobs 编码后从 UART TX 输出；同时把 `LOG_FORMAT="defmt-espflash"`
+#   写进 ELF 的 `.espressif.metadata` 段。`espflash monitor --elf ...` 会自动
+#   识别并解码。
+# - `esp-backtrace/panic-handler + defmt`（不开 `println`）：panic 时通过
+#   `defmt::error!` 输出，与上面 logger 走同一路径，避免混合文本+二进制帧。
+# - 不启用 `colors`：ANSI 转义会污染 rzcobs 二进制帧，导致 espflash 解码失败。
+esp-println = {version = "0.17.0", default-features = false, features = [
+  "esp32",
+  "defmt-espflash",
+  "critical-section",
+  "auto",
+]}
+esp-backtrace = {version = "0.19.0", default-features = false, features = [
+  "esp32",
+  "defmt",
+  "panic-handler",
+]}
 # for more networking protocol support see https://crates.io/crates/edge-net
 bt-hci = "0.8.0"
 embassy-executor = {version = "0.10.0", features = ["defmt"]}
@@ -163,9 +185,9 @@ codegen-units = 1 # LLVM can perform better optimizations using a single thread
 debug = 2 # prefer slower builds but better debugging experience
 lto = 'fat'
 opt-level = 's'
-# 显式声明 panic 策略为 abort（而不是依赖隐式 unwind + panic_rtt_target 触发 abort）：
+# 显式声明 panic 策略为 abort（而不是依赖隐式 unwind + esp-backtrace 触发 abort）：
 # 1. 语义明示：整个手柄固件是 `no_std` embedded target，任何 panic 都无法安全 recover，
-#    直接 abort 比"生成 unwind landing pad 然后被 panic_rtt_target 打印后 abort"更清晰
+#    直接 abort 比"生成 unwind landing pad 然后被 panic handler 打印后 abort"更清晰
 # 2. 体积/常量表收益：告诉 rustc "不需要 unwind"后，某些依赖会 elide landing pad 生成
 # 3. 与 [profile.wasm-release] 的 `panic = "abort"` 声明保持一致
 panic = "abort"
