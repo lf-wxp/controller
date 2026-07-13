@@ -27,12 +27,11 @@ use esp_radio::ble::controller::BleConnector;
 // 两个 crate 都只需 `as _` 触发链接期注册，无需显式调用 init。
 use esp_backtrace as _;
 use esp_println as _;
-use ssd1306::rotation::DisplayRotation;
 use ssd1306::size::DisplaySize128x64;
 use ssd1306::{I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
 
-use controller::config::display::I2C_FREQ_HZ;
+use controller::config::display::{I2C_FREQ_HZ, OLED_ROTATION};
 use controller::config::tuning::{INPUT_SCAN_INTERVAL_MS, JOYSTICK_DEADZONE, TRANSMIT_INTERVAL_MS};
 use controller::hal::battery::{IS_SIMULATED, battery_monitor_simulated_task};
 use controller::hal::led_effects::led_effects_task;
@@ -378,9 +377,10 @@ async fn main(spawner: Spawner) -> ! {
   };
 
   let interface = I2CDisplayInterface::new(i2c_owned);
+  // 屏幕物理安装方向由 `config::display::OLED_ROTATION` 集中控制
+  // （手柄外壳把屏幕装反了 180°，此处按需补偿；调向只改配置常量即可）
   let display: OledDisplay<I2c<'static, Blocking>> =
-    Ssd1306::new(interface, DisplaySize128x64, DisplayRotation::Rotate0)
-      .into_buffered_graphics_mode();
+    Ssd1306::new(interface, DisplaySize128x64, OLED_ROTATION).into_buffered_graphics_mode();
 
   // UI 帧通道：主循环 → oled_task
   static UI_SIGNAL: StaticCell<UiFrameSignal> = StaticCell::new();

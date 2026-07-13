@@ -114,6 +114,8 @@ pub mod tuning {
 
 /// OLED 显示屏配置
 pub mod display {
+  use ssd1306::rotation::DisplayRotation;
+
   /// SSD1306 I²C 地址
   pub const OLED_ADDR: u8 = 0x3C;
   /// 屏幕宽度（像素）
@@ -122,6 +124,22 @@ pub mod display {
   pub const OLED_HEIGHT: u16 = 64;
   /// I²C 时钟频率（400 kHz）
   pub const I2C_FREQ_HZ: u32 = 400_000;
+
+  /// 屏幕物理安装方向补偿
+  ///
+  /// SSD1306 的 4 个 `DisplayRotation` 值本质是 (`SegmentRemap`, `ReverseComDir`) 的
+  /// 4 种组合（X 翻 / Y 翻 各 2 种），并非数学意义上的连续旋转：
+  ///
+  /// | 值           | SegmentRemap | ReverseComDir | 相对 `Rotate0` 效果 |
+  /// |--------------|:------------:|:-------------:|--------------------|
+  /// | `Rotate0`    | true         | true          | 库定义的"正方向" |
+  /// | `Rotate90`   | false        | true          | X 翻（左右镜像）|
+  /// | `Rotate180`  | false        | false         | X 翻 + Y 翻（真 180° 旋转）|
+  /// | `Rotate270`  | true         | false         | Y 翻（上下镜像）|
+  ///
+  /// 因手柄外壳把 OLED 装反了 180°，屏幕整体倒置显示更符合视觉方向。
+  /// 若发现文字方向不对，请依次尝试 `Rotate0/90/180/270` 定位物理方向。
+  pub const OLED_ROTATION: DisplayRotation = DisplayRotation::Rotate180;
 
   /// OLED 刷新周期（毫秒；≈ 20 Hz，与传输 30 Hz 独立，减轻 I²C 压力）
   pub const REFRESH_INTERVAL_MS: u64 = 50;

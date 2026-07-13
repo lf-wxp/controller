@@ -21,9 +21,11 @@ use super::button::{Button, ButtonState};
 /// 摇杆一次采样的结果
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct JoystickReading {
-  /// X 轴：-1000..+1000（左负右正，具体方向取决于硬件走线）
+  /// X 轴：-1000..=+1000（右 = 正，左 = 负）
   pub x: i16,
-  /// Y 轴：-1000..+1000（前负后正，具体方向取决于硬件走线）
+  /// Y 轴：-1000..=+1000（上 = 正，下 = 负，数学坐标系）
+  ///
+  /// 注：`Joystick::read` 内部已对硬件读数取反，补偿外壳装反 180°。
   pub y: i16,
   /// 按下键当前状态
   pub button: ButtonState,
@@ -85,9 +87,19 @@ where
   /// 采样一次，返回完整读数
   ///
   /// 需要传入共享的 ADC1 引用（同时轮询多路 ADC 时用得到）
+  ///
+  /// # 方向约定（数学坐标系）
+  /// - X 轴：右 = 正，左 = 负
+  /// - Y 轴：上 = 正，下 = 负
+  ///
+  /// 由于手柄外壳把屏幕/摇杆整体装反了 180°，Y 轴在此处取反补偿，
+  /// 保证下游（BLE HID / ESP-NOW / OLED / dashboard）看到的语义一致。
   pub fn read(&mut self, adc: &mut Adc<'d, ADC1<'d>, Blocking>) -> JoystickReading {
     let x = self.x.read_centered(adc);
-    let y = self.y.read_centered(adc);
+    // Y 轴取反：补偿硬件安装方向，让"物理向上"= 正值。
+    // 使用 saturating_neg 防御 i16::MIN 溢出（read_centered 已 clamp
+    // 到 [-AXIS_RANGE, +AXIS_RANGE]，理论不会触发，仍保留防御）。
+    let y = self.y.read_centered(adc).saturating_neg();
     let button = self.button.poll();
     JoystickReading { x, y, button }
   }
