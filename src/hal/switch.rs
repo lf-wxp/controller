@@ -60,4 +60,11 @@ impl<'d> Switch<'d> {
   pub fn is_on(&self) -> bool {
     self.last_stable
   }
+
+  /// **仅用于诊断**：直接返回 GPIO 引脚的原始电平（未经 active_high 反转、未消抖）
+  ///
+  /// 用于验证硬件接线极性与 `active_high` 配置是否一致。生产代码请勿依赖此方法。
+  pub fn raw_is_high(&self) -> bool {
+    self.pin.is_high()
+  }
 }

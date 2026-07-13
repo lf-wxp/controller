@@ -296,7 +296,6 @@ async fn main(spawner: Spawner) -> ! {
   // 硬件初始化：按钮 / 开关 / 摇杆 / 旋钮 / LED
   // ============================================================
   let input_pullup = InputConfig::default().with_pull(Pull::Up);
-  let input_pulldown = InputConfig::default().with_pull(Pull::Down);
   let output_default = OutputConfig::default();
 
   // 4 个通用按钮：按下拉低（active_low）
@@ -306,16 +305,29 @@ async fn main(spawner: Spawner) -> ! {
   let button_4 = Button::new(Input::new(peripherals.GPIO23, input_pullup), false);
 
   // 拨动开关（IO15 strapping，Pull::Up）
+  //
+  // 电气结构：一端接 GND，另一端接 IO15；拨到 ON 位置时短接 GND → 拉低。
+  // 若诊断日志显示 raw_high 恒为 true 且拨动无变化，可能：
+  //   1. 开关未拨到接通侧（先确认物理位置切换到了另一侧）
+  //   2. 开关的另一端未接到 GND（浮空），需检查焊接
   let switch_1 = Switch::new(
     Input::new(peripherals.GPIO15, input_pullup),
     /* active_high = */ false,
     /* initial_on  = */ false,
   );
 
-  // 摇杆按下键（IO12 strapping，Pull::Down；⚠️ 电气结构见 hal/joystick.rs 说明）
+  // 摇杆按下键（IO12，标准 KY-023 / PS2 摇杆接法：一端 GND、按下拉低）
+  //
+  // 电气结构（见 hal/joystick.rs 文件头注释）：
+  //   GND ── [按钮 SW] ── IO12
+  // 需要 `Pull::Up`（保证未按下时读到 HIGH）+ `active_high = false`（按下 = LOW = 按下态）
+  //
+  // ⚠️ 历史配置曾用 `Pull::Down + active_high=true`（假设按钮接 3V3），
+  // 但实机诊断 raw 电平不随按压变化，说明按钮的另一端不是 3V3。
+  // 与项目里其它 4 个通用按钮统一采用"按下拉低"接法。
   let joystick_btn = Button::new(
-    Input::new(peripherals.GPIO12, input_pulldown),
-    /* active_high = */ true,
+    Input::new(peripherals.GPIO12, input_pullup),
+    /* active_high = */ false,
   );
 
   // ADC1：摇杆 X/Y + 2 个旋钮
@@ -427,6 +439,22 @@ async fn main(spawner: Spawner) -> ! {
     let mut sample = sampler.poll(&mut adc);
     update_button_led_state(&sample);
 
+    // ---- 硬件极性诊断：每 1s（100 tick）打一次 JoyBtn/Switch 的原始电平 ----
+    //
+    // 用于验证 `main.rs` 里对 IO12 / IO15 的 `Pull` + `active_high` 配置是否与
+    // 实际接线一致：若"按下/拨到 ON"时看到 raw 电平**没有变化**，说明该 pin
+    // 根本没被接通到预期电压；若 raw 变化了但 state=false，说明极性配置反了。
+    // 排查完成后请删除此块。
+    if tick.is_multiple_of(100) {
+      info!(
+        "[DIAG] joy_btn raw_high={} down={} | switch raw_high={} on={}",
+        sampler.joy_btn_raw_is_high(),
+        sample.joy_button.is_down(),
+        sampler.switch_raw_is_high(),
+        sample.switch_on,
+      );
+    }
+
     // ---- 应用灵敏度缩放（可能被 Host 命令动态修改）----
     apply_sensitivity(&mut sample.state);
 
@@ -434,8 +462,22 @@ async fn main(spawner: Spawner) -> ! {
     //
     // Selecting 模式下选择器会把 `suppress_frame_send` 置 true，此时下面的
     // `transport.send(&frame)` 会被跳过，避免摇杆游走干扰接收端。
+    //
+    // ⚠️ 临时改动（HW-WORKAROUND-SWITCH-IO15）：
+    // IO15 拨动开关物理故障（诊断日志显示 raw_high 恒 true，无论如何拨动都不变），
+    // 已用 sampler.poll() 后加"joy_button 覆盖 switch_on"的方式验证过 —— 上层代码
+    // 路径完全正常，问题在 IO15 硬件（开关/焊盘/走线/引脚）。
+    //
+    // 为了在硬件修好前也能验证 selector→Announce→receiver 列表这条完整链路，
+    // 此处**临时**把长按触发源从 `sample.switch_on`（IO15）替换成
+    // `sample.joy_button.is_down()`（IO12）。硬件修好后，把下面这行改回
+    // `switch_on: sample.switch_on,` 即可恢复原设计。
+    //
+    // 副作用提示：
+    // - 长按 IO12 摇杆按钮 ≥800ms 会进入 Selecting，此期间 Frame 发送被抑制
+    // - IO12 短按（<800ms）不影响，仍会作为 `ButtonBits::JoyBtn` 位正常上报
     let selector_outcome = handle_selector_input(SelectorInput {
-      switch_on: sample.switch_on,
+      switch_on: sample.joy_button.is_down(),
       btn1_just_pressed: sample.buttons[0] == controller::hal::button::ButtonState::JustPressed,
       btn2_just_pressed: sample.buttons[1] == controller::hal::button::ButtonState::JustPressed,
       joy_y: sample.joystick.y,

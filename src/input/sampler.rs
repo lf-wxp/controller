@@ -124,6 +124,16 @@ where
       switch_on: sw_on,
     }
   }
+
+  /// **仅用于诊断**：拨动开关引脚的原始电平（未经 `active_high` 反转、未消抖）
+  pub fn switch_raw_is_high(&self) -> bool {
+    self.switch_1.raw_is_high()
+  }
+
+  /// **仅用于诊断**：摇杆按下键引脚的原始电平（未经 `active_high` 反转、未消抖）
+  pub fn joy_btn_raw_is_high(&self) -> bool {
+    self.joystick.button_raw_is_high()
+  }
 }
 
 /// 本地反馈助手：把按钮状态写入 [`crate::hal::led_effects::BUTTON_LED_STATE`]
