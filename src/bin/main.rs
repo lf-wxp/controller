@@ -107,6 +107,30 @@ async fn main(spawner: Spawner) -> ! {
   // ============================================================
   controller::self_test::run();
 
+  // ------------------------------------------------------------
+  // [TEMP-DEBUG] 打印共享密钥前 4 字节，用于收发两端 .env 一致性核对。
+  //
+  // 泄漏 4 / 32 字节对高熵密钥无密码学威胁（剩余搜索空间 2^224），
+  // 但仍属敏感信息 —— **两端 fingerprint 比对完成后立即删除本段代码**。
+  //
+  // 期望日志：
+  //   [SECRET-DEBUG] v1[0..4]=xx:xx:xx:xx | v2[0..4]=xx:xx:xx:xx (remove after key sync check)
+  // ------------------------------------------------------------
+  {
+    use controller::config::keyring::{SECRET_V1, SECRET_V2};
+    info!(
+      "[SECRET-DEBUG] v1[0..4]={:02x}:{:02x}:{:02x}:{:02x} | v2[0..4]={:02x}:{:02x}:{:02x}:{:02x} (remove after key sync check)",
+      SECRET_V1[0],
+      SECRET_V1[1],
+      SECRET_V1[2],
+      SECRET_V1[3],
+      SECRET_V2[0],
+      SECRET_V2[1],
+      SECRET_V2[2],
+      SECRET_V2[3],
+    );
+  }
+
   // ============================================================
   // Wi-Fi / BLE / ESP-NOW 初始化
   //   - Wi-Fi 控制器构造后必须长期保留（driver 生命周期与其绑定）
