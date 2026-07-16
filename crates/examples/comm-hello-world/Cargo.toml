@@ -1,0 +1,43 @@
+[package]
+name = "comm-hello-world"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+# ============================================================
+# 说明：
+# 本 crate 是 comm 的 **"引入即用" 体验演示**：
+#   1) 双方各自 builder 一次配置（Notifier + Receiver）
+#   2) discover → 自动 AnnounceReply → 自动 AssignId
+#   3) send_command(LedBlink) → 接收端 handler 触发 → 自动 Ack
+#   4) send_frame(GamepadState) → 广播到接收端（这里只演示编排通道）
+#
+# 与 crates/examples/controller-receiver-demo 的分工：
+# - receiver-demo：**protocol 编解码** 层守护者（防止 Frame API 腐化）
+# - comm-hello-world（本 crate）：**comm 应用层** 快速上手模板
+#
+# target：host（与集成测试同款拓扑）
+# 通过 comm 的 `loopback` feature 借用内存 mpsc 版 CommLink，
+# 无需真实 ESP32 硬件即可端到端演示。
+# ============================================================
+
+[dependencies]
+# 目标 crate 本体 —— 打开 loopback feature 才能拿到 LoopbackLink
+comm = { path = "../../comm", features = ["loopback"] }
+# 直接引用 protocol 主要是为了构造 Command / GamepadState 示例
+controller-protocol = { path = "../../protocol" }
+
+# host 上驱动 embassy async loop 所需的三兄弟
+embassy-futures = { version = "0.1", default-features = false }
+embassy-time = { version = "0.5", features = ["std", "generic-queue-8"] }
+
+# 单线程 async executor（与集成测试完全同款；避免引入 tokio）
+futures-executor = "0.3"
+futures-util = "0.3"
+
+# critical-section 的 std impl —— embassy-sync 的 CriticalSectionRawMutex 必需
+critical-section = { version = "1.2", features = ["std"] }
+
+[lints]
+workspace = true

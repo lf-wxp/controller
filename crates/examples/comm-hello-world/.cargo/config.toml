@@ -1,13 +1,13 @@
-# controller-receiver-demo 使用 host target（不是 xtensa-esp32-none-elf）
+# comm-hello-world 使用 host target（不是 xtensa-esp32-none-elf）
 # 覆盖仓库根 .cargo/config.toml 的 xtensa 默认设置
 #
-# 让 `cd crates/examples/controller-receiver-demo && cargo run` 直接跑到本机
+# 让 `cd crates/examples/comm-hello-world && cargo run` 直接跑到本机
 
 [build]
 # 覆盖根 .cargo/config.toml 的默认 target（xtensa-esp32-none-elf）。
 # 显式回落到本机 host triple，让 `cargo run` / `cargo check` 无需手动 --target。
 # 注意：若在非 Apple Silicon 机器（如 x86_64 / Linux）运行，请改为对应 triple，
-# 或直接使用 `cargo make example-receiver-demo`（Makefile 用 ${HOST_TARGET} 自动探测）。
+# 或直接使用 `cargo make example-comm-hello-world`（Makefile 用 ${HOST_TARGET} 自动探测）。
 target = "aarch64-apple-darwin"
 rustflags = []
 
