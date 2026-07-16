@@ -118,4 +118,4 @@ controller-protocol = { path = "../../crates/protocol", default-features = false
 - 空中协议对照 → [`docs/protocol_air.md`](../../docs/protocol_air.md)
 - 接收端参考实现 → [`docs/esp_now_receiver.md`](../../docs/esp_now_receiver.md)
 - 控制端参考实现 → [`docs/esp_now_controller.md`](../../docs/esp_now_controller.md)
-- 手柄固件（本 crate 的使用方）→ [`src/bin/main.rs`](../../src/bin/main.rs)
+- 手柄固件（本 crate 的使用方）→ [`crates/controller/src/bin/main.rs`](../../crates/controller/src/bin/main.rs)

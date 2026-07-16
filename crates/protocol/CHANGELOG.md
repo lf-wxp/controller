@@ -35,8 +35,8 @@
 
 ### Added
 
-- **`src/peer_registry`**：controller 侧的 peer 注册表（存储 receiver 的 mac / rssi / role / receiver_id，供 UI selector 展示与目标寻址）。
-- **`src/ui/selector`**：OLED 上的目标接收方选择器（长按 switch 进入选择模式，摇杆上下选择，btn1 确认 / btn2 取消）。
+- **`crates/comm/src/peer_registry`**：controller 侧的 peer 注册表（存储 receiver 的 mac / rssi / role / receiver_id，供 UI selector 展示与目标寻址）。全局单例位于 `crates/controller/src/lib.rs` 的 `pub static REGISTRY`。
+- **`crates/controller/src/ui/selector`**：OLED 上的目标接收方选择器（长按 switch 进入选择模式，摇杆上下选择，btn1 确认 / btn2 取消）。
 - **`docs/protocol_air.md`** / **`docs/esp_now_controller.md`** / **`docs/esp_now_receiver.md`**：同步更新到 v0.2 的帧布局与 peer discovery 流程说明。
 - **属性测试**：`crates/protocol/tests/proptest_roundtrips.rs` 扩展覆盖 `dest_mask` 位图寻址、`Announce`、`AssignId`、`AnnounceReply` 的编解码往返。
 

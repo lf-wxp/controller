@@ -246,7 +246,7 @@ pub const RSSI_UNKNOWN: i8 = -127;
 
 /// 一个已发现接收方的展示信息
 ///
-/// 字段刻意与控制器侧 `peer_registry::PeerInfo` 保持一致（单一真相来源），
+/// 字段刻意与控制器侧 `comm::PeerInfo` 保持一致（单一真相来源），
 /// 便于两边语义对齐：`receiver_id` 自动分配（0..32），`role` 为定长 3 字节
 /// ASCII（不足右侧补 `\0`），UI 显示时用 [`Self::role_str`] 去尾零。
 ///
@@ -295,7 +295,7 @@ impl PeerInfo {
 impl AppState {
   /// 把一个接收方的 `AnnounceReply` 记入 receivers 目录
   ///
-  /// 与控制器 `peer_registry::upsert` 语义对齐：MAC 已存在则只更新
+  /// 与控制器 `comm::PeerRegistry::upsert` 语义对齐：MAC 已存在则只更新
   /// `role`/`rssi`/`last_seen`；否则分配一个最低的空闲 `receiver_id` 后插入。
   pub fn upsert_receiver(&self, mac: [u8; MAC_LEN], role: [u8; ROLE_TAG_LEN], rssi_dbm: i8) {
     // `rssi_dbm` 直接来自协议解码（负数），无需调用方合成未知值：协议侧约定
@@ -325,7 +325,7 @@ impl AppState {
         rssi_dbm,
         last_seen_ms: now,
       });
-      // 按 receiver_id 升序排列，与控制器 peer_registry 行为对齐（稳定 UI 显示顺序）
+      // 按 receiver_id 升序排列，与控制器 PeerRegistry 行为对齐（稳定 UI 显示顺序）
       list.sort_by_key(|p| p.receiver_id);
     });
   }

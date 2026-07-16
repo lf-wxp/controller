@@ -79,7 +79,7 @@ static_cell = "2.1.1"
 
 ## 接收端完整代码
 
-`src/bin/main.rs`：
+`crates/controller/src/bin/main.rs`：
 
 ```rust
 #![no_std]
@@ -279,7 +279,7 @@ if !frame.is_addressed_to(MY_RECEIVER_ID) {
   - **单播 receiver_id=3**：`dest_mask = 1 << 3`
   - **多选**：`dest_mask = (1 << 1) | (1 << 5) | (1 << 9)`
 
-> 如需**物理层单播**（省电、更安全）：把 `src/transport/esp_now/mod.rs` 里的
+> 如需**物理层单播**（省电、更安全）：把 `crates/controller/src/transport/esp_now/mod.rs` 里的
 > `BROADCAST_ADDRESS` 改成目标 MAC，并在发送端 `add_peer(target_mac)`；
 > 接收端无需改动。物理层单播 + `dest_mask` 逻辑寻址可以互补使用。
 
@@ -331,7 +331,7 @@ fn handle_command_from_controller(bytes: &[u8]) {
 
     match cmd.kind {
         CommandBody::Announce => {
-            // 广播 AnnounceReply，让手柄的 peer_registry 把我记下来
+            // 广播 AnnounceReply，让手柄的 PeerRegistry 把我记下来
             let my_mac = read_own_mac();       // 通常来自 ESP-HAL efuse
             let reply = CommandResponse {
                 req_seq: cmd.seq,

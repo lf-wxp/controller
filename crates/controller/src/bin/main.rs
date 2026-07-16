@@ -447,10 +447,7 @@ async fn main(spawner: Spawner) -> ! {
   // 嵌套 CompositeTransport：三路组合
   let mut transport = CompositeTransport::new(
     BleHidTransport::new(signal),
-    CompositeTransport::new(
-      EspNowTransport::new(),
-      UiTransport::new(ui_signal),
-    ),
+    CompositeTransport::new(EspNowTransport::new(), UiTransport::new(ui_signal)),
   );
 
   info!("Hardware ready. Entering main loop.");

@@ -458,7 +458,7 @@ async fn subscribe_response(
             rssi_dbm,
             role_tag,
           } => {
-            // 落进 receivers 目录（自动分配 id；字段对齐控制器 peer_registry）
+            // 落进 receivers 目录（自动分配 id；字段对齐控制器 PeerRegistry）
             // mac / role_tag 已是定长数组引用（&[u8; N]），直接解引用拷贝即可
             state.upsert_receiver(*mac, *role_tag, *rssi_dbm);
 

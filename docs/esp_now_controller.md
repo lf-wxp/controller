@@ -230,7 +230,7 @@ async fn nonce_listener_task(mut receiver: esp_radio::esp_now::EspNowReceiver<'s
         //
         // 说明：本 host 是"发命令角色"而非手柄本体，通常不需要维护
         // receiver 目录。若确实想 host 侧也管理 receiver 列表，可在此
-        // 复用手柄的 peer_registry 逻辑（`crates/protocol/USAGE.md`）。
+        // 则复用手柄的 PeerRegistry 逻辑（`crates/comm/src/peer_registry.rs`）。
         ResponseBody::AnnounceReply {
           mac,
           rssi_dbm,
@@ -324,7 +324,7 @@ async fn response_matcher_task() {
 
 ### 1. NonceHello 握手时机
 
-手柄每 5 秒广播一次 `NonceHello`（[esp_now/mod.rs](../src/transport/esp_now/mod.rs)
+手柄每 5 秒广播一次 `NonceHello`（[esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)
 的 `nonce_broadcast_task`）。控制端上电后**最长等待约 5 秒**才能
 发出第一条合法命令 —— 本例用 `NONCE_READY` AtomicBool 兜底：
 
@@ -344,7 +344,7 @@ while !NONCE_READY.load(Ordering::Relaxed) {
 - ❌ 重启后从 1 重新发 → **老 seq 被拒绝**（AuthFailed 或 Replay）
 
 **生产环境**建议把 `NEXT_SEQ` 值定期持久化到 NVS。参考
-[hal/persist.rs](../src/hal/persist.rs) 的 `PersistentConfig` 里已经
+[hal/persist.rs](../crates/controller/src/hal/persist.rs) 的 `PersistentConfig` 里已经
 包含 `replay_windows` 字段 —— 控制端可以模仿此实现。
 
 ### 3. Response 按 req_seq 匹配
@@ -384,7 +384,8 @@ Command 的多播由**目标 MAC** + `CommandBody::AssignId.mac` 字段实现。
 
 ### 5. Announce / AssignId 动态发现
 
-起手柄侧维护 [`PeerRegistry`](../src/peer_registry.rs)，通过 Announce
+起手柄侧维护 [`PeerRegistry`](../crates/comm/src/peer_registry.rs)（全局单例位于
+[`crates/controller/src/lib.rs`](../crates/controller/src/lib.rs) 的 `pub static REGISTRY`），通过 Announce
 广播动态发现 receiver、通过 AssignId 下发逻辑 `receiver_id`：
 
 ```text
@@ -521,7 +522,7 @@ let cmd = Command::with_key(seq, key_id, CommandBody::Nop);
 - Wi-Fi 频道不一致 → 参考
   [esp_now_receiver.md § 频道对齐](./esp_now_receiver.md#频道对齐)
 - 手柄侧 `nonce_broadcast_task` 未启动 → 检查
-  [transport/esp_now/mod.rs](../src/transport/esp_now/mod.rs)
+  [transport/esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)
 
 ### Q3: 收到 Ack 但 LED 没闪
 
@@ -547,8 +548,8 @@ let cmd = Command::with_key(seq, key_id, CommandBody::Nop);
 - 空中协议 3 种 magic → [protocol_air.md § 空气中的 3 种帧](./protocol_air.md#空气中的-3-种帧)
 - 协议 crate 源码 → [crates/protocol/](../crates/protocol/)
 - 协议 crate 使用指南 → [crates/protocol/USAGE.md](../crates/protocol/USAGE.md)
-- 手柄侧命令分发 → [src/transport/control.rs](../src/transport/control.rs)
-- 🆕 手柄侧 Peer 目录管理 → [src/peer_registry.rs](../src/peer_registry.rs)
-- 🆕 手柄侧 Announce 广播 → [src/transport/esp_now/mod.rs](../src/transport/esp_now/mod.rs)（`broadcast_announce` / `esp_now_receive_task`）
+- 手柄侧命令分发 → [crates/controller/src/transport/control.rs](../crates/controller/src/transport/control.rs)
+- 🆕 手柄侧 Peer 目录管理 → [crates/comm/src/peer_registry.rs](../crates/comm/src/peer_registry.rs)（全局单例在 [crates/controller/src/lib.rs](../crates/controller/src/lib.rs)）
+- 🆕 手柄侧 Announce 广播 → [crates/controller/src/transport/esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)（`broadcast_announce` / `esp_now_receive_task`）
 - Dashboard 参考实现（BLE 版）→ [crates/dashboard/src/bluetooth.rs](../crates/dashboard/src/bluetooth.rs)
 - **纯 host 侧协议交互 demo** → [crates/examples/controller-host-demo/](../crates/examples/controller-host-demo/)

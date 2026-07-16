@@ -176,7 +176,7 @@
  Step 1  手柄 → 广播  Command { kind: Announce }             (24 B)
  Step 2  receiver → 广播  Response { kind: AnnounceReply,     (24 B)
                        mac, rssi_dbm, role_tag }
-         └─ 手柄 upsert peer_registry：给未知 mac 分配最小可用 receiver_id (0..32)
+         └─ 手柄 upsert PeerRegistry：给未知 mac 分配最小可用 receiver_id (0..32)
  Step 3  手柄 → 广播  Command { kind: AssignId,               (24 B)
                        mac, receiver_id }
          └─ receiver 校验 payload.mac == 自身 → 记住 receiver_id 到 NVS
@@ -198,7 +198,7 @@ receiver 侧的过滤逻辑（推荐）：`if !frame.is_addressed_to(my_receiver
 - receiver_id 复用（离线 slot 会被下一个 Announce 的新 receiver 回收）
 
 > [!TIP]
-> **peer_registry 容量**：32 slot，对应 `dest_mask` 32 bit。多于 32 的 receiver 需要
+> **PeerRegistry 容量**：32 slot，对应 `dest_mask` 32 bit。多于 32 的 receiver 需要
 > 升 `dest_mask` 到 `u64` —— 见 [`crates/protocol/src/frame.rs`](../crates/protocol/src/frame.rs)
 > 的 `BROADCAST_DEST_MASK` 与 `is_addressed_to` 上限。
 
@@ -285,7 +285,7 @@ HMAC 共享密钥 **不在源码明文存放**，由 `controller-protocol` 的 `
 
 - **接收端（只读订阅）**：[`esp_now_receiver.md`](./esp_now_receiver.md)
 - **控制端（回发命令）**：[`esp_now_controller.md`](./esp_now_controller.md)
-- **手柄侧广播/接收**：[`src/transport/esp_now/mod.rs`](../src/transport/esp_now/mod.rs)
+- **手柄侧广播/接收**：[`crates/controller/src/transport/esp_now/mod.rs`](../crates/controller/src/transport/esp_now/mod.rs)
 - **Dashboard（BLE 版）**：[`crates/dashboard/src/bluetooth.rs`](../crates/dashboard/src/bluetooth.rs)
 - **完整可运行 demo（host 侧模拟）**：
   - 双向控制（Command / Response）：[`crates/examples/controller-host-demo/`](../crates/examples/controller-host-demo/)

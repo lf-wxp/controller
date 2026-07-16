@@ -18,7 +18,7 @@
 //! ## seq 语义
 //! - Host 端维护 `tx_counter`，每次发命令前 `+1`，从 1 开始（**0 保留**为无效值）
 //! - **每个 key_id 拥有独立的 seq 空间**：Host 切换 key_id 时应重置 tx_counter；
-//!   手柄端 [`crate::transport::control::REPLAY_WINDOWS`] 也按 key_id 分开维护单独的滑动位图
+//!   手柄端 `controller::transport::control::REPLAY` （内部为 `ReplayGuard`）也按 key_id 分开维护单独的滑动位图
 //! - seq 也是 HMAC 计算范围的一部分 —— 篡改 seq 会同时导致 HMAC 失败
 //!
 //! ## 命令种类
@@ -125,7 +125,7 @@ impl CommandKind {
 /// 已解码的命令（含发送端 seq + key_id）
 ///
 /// - `seq` 由 Host 端自行维护（每发一条 +1），手柄侧解码后交给
-///   [`crate::transport::control::REPLAY_WINDOWS`]（per-key-id）做重放检查。
+///   `controller::transport::control::REPLAY` （内部为 `ReplayGuard`，per-key-id）做重放检查。
 /// - `key_id` 描述本帧使用哪一份密钥计算 HMAC（O 选项）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Command {
@@ -359,7 +359,7 @@ fn encode_payload(body: &CommandBody) -> [u8; PAYLOAD_LEN] {
 ///
 /// **抗重放窗口检查不在此函数内**——由调用方（`dispatch_command`）
 /// 拿到 decode 后的 `cmd.seq` / `cmd.key_id` 交给全局
-/// [`crate::transport::control::REPLAY_WINDOWS`] 判断。
+/// `controller::transport::control::REPLAY` 判断。
 pub fn decode_command(buf: &[u8]) -> Result<Command, CommandDecodeError> {
   if buf.len() != COMMAND_LEN {
     return Err(CommandDecodeError::BadLength);

@@ -32,8 +32,8 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 
-use comm::ReplayGuard;
 pub use comm::CommandSource;
+use comm::ReplayGuard;
 use defmt::{info, warn};
 
 use crate::config::keyring::KEY_SLOTS;
@@ -301,7 +301,12 @@ fn execute_set_sensitivity(
 }
 
 /// `ShowToast` 执行体：截长 + 发信号
-fn execute_show_toast(src: CommandSource, seq: u32, len: u8, bytes: &[u8; 5]) -> Result<(), ErrorCode> {
+fn execute_show_toast(
+  src: CommandSource,
+  seq: u32,
+  len: u8,
+  bytes: &[u8; 5],
+) -> Result<(), ErrorCode> {
   let len = len.min(5);
   let msg = &bytes[..len as usize];
   signal_toast(msg);

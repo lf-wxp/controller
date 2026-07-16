@@ -150,10 +150,7 @@ fn parse_dotenv_line(raw: &str) -> Option<(String, String)> {
 /// 若字符串首尾是同种引号（`"` 或 `'`）则剥离一层；否则原样返回。
 fn strip_matched_quotes(value: &str) -> &str {
   for quote in ['"', '\''] {
-    if value.len() >= 2
-      && value.starts_with(quote)
-      && value.ends_with(quote)
-    {
+    if value.len() >= 2 && value.starts_with(quote) && value.ends_with(quote) {
       return &value[1..value.len() - 1];
     }
   }

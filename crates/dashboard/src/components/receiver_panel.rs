@@ -3,7 +3,7 @@
 //! 数据来源：手柄将各 receiver 的 `AnnounceReply` 经 BLE 转发给 dashboard，
 //! [`crate::bluetooth::on_control_response`] 解码后调用
 //! [`AppState::upsert_receiver`] 落入 `receivers` 目录。本面板只做**只读展示**，
-//! 不做目标选择（选择是控制器 OLED selector 的职责，见 `src/ui/selector.rs`）。
+//! 不做目标选择（选择是控制器 OLED selector 的职责，见 `crates/controller/src/ui/selector.rs`）。
 //!
 //! 展示列：id / role / MAC / RSSI（颜色按强弱）/ 最后在线（X s 前）。
 

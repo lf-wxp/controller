@@ -416,7 +416,7 @@ async fn handle_gatt_event<P: PacketPool>(
         let control_handle = server.custom.control_command.handle;
         if write_evt.handle() == control_handle {
           // 命令通道：解码 + 分发（不阻塞，仅内存操作）
-                    dispatch_command_from_ble(write_evt.data());
+          dispatch_command_from_ble(write_evt.data());
         }
       }
 
