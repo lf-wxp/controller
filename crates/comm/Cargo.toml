@@ -1,0 +1,81 @@
+[package]
+name = "comm"
+description = "Reusable ESP-NOW-style notify/receive communication crate — sender + receiver façades, peer discovery, key management, anti-replay. Built on embassy async runtime."
+authors = ["Francisco Wu <franciscowu@example.com>"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/lf-wxp/controller"
+categories = ["embedded", "no-std", "network-programming"]
+keywords = ["esp32", "esp-now", "embassy", "no-std", "controller"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# ============================================================
+# 打包白名单
+# ============================================================
+include = ["src/**/*", "Cargo.toml", "README.md"]
+
+# ============================================================
+# 依赖
+# ============================================================
+[dependencies]
+# 协议编解码：本 crate 复用 protocol 的类型 / HMAC / anti-replay 实现
+controller-protocol = {path = "../protocol", default-features = false}
+
+# embassy 生态：定死一个运行时；避免 anti-over-abstraction
+embassy-sync = {version = "0.7", default-features = false}
+embassy-futures = {version = "0.1", default-features = false}
+embassy-time = {version = "0.5", default-features = false}
+
+# no_std 集合工具
+heapless = "0.9"
+
+# 可选：defmt 集成（手柄端）
+defmt = {version = "1", optional = true}
+
+# 可选：serde 集成（Dashboard 端可能会用到 PeerInfo）
+serde = {version = "1", default-features = false, features = [
+  "derive",
+], optional = true}
+
+[dev-dependencies]
+# host 端集成测试：把 embassy-time 切到 std 模式
+embassy-time = {version = "0.5", features = ["std", "generic-queue-8"]}
+embassy-executor = {version = "0.10.0", features = [
+  "platform-std",
+  "executor-thread",
+]}
+static_cell = "2.1"
+# 让 async 测试跑起来
+futures-executor = "0.3"
+# spawn_local 扩展方法所在的 crate
+futures-util = "0.3"
+# critical-section 的 std impl（多线程 Mutex 版）—— host 测试必备
+critical-section = {version = "1.2", features = ["std"]}
+
+# ============================================================
+# Features
+# ============================================================
+# - default: 纯 no_std，可在 esp32 / wasm32 / host 上编译
+# - defmt / serde: 与 protocol crate 联动
+# - loopback: 内置一个内存 mpsc 版 CommLink，方便 host 侧端到端测试
+# - test-utils: 暴露仅测试用的 helper（如 `PeerRegistry::clear_for_test`）
+[features]
+default = []
+defmt = ["dep:defmt", "controller-protocol/defmt"]
+serde = ["dep:serde", "controller-protocol/serde"]
+loopback = []
+test-utils = []
+# 危险 opt-in：允许 Endpoint（Receiver）主动发送 Command。
+#
+# 90% 的部署场景 Command 只走 Coordinator→Endpoint 方向；开启本 feature 表示
+# 你确认自己正在做多 Coordinator / 对等发现等特殊拓扑，理解 Endpoint 主动发送
+# Command 会触发对端的 anti-replay 状态迁移。仅在真正需要时开启。
+endpoint-initiated-command = []
+
+# ============================================================
+# Lint 门控
+# ============================================================
+[lints]
+workspace = true

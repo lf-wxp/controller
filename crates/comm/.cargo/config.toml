@@ -1,0 +1,22 @@
+# ============================================================
+# comm —— .cargo/config.toml
+# ============================================================
+#
+# 覆盖仓库根 `.cargo/config.toml` 的 xtensa-esp32 默认设置：
+# - comm crate 是 no_std embassy crate；host 侧测试跑 loopback feature
+# - 关闭 build-std，避免与 host 系统 std 冲突
+#
+# ## 使用方式（在 crates/comm 目录下）
+# ```bash
+# # Apple Silicon
+# cargo test --target aarch64-apple-darwin --features loopback -- --test-threads=1
+#
+# # Linux CI
+# cargo test --target x86_64-unknown-linux-gnu --features loopback -- --test-threads=1
+# ```
+
+[build]
+rustflags = []
+
+[unstable]
+build-std = []
