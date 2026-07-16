@@ -1,0 +1,111 @@
+[package]
+edition.workspace = true
+name = "c6"
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "c6"
+path = "./src/bin/main.rs"
+test = false
+
+[[test]]
+harness = false
+name = "hello_test"
+
+[lib]
+test = false
+
+[dependencies]
+esp-hal = { version = "1.1.1", features = ["defmt", "esp32c6", "unstable"] }
+
+esp-rtos = { version = "0.3.0", features = [
+  "defmt",
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32c6",
+] }
+
+defmt = "1.1.1"
+esp-bootloader-esp-idf = { version = "0.5.0", features = ["defmt", "esp32c6"] }
+
+embassy-net = { version = "0.9.1", features = [
+  "defmt",
+  "dhcpv4",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+] }
+embedded-io = { version = "0.7.1", features = ["defmt"] }
+embedded-io-async = { version = "0.7.0", features = ["defmt"] }
+esp-alloc = { version = "0.10.0", features = ["defmt"] }
+panic-rtt-target = { version = "0.2.0", features = ["defmt"] }
+rtt-target = { version = "0.6.2", features = ["defmt"] }
+# for more networking protocol support see https://crates.io/crates/edge-net
+bt-hci = "0.9.0"
+embassy-executor = { version = "0.10.0", features = ["defmt"] }
+embassy-time = { version = "0.5.1", features = ["defmt"] }
+esp-radio = { version = "0.18.0", features = [
+  "ble",
+  "coex",
+  "defmt",
+  "esp-alloc",
+  "esp-now",
+  "esp32c6",
+  "unstable",
+  "wifi",
+] }
+smoltcp = { version = "0.13.1", default-features = false, features = [
+  "defmt",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+] }
+trouble-host = { version = "0.7.0", features = ["gatt"] }
+
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+
+# 关掉 embed-default-secrets，强制注入真密钥；启用 defmt::Format 集成。
+#
+# debug-auth-bypass（仅内网调试！）：
+#   protocol v0.2.0 的 Command/Response HMAC 会混入 session_nonce（K3 特性）。
+#   跨设备 nonce 同步需要接收方"未认证读 NonceHello"，但 v0.2.0 未提供该 API
+#   （官方 receiver-demo 未涉及 Command 通路，host-demo 靠单进程共享全局作弊）。
+#   为解开这个鸡蛋悖论，暂时开启此 feature：verify_hmac_tag 直接返回 true，
+#   c6 侧完全跳过 HMAC 校验（AUTH_ENABLED = false）。手柄侧照常算 HMAC 无需改动。
+#   ⚠️ 生产环境必须移除本 feature。
+controller-protocol = {path = "../protocol", default-features = false, features = ["defmt", "debug-auth-bypass"]}
+
+# comm 编排层：Notifier / Receiver 门面 + CommLink trait + PeerRegistry / ReplayGuard / Keyring
+# 通过实现 CommLink 把 esp_now.split() 的两半适配进 comm 的双 task 拓扑
+# （run_receive_loop + run_broadcast_loop），把手写的 handle_frame / handle_command / PeerCtx 全部下沉给 comm。
+comm = {path = "../comm", default-features = false, features = ["defmt"]}
+
+# LCD 驱动（ST7789 / 240x240 SPI 屏，正方形 1.3 寸屏）
+mipidsi = { version = "0.10.0", default-features = false, features = ["defmt"] }
+embedded-graphics = "0.8.2"
+embedded-hal = "1.0.0"
+embedded-hal-bus = { version = "0.3.0", features = ["defmt-03"] }
+
+# SD 卡 (FAT16/FAT32) — 与 LCD 共用 SPI2 总线，通过 embedded-hal-bus::RefCellDevice 复用
+embedded-sdmmc = { version = "0.9.0", default-features = false, features = ["defmt-log"] }
+
+# Inter-task 通道
+embassy-sync = { version = "0.8", features = ["defmt"] }
+embassy-futures = "0.1.2"
+
+[dev-dependencies]
+embedded-test = { version = "0.7.1", features = [
+  "defmt",
+  "embassy-010",
+  "external-executor",
+] }
