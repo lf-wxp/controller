@@ -22,7 +22,7 @@ pub use controller_protocol::{
   AntiReplayWindow, ButtonBits, COMMAND_LEN, COMMAND_MAGIC, COMMAND_VERSION, Command, CommandBody,
   CommandDecodeError, CommandKind, CommandResponse, DecodeError, ErrorCode, FRAME_LEN, FRAME_MAGIC,
   Frame, FrameHeader, GamepadState, KEY_ID_MAX, KeyId, KeyIdError, PROTOCOL_VERSION, RESPONSE_LEN,
-  RESPONSE_MAGIC, RESPONSE_VERSION, ReplayError, ResponseBody, ResponseDecodeError, ResponseKind,
-  WINDOW_WIDTH, decode_command, decode_frame, decode_response, encode_command, encode_frame,
-  encode_response, init_session_nonce, session_nonce,
+  RESPONSE_MAGIC, RESPONSE_VERSION, ResponseBody, ResponseDecodeError, ResponseKind, WINDOW_WIDTH,
+  decode_command, decode_frame, decode_response, encode_command, encode_frame, encode_response,
+  init_session_nonce,
 };

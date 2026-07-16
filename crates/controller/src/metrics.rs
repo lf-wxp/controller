@@ -3,7 +3,7 @@
 //! 本模块集中所有**幂等、可观测**的原子计数器，供两条主链路（BLE / ESP-NOW）
 //! 与持久化子系统在运行时上报"发生但被容忍"的事件：
 //!
-//! - [`response_overwrite_count`]：`RESPONSE_SIGNAL` 覆盖丢 Ack 事件（M-3）
+//! - [`response_overwrite_count`]：`esp_now::RESP_SIG` 覆盖丢 Ack 事件（M-3）
 //! - [`flash_write_count`]：NVS flash 实际发生的写入次数（M-5）
 //!
 //! ## 为什么集中？
@@ -27,9 +27,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // M-3：Response 覆盖事件计数
 // ============================================================
 
-/// `RESPONSE_SIGNAL` 覆盖丢 Ack 事件计数器
+/// `esp_now::RESP_SIG` 覆盖丢 Ack 事件计数器
 ///
-/// 每当 `signal_response()` 检测到 `RESPONSE_SIGNAL.signaled() == true`（意味
+/// 每当 [`crate::transport::control::broadcast_response`] 检测到 `esp_now::RESP_SIG.signaled() == true`（意味
 /// 前一次 Ack 尚未被 tx task 取走就被本次覆盖）时递增。
 ///
 /// # 何时值会显著上升？
@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 /// - **每分钟 > 100 次**：应升级为 `Channel<N>`（见 code-review 报告 M-3）
 static RESPONSE_OVERWRITE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// 记录一次 Response 覆盖事件（供 `signal_response` 内部调用）
+/// 记录一次 Response 覆盖事件（供 `broadcast_response` 内部调用）
 #[inline]
 pub fn record_response_overwrite() {
   RESPONSE_OVERWRITE_COUNT.fetch_add(1, Ordering::Relaxed);

@@ -46,8 +46,8 @@ use controller::transport::ble_hid::{
   BleHidTransport, EspBleController, FrameSignal, ble_gamepad_task,
 };
 use controller::transport::esp_now::{
-  EspNowFrameSignal, EspNowTransport, esp_now_broadcast_task, esp_now_receive_task,
-  nonce_broadcast_task,
+  EspNowRecvLink, EspNowSendLink, EspNowTransport, esp_now_notifier_broadcast_task,
+  esp_now_notifier_recv_task,
 };
 use controller::transport::{CompositeTransport, Transport};
 use controller::ui::{
@@ -141,38 +141,52 @@ async fn main(spawner: Spawner) -> ! {
   let (wifi_controller, interfaces) = esp_radio::wifi::new(peripherals.WIFI, Default::default())
     .expect("Failed to initialize Wi-Fi controller");
 
-  // 拆分出 esp_now（move），留下的 station/access_point 也必须保留
+  // 拆分出 esp_now（move），留下的 station/access_point 也必须保留。
+  // station 保留字段用来读 MAC-48（喂给 comm::Notifier 双身份 handler_config）。
   let esp_radio::wifi::Interfaces {
     esp_now: esp_now_iface,
-    station: _station,
+    station,
     access_point: _ap,
     ..
   } = interfaces;
+
+  // 本机 MAC-48：用于 `comm::CommandHandlerConfig::my_mac`（AssignId 分派匹配），
+  // 语义上 Notifier 不会收到给自己的 AssignId，此值仅作占位；日志里也顺便打印。
+  let own_mac = station.mac_address();
+  info!(
+    "[ESP-NOW] station MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+    own_mac[0], own_mac[1], own_mac[2], own_mac[3], own_mac[4], own_mac[5]
+  );
+  let _station = station; // 保活：drop 会关闭 station 接口
 
   // Wi-Fi controller / 剩余接口都需要长命周期——泄漏为 'static
   static WIFI_CTRL: StaticCell<esp_radio::wifi::WifiController<'static>> = StaticCell::new();
   let _wifi_ctrl_static = WIFI_CTRL.init(wifi_controller);
 
-  // 拆出 esp_now 的 sender 单向、独占；——发送任务只需要 sender
+  // 拆出 esp_now 的 sender / receiver；分别包成 comm::CommLink 的两半
   let (esp_now_manager, esp_now_sender, esp_now_receiver) = esp_now_iface.split();
   // manager 本项目不用，但 drop 会关闭 ESP-NOW，同样泄漏为 'static
   static ESP_NOW_MANAGER: StaticCell<esp_radio::esp_now::EspNowManager<'static>> =
     StaticCell::new();
   let _esp_now_manager_static = ESP_NOW_MANAGER.init(esp_now_manager);
 
-  // ESP-NOW 帧通道：主循环 → 广播任务
-  static ESP_NOW_SIGNAL: StaticCell<EspNowFrameSignal> = StaticCell::new();
-  let esp_now_signal: &'static EspNowFrameSignal = ESP_NOW_SIGNAL.init(EspNowFrameSignal::new());
+  // 用 EspNowSendLink / EspNowRecvLink 把 esp-radio 的两半包成 comm::CommLink，
+  // 交给 comm::Notifier 门面的两个 loop 驱动。Frame/Command/Response 三路 signal
+  // 已在 esp_now/mod.rs 以 static 形式定义，无需 StaticCell。
+  let send_link = EspNowSendLink::new(esp_now_sender);
+  let recv_link = EspNowRecvLink::new(esp_now_receiver);
 
-  // Spawn ESP-NOW 广播任务（sender 值传递）
+  // Spawn Notifier broadcast loop（对应旧 esp_now_broadcast_task）
   spawner.spawn(
-    esp_now_broadcast_task(esp_now_sender, esp_now_signal)
-      .expect("Failed to build ESP-NOW broadcast task token"),
+    esp_now_notifier_broadcast_task(send_link)
+      .expect("Failed to build ESP-NOW notifier broadcast task token"),
   );
 
-  // Spawn ESP-NOW 接收任务（receiver 值传递，用于接收 Command 帧）
+  // Spawn Notifier recv loop（对应旧 esp_now_receive_task；含 AnnounceReply
+  // upsert / 自动 AssignId / Command 派发到 control::dispatch_command_from_esp_now）
   spawner.spawn(
-    esp_now_receive_task(esp_now_receiver).expect("Failed to build ESP-NOW receive task token"),
+    esp_now_notifier_recv_task(recv_link, own_mac)
+      .expect("Failed to build ESP-NOW notifier recv task token"),
   );
 
   // ============================================================
@@ -182,17 +196,15 @@ async fn main(spawner: Spawner) -> ! {
   // 攻击者即使 dump 出 SHARED_SECRET，用旧 nonce 抓包再回放也无法通过
   // 校验 —— 因为下次重启时 nonce 已经变了。
   //
-  // Q 选项：使用 esp-hal 硬件 RNG 作为 seed 源。上面已经完成 Wi-Fi/BLE
-  // controller 初始化，RF phy 会向 RNG 硬件寄存器持续注入真随机熵源，
-  // `Rng::random()` 此时输出的是真随机数（而非启动时的 PRNG 弱熵）。
+  // 能力已下沉到 `comm`：
+  //   - `SimpleEntropy` 实现 `EntropySource`（硬件 RNG ⊕ 时钟抖动）
+  //   - `comm::init_session` 一行完成 seed 采样 + 写入 SESSION_NONCE
+  //   - `nonce_broadcast_task` 使用 comm 提供的通用 loop，无需手写
   // ============================================================
   {
-    let seed = controller::hal::rng::init_seed();
-    controller::protocol::init_session_nonce(seed);
-    info!(
-      "[SEC] Session nonce initialized (hw RNG): 0x{:08x}",
-      controller::protocol::session_nonce()
-    );
+    let mut entropy = controller::hal::rng::SimpleEntropy;
+    let nonce = comm::init_session(&mut entropy);
+    info!("[SEC] Session nonce initialized (hw RNG): 0x{:08x}", nonce);
   }
   spawner.spawn(nonce_broadcast_task().expect("Failed to build nonce_broadcast_task token"));
 
@@ -436,7 +448,7 @@ async fn main(spawner: Spawner) -> ! {
   let mut transport = CompositeTransport::new(
     BleHidTransport::new(signal),
     CompositeTransport::new(
-      EspNowTransport::new(esp_now_signal),
+      EspNowTransport::new(),
       UiTransport::new(ui_signal),
     ),
   );
@@ -453,11 +465,8 @@ async fn main(spawner: Spawner) -> ! {
 
   let mut seq: u32 = 0;
   let mut tick: u32 = 0;
-  // Announce 命令独立 seq 计数器（不与 Frame seq 共享）
-  //
-  // 反重放窗口按 (key_id, seq) 独立维护，因此 Announce/AssignId 不能借用
-  // Frame 的 seq —— 否则会导致空口上 seq 空间跳跃、窗口频繁失步。
-  let mut announce_seq: u32 = 1;
+  // Announce 命令的 seq 直接由 SESSION_KEYRING 分配，与其它 Command 共享同一个
+  // 递增计数器（反重放窗口按 key_id 内部自己推进，seq 空间无需隔离）。
   loop {
     // ---- 采样 + 本地反馈（LED 位图写入 AtomicU8，effect task 应用到硬件）----
     let mut sample = sampler.poll(&mut adc);
@@ -510,11 +519,17 @@ async fn main(spawner: Spawner) -> ! {
 
     // ---- 首次进入 Selecting：广播 Announce，让所有 receiver 上报 AnnounceReply ----
     //
-    // 独立 `announce_seq` 计数器（不与 Frame seq 共享），保证反重放窗口按需
-    // 独立推进。计数溢出概率极低（32 位），此处不做额外保护。
+    // 直接用 SESSION_KEYRING 分配 seq 并 encode；推入 CMD_OUT_SIG 后由 broadcast_loop 出站。
+    // 这就是 `comm::Notifier::discover()` 的内联展开 —— controller 未构造 Notifier 实例，直接用 comm 组件。
     if selector_outcome.just_entered {
-      controller::transport::esp_now::broadcast_announce(announce_seq);
-      announce_seq = announce_seq.wrapping_add(1);
+      let seq = controller::SESSION_KEYRING.next_seq();
+      let cmd = controller::protocol::Command::with_key(
+        seq,
+        controller::SESSION_KEYRING.active(),
+        controller::protocol::CommandBody::Announce,
+      );
+      controller::transport::esp_now::CMD_OUT_SIG
+        .signal(controller::protocol::encode_command(&cmd));
     }
 
     // ---- 每 TRANSMIT_EVERY_N 次采样发一帧，Selecting 时静默不发 ----
@@ -540,4 +555,21 @@ async fn main(spawner: Spawner) -> ! {
     tick = tick.wrapping_add(1);
     Timer::after(Duration::from_millis(INPUT_SCAN_INTERVAL_MS)).await;
   }
+}
+
+// ============================================================
+// K3: Nonce 广播 task 本地包装
+// ============================================================
+//
+// `comm::run_nonce_broadcast_loop` 是泛型 async fn（严格来说
+// 参数并非泛型，但 `#[embassy_executor::task]` 需要具体的 async fn 签名，
+// 而不是"调用其它 async fn 再返回 future"的透明包装），因此需要在此
+// 用 `#[embassy_executor::task]` 包一层。
+#[embassy_executor::task]
+async fn nonce_broadcast_task() -> ! {
+  comm::run_nonce_broadcast_loop(
+    &controller::transport::esp_now::RESP_SIG,
+    comm::DEFAULT_NONCE_BROADCAST_INTERVAL,
+  )
+  .await
 }

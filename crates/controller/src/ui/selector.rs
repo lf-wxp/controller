@@ -30,9 +30,8 @@
 //! - **不使用 async Mutex**：因为 sampler 是同步代码。
 //!
 //! ## 候选来源
-//! 候选列表直接取自真实的 [`peer_registry`](crate::peer_registry)（由
-//! Announce / AssignId 通道动态学习到的接收方列表）。UI 层只负责展示与选择，
-//! 不内置任何假 peer。
+//! 候选列表直接取自真实的 [`crate::REGISTRY`]（由 Announce / AssignId 通道动态
+//! 学习到的接收方列表）。UI 层只负责展示与选择，不内置任何假 peer。
 
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -42,13 +41,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Instant};
 use heapless::Vec;
 
-// PeerInfo / MAX_PEERS 统一由 peer_registry 提供——与硬件层一致。
+// PeerInfo / MAX_PEERS 统一由 comm 提供——与硬件层一致。
 // UI 层只使用其介面，不再自定义类型。
-use crate::peer_registry;
-pub use crate::peer_registry::{MAX_PEERS, PeerInfo};
-
-// MAX_PEERS 已从 [`crate::peer_registry`] re-export（见文件顶部 `pub use`），
-// 不在本处重复定义，保证 UI/硬件层使用同一份常量。
+pub use comm::{MAX_PEERS, PeerInfo};
 
 /// 面板一次能同时展示的候选行数（受屏幕高度限制）
 ///
@@ -96,7 +91,7 @@ impl UiMode {
   }
 }
 
-// PeerInfo / MAX_PEERS 已从 [`crate::peer_registry`] re-export（见文件头部），
+// PeerInfo / MAX_PEERS 已从 comm re-export（见文件头部），
 // 不在本文件重复定义；以保证 UI 层与硬件层使用同一份类型。
 
 // ============================================================
@@ -287,7 +282,7 @@ pub fn handle_input(input: SelectorInput) -> SelectorOutcome {
     just_entered: false,
   };
 
-  // 预取 candidates（会 lock peer_registry），避免在 TARGET_SELECTOR lock 内嵌套锁
+  // 预取 candidates（会 lock REGISTRY），避免在 TARGET_SELECTOR lock 内嵌套锁
   let candidates = current_candidates();
   let candidates_len = candidates.len();
 
@@ -360,7 +355,7 @@ pub fn handle_input(input: SelectorInput) -> SelectorOutcome {
 /// 的值，`candidates` 仍返回当前 registry 快照，用于稳态标题栏渲染）。
 #[must_use]
 pub fn snapshot(now: Instant) -> SelectorSnapshot {
-  // 先获取 candidates（会 lock peer_registry），避免在 TARGET_SELECTOR lock 内嵌套锁
+  // 先获取 candidates（会 lock REGISTRY），避免在 TARGET_SELECTOR lock 内嵌套锁
   let candidates = current_candidates();
 
   TARGET_SELECTOR.lock(|cell| {
@@ -476,9 +471,9 @@ fn remove_current_from_mask(inner: &mut TargetSelectorInner, candidates: &[PeerI
 // PeerRegistry 候选获取（现接真实 registry，Step A 的 MOCK_PEERS 已下线）
 // ============================================================
 
-/// 返回当前候选列表的快照（直接代理到 [`peer_registry::snapshot`]）
+/// 返回当前候选列表的快照（直接代理到 [`crate::REGISTRY`]）
 fn current_candidates() -> Vec<PeerInfo, MAX_PEERS> {
-  peer_registry::snapshot()
+  crate::REGISTRY.snapshot()
 }
 
 // ============================================================
@@ -501,7 +496,7 @@ mod tests {
 
   #[test]
   fn peer_info_role_bytes_trims_padding() {
-    // 现在 PeerInfo 来自 peer_registry：role 为定长 3 字节，末尾以 `\0` 填充
+    // PeerInfo 来自 comm：role 为定长 3 字节，末尾以 `\0` 填充
     let peer = PeerInfo {
       receiver_id: 0,
       mac: [0; 6],
@@ -519,14 +514,14 @@ mod tests {
   #[test]
   fn snapshot_reflects_real_registry() {
     // 清理全局 registry 状态，避免与其他测试并行执行时互相污染
-    peer_registry::clear_for_test();
+    crate::REGISTRY.clear_for_test();
 
-    // 候选直接取自真实 peer_registry；空 registry 时快照为空
+    // 候选直接取自真实 REGISTRY；空 registry 时快照为空
     assert_eq!(snapshot(Instant::from_ticks(0)).candidates.len(), 0);
 
     // 注册两台真实 peer 后，快照应反映 registry 内容（含升序 receiver_id）
-    let _ = peer_registry::upsert([0x11, 0, 0, 0, 0, 0], *b"mot", -40, Instant::from_ticks(0));
-    let _ = peer_registry::upsert([0x22, 0, 0, 0, 0, 0], *b"led", -50, Instant::from_ticks(0));
+    let _ = crate::REGISTRY.upsert([0x11, 0, 0, 0, 0, 0], *b"mot", -40, Instant::from_ticks(0));
+    let _ = crate::REGISTRY.upsert([0x22, 0, 0, 0, 0, 0], *b"led", -50, Instant::from_ticks(0));
     let snap = snapshot(Instant::from_ticks(0));
     assert_eq!(snap.candidates.len(), 2);
     assert_eq!(snap.candidates[0].receiver_id, 0);

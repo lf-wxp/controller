@@ -210,7 +210,7 @@ pub struct CustomControllerService {
   /// - `write_without_response`：无响应（低延迟，适合频繁命令）
   ///
   /// 收到写入后，`ble_gamepad_task` 会在 `handle_gatt_event` 里调用
-  /// [`crate::transport::control::dispatch_command`] 解码并执行。
+/// [`crate::transport::control::dispatch_command_from_ble`] 解码并执行。
   #[characteristic(uuid = CONTROL_COMMAND_UUID, write, write_without_response, value = [0u8; COMMAND_LEN])]
   pub control_command: [u8; COMMAND_LEN],
 

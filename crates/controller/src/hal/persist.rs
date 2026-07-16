@@ -48,7 +48,7 @@
 //! | LED 状态变化                 | **否**       |
 //!
 //! ## 后台落盘协作
-//! - 命令处理路径（`dispatch_command` 里）仅调用 [`mark_dirty`] 标脏，
+//! - 命令处理路径（`dispatch_command_from_ble` / `dispatch_command_from_esp_now`）仅调用 [`mark_dirty`] 标脏，
 //!   不阻塞（不触碰 flash）
 //! - [`persist_worker_in_memory_task`] / [`persist_worker_nvs_task`] 每 500 ms
 //!   轮询脏位，脏则调用 [`PersistentStorage::save`] 完成实际 IO
@@ -104,7 +104,7 @@ pub struct PersistentConfig {
   /// **U 选项**：per-key-id 抗重放窗口快照（KEY_SLOTS 个 slot）
   ///
   /// 每个元素 12 字节（4B last_seq + 8B bitmap）。启动时 [`Self::apply_replay_windows_to_runtime`]
-  /// 会把它们回填到 [`crate::transport::control::REPLAY_WINDOWS`]。
+  /// 会把它们回填到 [`crate::transport::control::REPLAY`]。
   pub replay_windows: [AntiReplayWindow; KEY_SLOTS],
 }
 
@@ -159,22 +159,18 @@ impl PersistentConfig {
     BATTERY_SIMULATED.store(self.battery_simulated, Ordering::Relaxed);
   }
 
-  /// 把 `replay_windows` 回填到全局 [`crate::transport::control::REPLAY_WINDOWS`]（U 选项）
+  /// 把 `replay_windows` 回填到全局 [`crate::transport::control::REPLAY`]（U 选项）
   ///
   /// # 为什么与 [`Self::apply_to_runtime`] 拆开？
   /// - `apply_to_runtime` 写 Atomic，无需 critical section
-  /// - 本方法写 [`crate::transport::control::REPLAY_WINDOWS`]（`Mutex<RefCell<...>>`），
-  ///   内部使用 `critical_section::with`；拆开则只在需要时才付出中断屏蔽代价。
+  /// - 本方法写 [`crate::transport::control::REPLAY`]（内部
+  ///   `Mutex<CriticalSectionRawMutex, RefCell<...>>`）；拆开则只在需要时才付出
+  ///   中断屏蔽代价。
   ///
   /// # 预期调用时机
   /// [`crate::bin::main`] 在启动时 `load_or_default` 之后、开始处理 Command 之前。
   pub fn apply_replay_windows_to_runtime(&self) {
-    use crate::transport::control::REPLAY_WINDOWS;
-    critical_section::with(|cs| {
-      for (i, w) in self.replay_windows.iter().enumerate() {
-        *REPLAY_WINDOWS[i].borrow_ref_mut(cs) = *w;
-      }
-    });
+    crate::transport::control::REPLAY.restore_from_snapshot(self.replay_windows);
   }
 
   /// 编码为 [`PERSIST_LEN`] 字节数组（含 CRC）
@@ -330,7 +326,7 @@ impl PersistentStorage for InMemoryStorage {
 }
 
 // ============================================================
-// 便捷全局单例（供 dispatch_command / main 使用）
+// 便捷全局单例（供 dispatch_command_from_ble / main 使用）
 // ============================================================
 
 /// **是否需要保存**标志（脏位）
@@ -352,7 +348,7 @@ static SNAP_LAST_SEQ: AtomicU32 = AtomicU32::new(0);
 ///
 /// 不使用 Atomic 因为数据太大（KEY_SLOTS × 12 = 48 字节）；用
 /// `critical_section::Mutex<RefCell<...>>` 与全局
-/// [`crate::transport::control::REPLAY_WINDOWS`] 保持一致风格。
+/// 与 [`crate::transport::control::REPLAY`] 保持一致风格。
 ///
 /// # 初始值
 /// 全 [`AntiReplayWindow::new`]（last_seq=0, bitmap=0）；尚未标脏时也不会被落盘。
@@ -391,7 +387,7 @@ pub fn mark_dirty(
 /// **U 选项**：仅刷新 replay_windows 快照 + 标脏（业务状态保持先前的快照）
 ///
 /// # 为什么需要专门的 replay-only 入口？
-/// [`crate::transport::control::dispatch_command`] 每 N 次命令会需要刷新窗口，
+/// [`crate::transport::control::dispatch_command_from_ble`] 每 N 次命令会需要刷新窗口，
 /// 但**不应该重写灵敏度/电池模式**（那些需要保持 [`SetSensitivity`] / [`SetBatteryMode`]
 /// 命令写入的最新值）。本函数只更新 replay_windows 一项。
 ///

@@ -20,7 +20,9 @@
 # cargo make ci                # 完整 CI 流程（本地跑通 = CI 跑通）
 #
 # cargo make controller-build  # 手柄固件构建
+# cargo make c6-build  # C6固件构建
 # cargo make controller-run    # 烧录 + probe-rs 实时日志
+# cargo make c6-run    # C6 烧录 + probe-rs 实时日志建
 # cargo make dashboard-serve   # Dashboard 开发服务器（trunk serve --open）
 # cargo make dashboard-build   # Dashboard 生产构建（trunk build --release）
 # ```
@@ -73,7 +75,7 @@ echo "🎮 controller —— cargo-make 任务列表"
 echo ""
 echo "常用："
 echo "  cargo make quick             快速本地校验（手柄 check + clippy）"
-echo "  cargo make ci                完整 CI 流程（三 crate 全部检查）"
+echo "  cargo make ci                完整 CI 流程（全部 crate 检查）"
 echo ""
 echo "手柄固件（controller / xtensa-esp32）："
 echo "  cargo make controller-check"
@@ -87,6 +89,11 @@ echo "协议 crate（controller-protocol / host）："
 echo "  cargo make protocol-check"
 echo "  cargo make protocol-clippy"
 echo "  cargo make protocol-test     单元测试 + proptest"
+echo ""
+echo "通信 crate（comm / host，启用全部 feature）："
+echo "  cargo make comm-check"
+echo "  cargo make comm-clippy"
+echo "  cargo make comm-test      集成测试（开启 loopback feature）"
 echo ""
 echo "Dashboard（controller-dashboard / wasm32）："
 echo "  cargo make dashboard-check"
@@ -109,36 +116,42 @@ echo ""
 # ============================================================
 # 手柄固件（controller，xtensa-esp32-none-elf）
 # ============================================================
-# 顶层 .cargo/config.toml 已配置 target = "xtensa-esp32-none-elf"
-# 所以在项目根直接 cargo <cmd> 就会自动用 xtensa target + esp fork toolchain
+# 固件 crate 现位于 crates/controller，其 .cargo/config.toml 配置
+# target = "xtensa-esp32-none-elf"。下面的 controller-* 任务通过
+# cwd = "crates/controller" 进入该目录，自动套用 xtensa target + esp fork toolchain。
 
 [tasks.controller-check]
 description = "手柄固件 cargo check（xtensa-esp32-none-elf）"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
 args = ["check", "--lib", "--bins"]
 
 [tasks.controller-clippy]
 description = "手柄固件 cargo clippy 严格模式"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
 args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
 
 [tasks.controller-build]
 description = "手柄固件 cargo build（release 需加 --release）"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
 args = ["build", "--bin", "controller"]
 
 [tasks.controller-build-release]
 description = "手柄固件 release 构建（LTO + opt-level=s）"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
 args = ["build", "--bin", "controller", "--release"]
 
 [tasks.controller-run]
 description = "烧录并启动 probe-rs 实时日志（需要 JTAG 调试探针，如 ESP-Prog / FTDI）"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
 args = ["run", "--bin", "controller"]
 
@@ -151,13 +164,15 @@ args = ["run", "--bin", "controller"]
 [tasks.controller-flash]
 description = "构建 + espflash 串口烧录固件（自动先 build，无需 JTAG 探针）"
 category = "Controller"
+cwd = "crates/controller"
 dependencies = ["controller-build"]
 command = "espflash"
-args = ["flash", "--port", "${ESP_PORT}", "target/xtensa-esp32-none-elf/debug/controller"]
+args = ["flash", "--port", "${ESP_PORT}", "../../target/xtensa-esp32-none-elf/debug/controller"]
 
 [tasks.controller-monitor]
 description = "通过 espflash 监听串口 defmt 实时日志（无需 JTAG 探针）"
 category = "Controller"
+cwd = "crates/controller"
 # --elf 让 espflash 从 ELF 的 .espressif.metadata 段读到 LOG_FORMAT="defmt-espflash"
 # 并加载 defmt symbol table 解码 rzcobs 二进制日志帧。
 # 依赖 controller-build 是为了保证 ELF 与实际烧录的 flash 内容一致——
@@ -169,14 +184,19 @@ args = [
   "--port",
   "${ESP_PORT}",
   "--elf",
-  "target/xtensa-esp32-none-elf/debug/controller",
+  "../../target/xtensa-esp32-none-elf/debug/controller",
 ]
 
 [tasks.controller-test-check]
 description = "手柄 embedded-test harness 静态检查（不真机运行）"
 category = "Controller"
+cwd = "crates/controller"
 command = "cargo"
-args = ["check", "--tests"]
+# --no-default-features：关掉 workspace feature `firmware-panic`，
+# 让 embedded-test 独占 `#[panic_handler]` lang item，避免 E0152 冲突。
+# 生产 firmware 编译（controller-check / controller-build 等）不加此 flag，
+# 默认启用 firmware-panic → esp-backtrace 正常注册 panic handler。
+args = ["check", "--tests", "--no-default-features"]
 
 # ============================================================
 # 协议 crate（controller-protocol，host target）
@@ -246,6 +266,58 @@ cwd = "crates/protocol"
 description = "协议单元测试 + proptest（cargo make protocol-test 别名）"
 category = "Protocol"
 alias = "protocol-test"
+
+# ============================================================
+# 通信 crate（comm，host target）
+# ============================================================
+# comm crate 基于 embassy async + no_std，面向手柄/接收端两侧提供引入即用的
+# Notifier / Receiver / 密钥环。本地 CI 跑 host target，靠 `loopback` feature
+# 模拟真实 ESP-NOW 拓扑。
+#
+# 为什么用 --all-features：
+# - `defmt` / `serde` / `loopback` 三个 feature 不互斥，且各自 gate 不同的模块；
+#   如果只跑 default features，loopback.rs 里的 clippy 问题永远不会被发现
+# - test 任务则只开 loopback（defmt 需要 embedded probe 不适合 host tests）
+
+[tasks.comm-check]
+description = "通信 crate cargo check（host target，--all-features）"
+category = "Comm"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}", "--all-features"]
+cwd = "crates/comm"
+
+[tasks.comm-clippy]
+description = "通信 crate cargo clippy 严格模式（host target，--all-features / --all-targets）"
+category = "Comm"
+toolchain = "stable"
+command = "cargo"
+# --all-targets 让 tests/ 目录也过 clippy；--all-features 覆盖 loopback / defmt / serde 代码路径
+args = [
+  "clippy",
+  "--target", "${HOST_TARGET}",
+  "--all-features",
+  "--all-targets",
+  "--",
+  "-D", "warnings",
+]
+cwd = "crates/comm"
+
+[tasks.comm-test]
+description = "通信 crate 集成测试（host target，开启 loopback feature，单线程）"
+category = "Comm"
+toolchain = "stable"
+command = "cargo"
+# --features loopback：集成测试依赖内存 mpsc 模拟链路
+# --test-threads=1：与 protocol crate 同款可靠性保障（避免全局静态变量互干）
+args = [
+  "test",
+  "--target", "${HOST_TARGET}",
+  "--features", "loopback",
+  "--",
+  "--test-threads=1",
+]
+cwd = "crates/comm"
 
 # ============================================================
 # Dashboard（controller-dashboard，wasm32-unknown-unknown）
@@ -375,6 +447,43 @@ command = "cargo"
 args = ["run", "--target", "${HOST_TARGET}"]
 cwd = "crates/examples/controller-receiver-demo"
 
+# ------------------------------------------------------------
+# comm-hello-world：comm 的"引入即用"体验演示，无需真机。
+# 通过 loopback feature 在同一进程里跑通 Notifier + Receiver 全链路，
+# 用于验证 comm 的门面 API 是否易用；CI 每次跑住 defense-in-depth。
+
+[tasks.example-comm-hello-world-check]
+description = "comm-hello-world 类型检查（host target）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["check", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/comm-hello-world"
+
+[tasks.example-comm-hello-world-clippy]
+description = "comm-hello-world cargo clippy 严格模式"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["clippy", "--target", "${HOST_TARGET}", "--", "-D", "warnings"]
+cwd = "crates/examples/comm-hello-world"
+
+[tasks.example-comm-hello-world-test]
+description = "comm-hello-world 单元测试"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["test", "--target", "${HOST_TARGET}", "--", "--test-threads=1"]
+cwd = "crates/examples/comm-hello-world"
+
+[tasks.example-comm-hello-world]
+description = "运行 comm-hello-world（comm 引入即用演示）"
+category = "Example"
+toolchain = "stable"
+command = "cargo"
+args = ["run", "--target", "${HOST_TARGET}"]
+cwd = "crates/examples/comm-hello-world"
+
 # ============================================================
 # 格式化（三 crate 共用 rustfmt.toml）
 # ============================================================
@@ -385,9 +494,11 @@ category = "Format"
 dependencies = [
   "fmt-controller",
   "fmt-protocol",
+  "fmt-comm",
   "fmt-dashboard",
   "fmt-example-host-demo",
   "fmt-example-receiver-demo",
+  "fmt-example-comm-hello-world",
 ]
 
 [tasks.fmt-controller]
@@ -402,6 +513,13 @@ category = "Format"
 command = "cargo"
 args = ["fmt", "--all"]
 cwd = "crates/protocol"
+
+[tasks.fmt-comm]
+description = "格式化通信 crate 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/comm"
 
 [tasks.fmt-dashboard]
 description = "格式化 Dashboard 源码"
@@ -424,15 +542,24 @@ command = "cargo"
 args = ["fmt", "--all"]
 cwd = "crates/examples/controller-receiver-demo"
 
+[tasks.fmt-example-comm-hello-world]
+description = "格式化 comm-hello-world 源码"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all"]
+cwd = "crates/examples/comm-hello-world"
+
 [tasks.fmt-check]
 description = "格式检查（不修改文件，CI 使用）"
 category = "Format"
 dependencies = [
   "fmt-check-controller",
   "fmt-check-protocol",
+  "fmt-check-comm",
   "fmt-check-dashboard",
   "fmt-check-example-host-demo",
   "fmt-check-example-receiver-demo",
+  "fmt-check-example-comm-hello-world",
 ]
 
 [tasks.fmt-check-controller]
@@ -447,6 +574,13 @@ category = "Format"
 command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
 cwd = "crates/protocol"
+
+[tasks.fmt-check-comm]
+description = "通信 crate fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/comm"
 
 [tasks.fmt-check-dashboard]
 description = "Dashboard fmt --check"
@@ -469,6 +603,13 @@ command = "cargo"
 args = ["fmt", "--all", "--", "--check"]
 cwd = "crates/examples/controller-receiver-demo"
 
+[tasks.fmt-check-example-comm-hello-world]
+description = "comm-hello-world fmt --check"
+category = "Format"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+cwd = "crates/examples/comm-hello-world"
+
 # ============================================================
 # 聚合任务
 # ============================================================
@@ -479,9 +620,12 @@ category = "Aggregate"
 dependencies = [
   "controller-check",
   "protocol-check",
+  "c6-check",
+  "comm-check",
   "dashboard-check",
   "example-host-demo-check",
   "example-receiver-demo-check",
+  "example-comm-hello-world-check",
 ]
 
 [tasks.clippy-all]
@@ -490,9 +634,12 @@ category = "Aggregate"
 dependencies = [
   "controller-clippy",
   "protocol-clippy",
+  "c6-clippy",
+  "comm-clippy",
   "dashboard-clippy",
   "example-host-demo-clippy",
   "example-receiver-demo-clippy",
+  "example-comm-hello-world-clippy",
 ]
 
 [tasks.quick]
@@ -509,22 +656,29 @@ dependencies = [
   # 2. 全部 crate check
   "controller-check",
   "protocol-check",
+  "comm-check",
   "dashboard-check",
   "example-host-demo-check",
   "example-receiver-demo-check",
+  "example-comm-hello-world-check",
   # 3. 全部 crate clippy 严格模式
   "controller-clippy",
   "protocol-clippy",
+  "comm-clippy",
   "dashboard-clippy",
   "example-host-demo-clippy",
   "example-receiver-demo-clippy",
+  "example-comm-hello-world-clippy",
   # 4. 手柄 tests harness 静态检查
   "controller-test-check",
   # 5. 协议 crate 单元测试 + proptest
   "protocol-test",
-  # 6. Example 单元测试（防止 controller.md / receiver.md 示例代码腐化）
+  # 6. 通信 crate 集成测试（loopback feature）
+  "comm-test",
+  # 7. Example 单元测试（防止 controller.md / receiver.md 示例代码腐化 + 验证 comm 引入即用体验）
   "example-host-demo-test",
   "example-receiver-demo-test",
+  "example-comm-hello-world-test",
 ]
 
 # ------------------------------------------------------------
@@ -559,3 +713,66 @@ description = "清理 cargo target 目录"
 category = "Clean"
 command = "cargo"
 args = ["clean"]
+
+# ============================================================
+# c6 接收端固件（ESP32-C6，riscv32imac-unknown-none-elf）
+# ============================================================
+# 与 controller（ESP32 xtensa）是兄弟 receiver：c6 常驻监听手柄 ESP-NOW 广播，
+# 解码后在 ST7789 LCD 上渲染状态。其专用 toolchain（nightly + riscv）与
+# target 配置都在 crates/c6/.cargo/config.toml 与 crates/c6/rust-toolchain.toml，
+# 下面的任务通过 cwd = "crates/c6" 进入该目录自动套用。
+# 日志走 panic-rtt-target + RTT（需 probe-rs / JTAG），不用 espflash defmt。
+[tasks.c6-check]
+description = "c6 接收端固件 cargo check（riscv32imac-unknown-none-elf）"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["check", "--lib", "--bins"]
+
+[tasks.c6-clippy]
+description = "c6 接收端固件 cargo clippy 严格模式（riscv32imac-unknown-none-elf）"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
+
+[tasks.c6-build]
+description = "c6 接收端固件 cargo build（release 需加 --release）"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["build", "--bin", "c6"]
+
+[tasks.c6-build-release]
+description = "c6 接收端固件 release 构建"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["build", "--bin", "c6", "--release"]
+
+[tasks.c6-run]
+description = "c6 通过 probe-rs 烧录并运行（带 RTT 日志，需要 JTAG 调试探针）"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["run", "--bin", "c6", "--release"]
+
+[tasks.c6-flash]
+description = "c6 通过 espflash 串口烧录（release，自动先 build，无需 JTAG）"
+category = "C6"
+dependencies = ["c6-build-release"]
+command = "espflash"
+args = ["flash", "--chip", "esp32c6", "../../target/riscv32imac-unknown-none-elf/release/c6"]
+
+[tasks.c6-monitor]
+description = "c6 通过 espflash 监听串口（RTT 需 probe-rs，此命令仅串口裸 monitor）"
+category = "C6"
+command = "espflash"
+args = ["monitor", "--chip", "esp32c6"]
+
+[tasks.c6-test-check]
+description = "c6 embedded-test harness 静态检查（不真机运行）"
+category = "C6"
+cwd = "crates/c6"
+command = "cargo"
+args = ["check", "--tests"]

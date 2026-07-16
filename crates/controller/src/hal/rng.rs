@@ -28,6 +28,13 @@
 //! [`Rng::new()`] 不需要 peripheral，也不会独占硬件——多个模块可以各自 `new`
 //! 一份用，硬件寄存器本身就是全局共享的。
 //!
+//! ## 兼容 comm crate 的 `EntropySource` trait
+//!
+//! [`SimpleEntropy`] 是本模块提供的**便捷 wrapper**，它同时实现
+//! `comm::EntropySource`；把它传给 `Notifier::init_session()`
+//! 或 `comm::init_session()` 即可完成 session_nonce 初始化，
+//! 无需在应用层再手动写"读 RNG + XOR 时钟 + 调 init_session_nonce"这一串。
+//!
 //! [`SESSION_NONCE`]: crate::protocol::auth::SESSION_NONCE
 //! [`Rng`]: esp_hal::rng::Rng
 
@@ -62,6 +69,35 @@ pub fn init_seed() -> u32 {
   // Instant::as_ticks() 返回 u64；截断到低 32 位即可（我们只需要 32 bit 熵）
   let clock_jitter = Instant::now().as_ticks() as u32;
   hw_random ^ clock_jitter
+}
+
+/// [`comm::EntropySource`] 的默认 esp32 实现
+///
+/// # 混合公式（与 [`init_seed`] 一致）
+/// ```text
+///   read_u32() = rng.random() ^ (Instant::now().as_ticks() as u32)
+/// ```
+///
+/// # 使用示例
+/// ```ignore
+/// let mut entropy = controller::hal::rng::SimpleEntropy;
+/// notifier.init_session(&mut entropy);
+/// // 或者：
+/// comm::init_session(&mut entropy);
+/// ```
+///
+/// # 为什么用零大小结构体？
+/// `esp_hal::rng::Rng` 本身就是零大小类型（`pub struct Rng;`），`new()`
+/// 也不消费任何 peripheral —— 我们对外表现为"要有个东西才能 read"，实际
+/// 每次 `read_u32` 内部 `Rng::new()` 现取现用，语义等价。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SimpleEntropy;
+
+impl comm::EntropySource for SimpleEntropy {
+  #[inline]
+  fn read_u32(&mut self) -> u32 {
+    init_seed()
+  }
 }
 
 /// 便捷入口：连续读多个 32-bit 熵（未来 key rotation / CSPRNG seeding 会用到）

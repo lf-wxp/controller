@@ -5,10 +5,16 @@
 #![no_std]
 #![no_main]
 
-// Panic handler + defmt global logger via UART（无需 JTAG）：
-// - esp_backtrace 提供 #[panic_handler]，panic 时用 defmt::error! 打印
-// - esp_println 通过 #[defmt::global_logger] 自动注册 defmt logger
-use esp_backtrace as _;
+// Panic handler：由 `embedded_test` 提供
+//   embedded-test 的 `#[embedded_test::tests]` 宏会自动注入 `#[panic_handler]`
+//   用于报告测试失败。因此本文件不再显式 `use esp_backtrace as _;`
+//   （若同时引入，会与 esp-backtrace 的 panic_handler 冲突：E0152）。
+//
+// 生产 firmware（crates/controller/src/bin/main.rs）走的是另一条路径：
+//   通过 `cargo build`（默认 features 里包含 `firmware-panic`）启用
+//   `esp-backtrace/panic-handler`，由 esp-backtrace 提供全局 panic_handler。
+//
+// defmt global logger 仍由 esp_println 通过 `#[defmt::global_logger]` 自动注册。
 use esp_println as _;
 
 esp_bootloader_esp_idf::esp_app_desc!();

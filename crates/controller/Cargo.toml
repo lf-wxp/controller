@@ -1,0 +1,147 @@
+[package]
+name = "controller"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "controller"
+path = "./src/bin/main.rs"
+test = false
+
+[[test]]
+harness = false
+name = "hello_test"
+
+[lib]
+test = false
+
+# ============================================================
+# Features
+# ============================================================
+# `firmware-panic`：注册 esp-backtrace 作为 #[panic_handler]（生产固件必需）。
+#
+# 为什么需要 feature 门控？
+#   `esp-backtrace/panic-handler` 与 `embedded-test`（dev-dep）均提供 `#[panic_handler]`
+#   lang item，直接同时启用会导致 `duplicate lang item: panic_impl` (E0152)。
+#   → 生产完全不知道 embedded-test、需要 esp-backtrace 处理 panic。
+#   → 集成测试（tests/hello_test.rs）只需要 embedded-test 自带的 panic_handler。
+#
+# 使用方式：
+#   - 生产构建（默认）：`cargo build --bin controller`  → firmware-panic 自动打开
+#   - test check：`cargo check --tests --no-default-features` → 关掉，避免冲突
+[features]
+default = ["firmware-panic"]
+firmware-panic = ["esp-backtrace/panic-handler"]
+
+[dependencies]
+# 协议 crate（在 crates/protocol 中），启用 defmt 集成
+controller-protocol = {path = "../protocol", features = ["defmt"]}
+
+# 通信编排 crate（在 crates/comm 中）：提供 Notifier / Receiver / nonce 广播等能力
+comm = {path = "../comm", features = ["defmt"]}
+
+esp-hal = {version = "~1.1.0", features = ["defmt", "esp32", "unstable"]}
+
+esp-rtos = {version = "0.3.0", features = [
+  "defmt",
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32",
+]}
+
+defmt = "1.0.1"
+esp-bootloader-esp-idf = {version = "0.5.0", features = ["defmt", "esp32"]}
+
+embassy-net = {version = "0.9.1", features = [
+  "defmt",
+  "dhcpv4",
+  "medium-ethernet",
+  "tcp",
+  "udp",
+]}
+embedded-io = {version = "0.7.1", features = ["defmt"]}
+embedded-io-async = {version = "0.7.0", features = ["defmt"]}
+esp-alloc = {version = "0.10.0", features = ["defmt"]}
+# ---- defmt 日志：走 UART + espflash 解码（无需 JTAG 探针） ----
+#
+# 原方案：`rtt-target` + `panic-rtt-target`，日志走 RTT，需要 probe-rs / JTAG 探针
+# 才能读取。原始 ESP32 无内置 USB-Serial-JTAG，仅以 USB-UART 连接开发机时无法看日志。
+#
+# 现方案：
+# - `esp-println/defmt-espflash`：以 `#[defmt::global_logger]` 注册全局 logger，
+#   把 defmt 帧 rzcobs 编码后从 UART TX 输出；同时把 `LOG_FORMAT="defmt-espflash"`
+#   写进 ELF 的 `.espressif.metadata` 段。`espflash monitor --elf ...` 会自动
+#   识别并解码。
+# - `esp-backtrace/panic-handler + defmt`（不开 `println`）：panic 时通过
+#   `defmt::error!` 输出，与上面 logger 走同一路径，避免混合文本+二进制帧。
+# - 不启用 `colors`：ANSI 转义会污染 rzcobs 二进制帧，导致 espflash 解码失败。
+esp-println = {version = "0.17.0", default-features = false, features = [
+  "esp32",
+  "defmt-espflash",
+  "critical-section",
+  "auto",
+]}
+esp-backtrace = {version = "0.19.0", default-features = false, features = [
+  "esp32",
+  "defmt",
+]}
+# for more networking protocol support see https://crates.io/crates/edge-net
+bt-hci = "0.8.0"
+embassy-executor = {version = "0.10.0", features = ["defmt"]}
+embassy-futures = "0.1"
+embassy-sync = {version = "0.7", features = ["defmt"]}
+embassy-time = {version = "0.5.0", features = ["defmt"]}
+esp-radio = {version = "0.18.0", features = [
+  "ble",
+  "coex",
+  "defmt",
+  "esp-alloc",
+  "esp-now",
+  "esp32",
+  "unstable",
+  "wifi",
+]}
+smoltcp = {version = "0.13.0", default-features = false, features = [
+  "defmt",
+  "medium-ethernet",
+  "multicast",
+  "proto-dhcpv4",
+  "proto-dns",
+  "proto-ipv4",
+  "socket-dns",
+  "socket-icmp",
+  "socket-raw",
+  "socket-tcp",
+  "socket-udp",
+]}
+trouble-host = {version = "0.6.0", features = ["gatt", "derive", "peripheral", "default-packet-pool"]}
+
+critical-section = "1.2.0"
+static_cell = "2.1.1"
+nb = "1.1"
+
+# ---- Persistent Storage (P 选项：NVS 真机落盘) ----
+# 通过 esp-storage 直接读写 flash 分区，不经过 ESP-IDF 的 NVS 库。
+# feature `critical-section` 默认开启，确保擦写期间的中断安全。
+esp-storage = {version = "0.9", features = ["esp32", "defmt"]}
+embedded-storage = "0.3"
+
+# ---- OLED UI ----
+embedded-graphics = "0.8"
+heapless = "0.9"
+ssd1306 = "0.10"
+
+[dev-dependencies]
+# 让下游测试可以调用 comm 里的 `clear_for_test` 等 helper（仅在 dev 生效）
+comm = {path = "../comm", features = ["defmt", "test-utils"]}
+embedded-test = {version = "0.7.1", features = [
+  "defmt",
+  "embassy-010",
+  "external-executor",
+  "xtensa-semihosting",
+]}
+
+[lints]
+workspace = true

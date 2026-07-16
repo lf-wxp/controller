@@ -40,7 +40,7 @@ use self::report::encode_report;
 use self::service::{CONNECTIONS_MAX, L2CAP_CHANNELS_MAX, Server};
 use crate::protocol::{CommandResponse, Frame, encode_frame, encode_response};
 use crate::transport::Transport;
-use crate::transport::control::{CommandSource, dispatch_command};
+use crate::transport::control::dispatch_command_from_ble;
 use crate::ui::{BATTERY_LEVEL, set_ble_connected};
 
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -73,7 +73,7 @@ pub type FrameSignal = Signal<CriticalSectionRawMutex, Frame>;
 ///
 /// 当 [`crate::transport::control::handle_command`] 产生 Ack / Error /
 /// NonceHello 等 [`CommandResponse`] 时，会同时写入本 Signal 与
-/// [`crate::transport::esp_now::RESPONSE_SIGNAL`]，实现两链路对等的反馈。
+/// [`crate::transport::esp_now::RESP_SIG`]，实现两链路对等的反馈。
 ///
 /// # 为什么采用覆盖式？
 /// - 高频命令场景下若 Response 堆积会造成流量放大
@@ -82,7 +82,7 @@ pub type ResponseSignal = Signal<CriticalSectionRawMutex, CommandResponse>;
 
 /// 全局 Response 通道（handler → BLE broadcast task）
 ///
-/// 与 [`crate::transport::esp_now::RESPONSE_SIGNAL`] 平行存在：
+/// 与 [`crate::transport::esp_now::RESP_SIG`] 平行存在：
 /// - Command handler 同时写入两个 signal（[`crate::transport::control::broadcast_response`]）
 /// - BLE task 仅订阅本 signal；ESP-NOW task 仅订阅自己那一个
 /// - 互不影响，双链路各自可靠发送
@@ -400,7 +400,7 @@ async fn push_response_to_peer<P: PacketPool>(
 ///
 /// # 命令通道处理
 /// 若事件是 `Write` 到 `server.custom.control_command`，先解码字节调用
-/// [`crate::transport::control::dispatch_command`]，然后 `accept()` 让 stack 回复 Host。
+/// [`crate::transport::control::dispatch_command_from_ble`]，然后 `accept()` 让 stack 回复 Host。
 async fn handle_gatt_event<P: PacketPool>(
   server: &Server<'_>,
   event: GattConnectionEvent<'_, '_, P>,
@@ -416,7 +416,7 @@ async fn handle_gatt_event<P: PacketPool>(
         let control_handle = server.custom.control_command.handle;
         if write_evt.handle() == control_handle {
           // 命令通道：解码 + 分发（不阻塞，仅内存操作）
-          dispatch_command(CommandSource::Ble, write_evt.data());
+                    dispatch_command_from_ble(write_evt.data());
         }
       }
 

@@ -190,39 +190,6 @@ pub mod battery {
   pub const BATTERY_MAX_V: f32 = 4.20;
 }
 
-/// 命令认证配置（K 选项：HMAC-SHA256 签名 + O 选项：密钥轮换）
-///
-/// # 威胁模型
-/// - **目标**：防止空气中未授权的 ESP-NOW 设备伪造 Command 干扰手柄
-/// - **手段**：Command / CommandResponse 帧尾部内嵌 4 字节 HMAC-SHA256 截断值
-/// - **K3 加固**：session nonce 混入 HMAC，重启即换 nonce
-/// - **O 加固**：多版密钥并存，Host 可在不停机的情况下平滑轮换
-/// - **不解决**：密钥泄漏（固件被物理 dump 后 secret 会暴露）
-///
-/// # 部署强化建议（生产环境）
-/// 1. 用 `build.rs` 从 `env!("CONTROLLER_SECRET_V*")` 读取密钥，避免明文入库
-/// 2. 出厂烧录时通过 NVS 分区写入独立密钥，每台设备唯一
-/// 3. 启用 flash encryption / secure boot 阻止密钥 dump
-///
-/// # 迁移说明
-/// `AUTH_ENABLED` / `HMAC_TAG_LEN` 已下沉到 [`controller_protocol::config::auth`]
-/// 供 dashboard/WASM 端复用；本模块作为兼容 re-export 层，同时保留手柄独有的
-/// [`auth::NONCE_BROADCAST_INTERVAL_MS`]（属于传输节奏，不属于协议本身）。
-pub mod auth {
-  pub use controller_protocol::config::auth::{AUTH_ENABLED, HMAC_TAG_LEN};
-
-  /// Session Nonce 广播周期（毫秒，K3 选项）
-  ///
-  /// 手柄每隔此时间广播一次 [`crate::protocol::ResponseKind::NonceHello`] 帧，
-  /// Host 侧被动收听即可获取当前 nonce（无需握手）。
-  ///
-  /// 权衡：
-  /// - 太短（<1s）：ESP-NOW 流量增加，Host 处理压力增大
-  /// - 太长（>30s）：Host 启动后要等很久才能开始发命令
-  /// - 5 秒是一个"人体感知不到延迟 + 空气流量友好"的折中值
-  pub const NONCE_BROADCAST_INTERVAL_MS: u64 = 5_000;
-}
-
 /// 密钥环（O 选项：HMAC 密钥轮换）
 ///
 /// # 迁移说明
