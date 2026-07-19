@@ -67,7 +67,7 @@ pub use frame::{FRAME_MAGIC, Frame, FrameHeader, PROTOCOL_VERSION};
 pub use replay::{AntiReplayWindow, ReplayError, WINDOW_WIDTH};
 pub use response::{
   CommandResponse, ErrorCode, RESPONSE_LEN, RESPONSE_MAGIC, RESPONSE_VERSION, ResponseBody,
-  ResponseDecodeError, ResponseKind, decode_response, encode_response,
+  ResponseDecodeError, ResponseKind, decode_response, encode_response, peek_nonce_hello,
 };
 pub use state::{ButtonBits, GamepadState};
 

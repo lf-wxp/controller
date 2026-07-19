@@ -122,7 +122,7 @@ let notifier = Notifier::builder()
 
 // 4. 主循环 API
 notifier.discover();                    // 主动发起一次发现
-for peer in notifier.peers().snapshot() { /* ... */ }
+for peer in notifier.peers() { /* ... */ } // peers() 直接返回 PeerInfo 快照 Vec
 notifier.select_targets(0b0000_0011);   // 选择 receiver 0 + 1
 notifier.send_frame(&frame);            // 广播状态帧
 ```
@@ -187,7 +187,7 @@ let receiver = Receiver::builder()
 |---|---|
 | 主动出站 | `send_frame(&Frame)` / `send_command(CommandBody)` / `report(ResponseBody)` |
 | 发现 | `discover()` — 广播一次 `Announce` |
-| Peer 目录 | `peers()` — 借出 `&PeerRegistry` |
+| Peer 目录 | `peers()` — 返回 `PeerInfo` 只读快照 `Vec`（非借出 registry） |
 | 目标选择 | `select_targets(mask)` / `selector()` |
 | Getter | `response_signal()` / `keyring()` |
 

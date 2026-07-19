@@ -17,11 +17,16 @@
 /// 除了作为 [`comm::CommLink::BROADCAST`] 的常量来源外，UI 层也可以从这里读取。
 pub const BROADCAST: [u8; 6] = [0xFF; 6];
 
-/// 首次上电 / 未收到 `AssignId` 之前的占位 receiver_id（`0`）。
+/// 首次上电 / 未收到 `AssignId` 之前的占位 receiver_id。
 ///
-/// `1 << 0 = 0x0000_0001`，广播帧 (`dest_mask = 0xFFFF_FFFF`) 依然命中，
-/// 与 `docs/esp_now_receiver.md` 的"占位 0"约定一致。
-pub const INITIAL_RECEIVER_ID: u8 = 0;
+/// 采用 comm 的"未分配"约定 [`comm::receiver::UNASSIGNED_ID`]（= `u8::MAX`），
+/// **而非 `0`**：
+/// - `0` 是一个**合法**的已分配 id（占 `dest_mask` 的第 0 位）。若拿它当"未分配"
+///   哨兵，真正被分配到 `id = 0` 的 receiver 会被 UI 误判为"未分配"，且无法进入
+///   comm 对未分配 receiver 的**宽限接收**（grace）路径。
+/// - `u8::MAX` 落在合法范围 `0..=31` 之外，`1 << 255` 不会命中任何 `dest_mask`，
+///   天然表达"尚未被寻址"，并与 [`comm::Receiver`] 的判定保持一致。
+pub const INITIAL_RECEIVER_ID: u8 = comm::receiver::UNASSIGNED_ID;
 
 /// receiver_id 上限（0..=31，对应 `dest_mask: u32` 的 32 个位）。
 ///

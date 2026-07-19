@@ -308,12 +308,15 @@ description = "通信 crate 集成测试（host target，开启 loopback feature
 category = "Comm"
 toolchain = "stable"
 command = "cargo"
-# --features loopback：集成测试依赖内存 mpsc 模拟链路
-# --test-threads=1：与 protocol crate 同款可靠性保障（避免全局静态变量互干）
+# --features loopback,test-utils：集成测试依赖内存 mpsc 模拟链路（loopback）
+#   且被 `#![cfg(all(feature = "loopback", feature = "test-utils"))]` 双 gate；
+#   缺少 test-utils 时 tests/integration.rs 会被整体跳过（编译出 0 个用例）。
+# --test-threads=1：与 protocol crate 同款可靠性保障（避免全局静态变量互干，
+#   尤其是 SESSION_NONCE 这类进程级 static）
 args = [
   "test",
   "--target", "${HOST_TARGET}",
-  "--features", "loopback",
+  "--features", "loopback,test-utils",
   "--",
   "--test-threads=1",
 ]

@@ -740,3 +740,116 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
     "receiver→notifier 方向的 Frame payload 应完整穿透 encode→decode"
   );
 }
+
+// ============================================================
+// 测试 9：AssignId 丢失后可自愈（Updated 路径重发）
+// ============================================================
+//
+// 回归防守：若 notifier 只在 peer 首次入库（Inserted）时下发一次 AssignId，
+// 一旦那条 AssignId 因覆盖式信号被覆盖 / 射频丢包而丢失，peer 会永久停留在
+// UNASSIGNED_ID（后续 AnnounceReply 只返回 Updated，不再补发）。
+//
+// 修复后：每次 AnnounceReply 都重发 AssignId（幂等）。本测试模拟"第一条
+// AssignId 丢失"——手动把 receiver 的 my_id 复位为 UNASSIGNED，再触发一次
+// discover，验证第二轮（Updated 路径）会重新把 id 分配回来。
+
+#[test]
+fn assign_id_resends_on_updated_and_self_heals() {
+  let ns = NotifierState::leak();
+  let rs = ReceiverState::leak();
+  let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
+
+  let mut pool = LocalPool::new();
+  let handler: fn(CommandSource, &comm::Command) -> CommandOutcome = |_src, _| CommandOutcome::Ok;
+  spawn_all_loops(
+    &pool, &ns, &rs, a_send, a_recv, b_send, b_recv, handler, None, None,
+  );
+
+  // 所有需要的字段都是 `&'static`（Copy），先取出来供 `async move` 与结尾断言共用。
+  let ns_keyring = ns.keyring;
+  let ns_cmd = ns.cmd_sig;
+  let ns_peers = ns.peers;
+  let rs_my_id = rs.my_id;
+
+  let send_announce = move || {
+    use controller_protocol::{Command, CommandBody as CB, encode_command};
+    let seq = ns_keyring.next_seq();
+    let cmd = Command::with_key(seq, ns_keyring.active(), CB::Announce);
+    ns_cmd.signal(encode_command(&cmd));
+  };
+
+  pool.run_until(async move {
+    // 第一轮发现：peer 入库（Inserted）→ 拿到 id=0
+    send_announce();
+    wait_for(|| rs_my_id.load(Ordering::Relaxed) != u8::MAX, 10_000).await;
+    assert_eq!(rs_my_id.load(Ordering::Relaxed), 0, "首轮应分配 id=0");
+    assert_eq!(ns_peers.len(), 1, "peer 已入库");
+
+    // 模拟"AssignId 丢失"：把 receiver 的 my_id 复位为 UNASSIGNED
+    rs_my_id.store(u8::MAX, Ordering::Relaxed);
+
+    // 第二轮发现：peer 已在 registry 里，upsert 返回 Updated；
+    // 修复后应仍重发 AssignId，让 receiver 重新拿回 id。
+    send_announce();
+    wait_for(|| rs_my_id.load(Ordering::Relaxed) != u8::MAX, 10_000).await;
+  });
+
+  assert_eq!(
+    rs_my_id.load(Ordering::Relaxed),
+    0,
+    "Updated 路径应重发 AssignId，receiver 自愈回 id=0"
+  );
+  assert_eq!(ns_peers.len(), 1, "peer 数量不应因重发变化");
+}
+
+// ============================================================
+// 测试 10：Receiver 从 NonceHello 广播同步 session nonce（K3 bootstrap）
+// ============================================================
+//
+// 覆盖上一轮审查发现的 comm 缺口：receiver 侧原先丢弃所有 Response 帧，
+// 无法采纳 Coordinator 广播的 NonceHello，导致跨设备 nonce 无法同步、
+// HMAC 校验只能靠 debug-auth-bypass 绕过。
+//
+// 修复后：receiver 的 dispatch 会免鉴权读取 NonceHello 里的 nonce 并写入
+// 全局 SESSION_NONCE。本测试把一条 NonceHello 通过 notifier→receiver 链路
+// 送出，验证 receiver 侧把 session nonce 更新成广播值。
+//
+// 注：host 测试里 notifier / receiver 共享同一进程内的全局 SESSION_NONCE，
+// 因此这里断言的是"全局 nonce 被 dispatch 改成广播值"——先置一个不同的
+// 初值，再验证它被 NonceHello 覆盖。
+
+use controller_protocol::{CommandResponse, init_session_nonce, session_nonce};
+
+#[test]
+fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
+  const START_NONCE: u32 = 0x1111_1111;
+  const BROADCAST_NONCE: u32 = 0x2222_2222;
+
+  // 先把全局 nonce 置成一个与广播值不同的初值。
+  init_session_nonce(START_NONCE);
+  assert_eq!(session_nonce(), START_NONCE);
+
+  let ns = NotifierState::leak();
+  let rs = ReceiverState::leak();
+  let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
+
+  let mut pool = LocalPool::new();
+  let handler: fn(CommandSource, &comm::Command) -> CommandOutcome = |_src, _| CommandOutcome::Ok;
+  spawn_all_loops(
+    &pool, &ns, &rs, a_send, a_recv, b_send, b_recv, handler, None, None,
+  );
+
+  let ns_resp = ns.resp_sig;
+
+  pool.run_until(async move {
+    // Notifier 侧广播一条 NonceHello（走 broadcast_loop → wire → receiver dispatch）
+    ns_resp.signal(CommandResponse::nonce_hello(BROADCAST_NONCE));
+    wait_for(|| session_nonce() == BROADCAST_NONCE, 10_000).await;
+  });
+
+  assert_eq!(
+    session_nonce(),
+    BROADCAST_NONCE,
+    "receiver 的 dispatch 应免鉴权采纳 NonceHello 里的 nonce"
+  );
+}

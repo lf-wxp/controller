@@ -68,6 +68,21 @@ pub struct Packet<'a, A> {
 /// # 为什么用 `impl Future` 而不是 `async fn`
 /// - `async fn` in trait 从 rust 1.75 起稳定；但当前仓库 rustc 1.88 已支持
 /// - 显式 `impl Future` 让借用生命周期更清晰，方便实现方定制
+///
+/// # ⚠️ 自帧回环（self-echo）约定
+/// **实现方必须保证 `recv` 不会把本机自己通过 `send` 发出的帧再交回来。**
+///
+/// comm 的派发逻辑只按 magic + 长度分流，**不会**按 `Packet::src` 过滤本机地址
+/// （`Addr` 是实现自选的泛型类型，crate 无法通用地与"本机地址"比较）。因此若
+/// 底层链路存在自回环（部分共享总线、TCP 广播被 hub 反射、某些 mesh 转发），
+/// 一个**双身份 `Notifier`**（[`crate::NotifierBuilder::with_command_handler`]）会：
+/// - 收到自己广播的 `Announce` → 回 `AnnounceReply` → 再收到自己的 `AnnounceReply`
+///   → 把**自己**登记成 peer 并给自己发 `AssignId`（自发现回环）
+/// - 收到自己 `send_command` 的回环 → 通过 anti-replay（新 seq）→ 在自己身上
+///   执行并回 `Ack`（自执行）
+///
+/// ESP-NOW 硬件默认**不会**把本机 TX 回环给自己，所以标准部署无此问题；但若你的
+/// 链路会回环，请在 `recv` 实现里丢弃 `src == 本机地址` 的帧。
 pub trait CommLink {
   /// 单帧最大字节数（用于内部缓冲 sizing）
   const MAX_FRAME_LEN: usize;

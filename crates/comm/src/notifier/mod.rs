@@ -308,7 +308,8 @@ pub async fn run_broadcast_loop<L: CommLink>(
 /// **接收 loop** —— 从 link 里连续 recv，解析并派发
 ///
 /// # 基本行为（纯 notifier 场景，`handler_config = None`）
-/// - `RESPONSE_LEN` 帧 → AnnounceReply → `peers.upsert(...)` → 首次入库时回 AssignId
+/// - `RESPONSE_LEN` 帧 → AnnounceReply → `peers.upsert(...)` → 回 AssignId（每次
+///   AnnounceReply 都重发，以自愈覆盖式信号被覆盖 / 射频丢包造成的 AssignId 丢失）
 /// - `COMMAND_LEN` 帧 → 静默忽略（自发命令广播回环，无消费者）
 ///
 /// # 启用 "双身份" 后的行为（`handler_config = Some(...)`）
@@ -405,7 +406,8 @@ pub async fn run_receive_loop<L: CommLink>(
 /// 处理入站 Response（主要是 AnnounceReply，以及可选的业务 response_handler）
 ///
 /// # 副作用
-/// - `AnnounceReply` → `peers.upsert(...)` + 首次入库时回 AssignId（comm 内部机制）
+/// - `AnnounceReply` → `peers.upsert(...)` + 回 AssignId（comm 内部机制；每次
+///   AnnounceReply 都重发，幂等自愈，详见函数体注释）
 /// - 其他变体（`Ack` / `Error` / `NonceHello` / `BatterySnapshot` 等）：
 ///   若 `response_handler = Some(fn)` 则回调；否则静默丢弃
 fn handle_incoming_response(
@@ -421,9 +423,26 @@ fn handle_incoming_response(
       rssi_dbm,
       role_tag,
     } => {
-      let outcome = peers.upsert(mac, role_tag, rssi_dbm, embassy_time::Instant::now());
-      if let UpsertOutcome::Inserted { receiver_id } = outcome {
-        // 首次入库：回一条 AssignId 让 receiver 记住自己的 id
+      // 无论首次入库（`Inserted`）还是刷新已有条目（`Updated`），都回一条 AssignId。
+      //
+      // # 为什么 `Updated` 也要重发？
+      // AssignId 走的是**覆盖式** `CommandOutSignal` + **无 Ack** 的广播下发，
+      // 存在两条丢失路径：(1) 信号在被 `broadcast_loop` 消费前被后续命令覆盖；
+      // (2) 射频/链路丢包。若只在 `Inserted` 时下发一次，一旦那条 AssignId 丢失，
+      // 该 peer 会**永久**停留在 [`crate::receiver::UNASSIGNED_ID`]——因为它已经
+      // 在 registry 里，后续 AnnounceReply 只会返回 `Updated`，再也不会补发。
+      //
+      // 每次 AnnounceReply 都重发是**幂等**的：同一 MAC 的 `receiver_id` 由
+      // registry 稳定保序分配、不会变化，receiver 重复写入同一个 id 无副作用。
+      // 用极低频的发现流量（AnnounceReply 仅在 controller 广播 Announce 后出现）
+      // 换取"只要还能通信，peer 最终一定拿到 id"的自愈能力。
+      let assigned = match peers.upsert(mac, role_tag, rssi_dbm, embassy_time::Instant::now()) {
+        UpsertOutcome::Inserted { receiver_id } | UpsertOutcome::Updated { receiver_id } => {
+          Some(receiver_id)
+        }
+        UpsertOutcome::Full => None,
+      };
+      if let Some(receiver_id) = assigned {
         let seq = keyring.next_seq();
         let cmd = Command::with_key(
           seq,

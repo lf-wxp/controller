@@ -67,8 +67,9 @@ static KEYRING: Keyring = Keyring::new();
 /// `check_and_update`，验证失败静默丢弃。
 static REPLAY: ReplayGuard = ReplayGuard::new();
 
-/// 本机 `receiver_id`：占位 [`INITIAL_RECEIVER_ID`] = 0；comm 收到匹配 mac 的
-/// `AssignId` 会自动 `.store(new_id, Relaxed)` 覆写。
+/// 本机 `receiver_id`：占位 [`INITIAL_RECEIVER_ID`]（= `comm` 的 `UNASSIGNED_ID`
+/// / `u8::MAX`）；comm 收到匹配 mac 的 `AssignId` 会自动 `.store(new_id, Relaxed)`
+/// 覆写成 `0..=31` 的合法 id。用 `u8::MAX` 而非 `0` 作占位，见 [`INITIAL_RECEIVER_ID`] 文档。
 static MY_ID: AtomicU8 = AtomicU8::new(INITIAL_RECEIVER_ID);
 
 /// Frame 出站 Signal（本 receiver 不主动 send_frame，但 comm builder 强制填）。

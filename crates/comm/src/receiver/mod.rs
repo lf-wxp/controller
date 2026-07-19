@@ -225,7 +225,7 @@ impl<L: CommLink> Receiver<L> {
     self.keyring
   }
 
-  /// 本机 MAC 地址（3 字节以下的地址请靠自己 pad）
+  /// 本机 MAC 地址（回 AnnounceReply / 判断 AssignId 目标时使用）
   #[must_use]
   pub fn my_mac(&self) -> [u8; 6] {
     self.my_mac
@@ -363,6 +363,13 @@ pub fn test_receiver_from_parts(
 // ============================================================
 
 /// 从 link 里连续 recv，解码 → 派发 → 自动回执
+///
+/// # 入站帧处理
+/// - `Command`（`Announce` / `AssignId` / 业务命令）：解码 + HMAC + 抗重放 → 派发
+/// - `Frame`：解码 + `dest_mask` 过滤 → 可选 `frame_handler`
+/// - `Response`：**仅**消费 `NonceHello` 以同步 session nonce（K3 bootstrap，见
+///   [`crate::dispatch`]）；其余 Response 变体静默丢弃。这条路径让 Endpoint 无需
+///   应用层介入即可与 Coordinator 对齐 HMAC nonce，是 Command 验签能通过的前提。
 ///
 /// # 适用场景
 /// - 纯 receiver-only 设备（led / motor / 伯服等只收命令 / 可选接收手柄 Frame 状态）

@@ -57,7 +57,8 @@ pub struct ViewModel {
   pub ok_count: u32,
   /// 累计被 `dest_mask` 过滤掉（收到但不是发给本机）的帧数
   pub filtered_count: u32,
-  /// 本机当前 `receiver_id`（由手柄的 `AssignId` 命令下发，默认 0）
+  /// 本机当前 `receiver_id`（由手柄的 `AssignId` 命令下发；未分配时为
+  /// [`crate::peer::INITIAL_RECEIVER_ID`] = `UNASSIGNED_ID` / `u8::MAX`）
   pub receiver_id: u8,
   /// 是否已被手柄通过 `AssignId` 分配过 ID
   pub assigned: bool,
@@ -316,13 +317,24 @@ where
   // 格式（示例）：`id=3*  filt=12  rep=2`；`*` 表示已被 AssignId 分配过（未分配显示 `.`）。
   let mut peer = heapless_str::<48>();
   let mark = if vm.assigned { '*' } else { '.' };
-  let _ = core::fmt::write(
-    &mut peer,
-    format_args!(
-      "id={}{}  filt={}  rep={}",
-      vm.receiver_id, mark, vm.filtered_count, vm.reply_count
-    ),
-  );
+  // 未分配时 receiver_id 是 UNASSIGNED_ID（`u8::MAX`）哨兵，显示 `-` 而非裸 255。
+  let _ = if vm.assigned {
+    core::fmt::write(
+      &mut peer,
+      format_args!(
+        "id={}{}  filt={}  rep={}",
+        vm.receiver_id, mark, vm.filtered_count, vm.reply_count
+      ),
+    )
+  } else {
+    core::fmt::write(
+      &mut peer,
+      format_args!(
+        "id=-{}  filt={}  rep={}",
+        mark, vm.filtered_count, vm.reply_count
+      ),
+    )
+  };
   draw_text(
     display,
     peer.as_str(),

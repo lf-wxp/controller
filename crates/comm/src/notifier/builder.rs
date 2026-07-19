@@ -162,6 +162,12 @@ impl<L: CommLink> NotifierBuilder<L> {
   /// AssignId 的现有逻辑，还会把 Command 帧——包含内置的 Announce / AssignId 与
   /// 用户业务命令——派发给你提供的 handler。
   ///
+  /// # ⚠️ 自帧回环约定
+  /// 双身份 `Notifier` 会**同时收发** Command / Announce。若底层 [`CommLink`] 存在
+  /// 自回环（`recv` 会交回本机 `send` 出去的帧），会触发自发现 / 自执行问题。
+  /// 详见 [`CommLink`](crate::CommLink) 文档的"自帧回环"章节——实现方需保证
+  /// 不回环本机帧（ESP-NOW 默认满足）。
+  ///
   /// # 参数
   /// - `handler`：用户业务命令处理函数
   /// - `role_tag`：本机角色（3 字节 ASCII，回 AnnounceReply 时携带）

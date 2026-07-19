@@ -116,7 +116,8 @@ impl Keyring {
   /// 获取当前 active slot 的下一个 seq（原子 fetch_add）
   ///
   /// # 语义
-  /// - 返回值 `>= 1`；0 保留给"未初始化"
+  /// - 返回值**恒 `>= 1`**；`0` 保留给"未初始化"哨兵，[`Self::bump_nonzero`]
+  ///   会在计数器绕回 `u32::MAX → 0` 时自动跳过它
   /// - `wrapping_add`：即使溢出也不 panic；`AntiReplayWindow` 已经能处理边界
   ///
   /// # Fallback
@@ -130,19 +131,39 @@ impl Keyring {
     } else {
       FALLBACK_SLOT
     };
-    let prev = self.tx_counters[idx].fetch_add(1, Ordering::Relaxed);
-    prev.wrapping_add(1)
+    Self::bump_nonzero(&self.tx_counters[idx])
   }
 
   /// 获取指定 slot 的下一个 seq（用于测试或自定义流程）
+  ///
+  /// 越界 slot 返回 `0`（沿用"非法输入"哨兵）；合法 slot 恒返回 `>= 1`。
   #[must_use]
   pub fn next_seq_for(&self, key_id: KeyId) -> u32 {
     let idx = key_id.as_u8() as usize;
     if idx >= KEY_SLOTS {
       return 0;
     }
-    let prev = self.tx_counters[idx].fetch_add(1, Ordering::Relaxed);
-    prev.wrapping_add(1)
+    Self::bump_nonzero(&self.tx_counters[idx])
+  }
+
+  /// 原子 `fetch_add` 取下一个 seq，并跳过被保留为"未初始化"哨兵的 `0`
+  ///
+  /// # 为什么需要
+  /// 朴素的 `fetch_add(1).wrapping_add(1)` 在计数器达到 `u32::MAX` 时会返回
+  /// `0`，而 `0` 是 anti-replay 约定的非法 seq（对端会以 `InvalidSeq` 丢弃）。
+  /// 本 helper 在**绕回的那一格**额外自增一次跳过 `0`，保证返回值恒 `>= 1`。
+  ///
+  /// # 代价
+  /// 仅在约 43 亿条命令后绕回时触发一次额外 `fetch_add`，可忽略。
+  #[inline]
+  fn bump_nonzero(counter: &AtomicU32) -> u32 {
+    let seq = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if seq == 0 {
+      // 计数器刚绕回并落在保留的 0 上：再消耗一格跳过它。
+      counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    } else {
+      seq
+    }
   }
 
   /// 只读快照：当前 tx_counter 值（用于 defmt 日志 / 单元测试）
@@ -153,6 +174,15 @@ impl Keyring {
       return 0;
     }
     self.tx_counters[idx].load(Ordering::Relaxed)
+  }
+
+  /// **仅测试**：强制某 slot 的 tx_counter，方便构造绕回等边界场景
+  #[cfg(test)]
+  fn force_counter_for_test(&self, key_id: KeyId, value: u32) {
+    let idx = key_id.as_u8() as usize;
+    if idx < KEY_SLOTS {
+      self.tx_counters[idx].store(value, Ordering::Relaxed);
+    }
   }
 }
 
@@ -203,6 +233,17 @@ mod tests {
     assert_eq!(kr.rotate_to(key2), Err(KeyringError::SlotDisabled(2)));
     // active 应该保持不变
     assert_eq!(kr.active().as_u8(), DEFAULT_KEY_ID);
+  }
+
+  #[test]
+  fn next_seq_skips_reserved_zero_on_wrap() {
+    let kr = Keyring::new();
+    // 把 active slot 的计数器推到 u32::MAX：下一次朴素 +1 会绕回 0。
+    kr.force_counter_for_test(KeyId::DEFAULT, u32::MAX);
+    // 应跳过保留的 0，直接返回 1。
+    assert_eq!(kr.next_seq(), 1);
+    // 之后继续单调递增。
+    assert_eq!(kr.next_seq(), 2);
   }
 
   #[test]

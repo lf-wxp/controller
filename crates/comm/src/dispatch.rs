@@ -22,7 +22,8 @@ use core::sync::atomic::{AtomicU8, Ordering};
 
 use controller_protocol::{
   COMMAND_LEN, COMMAND_MAGIC, Command, CommandBody, CommandDecodeError, CommandResponse, FRAME_LEN,
-  FRAME_MAGIC, KeyId, ResponseBody, decode_command, decode_frame,
+  FRAME_MAGIC, KeyId, RESPONSE_LEN, RESPONSE_MAGIC, ResponseBody, decode_command, decode_frame,
+  init_session_nonce, peek_nonce_hello, session_nonce,
 };
 
 use crate::keyring::Keyring;
@@ -53,12 +54,20 @@ pub(crate) struct DispatchCtx {
   pub(crate) frame_handler: Option<FrameHandler>,
 }
 
-/// 顶层派发入口：按 magic 分流到 Command / Frame 处理路径
+/// 顶层派发入口：按 magic 分流到 Command / Frame / Response 处理路径
 ///
 /// # 匹配规则
 /// - `data.len() == COMMAND_LEN` 且 magic == `COMMAND_MAGIC` → [`dispatch_command_frame`]
 /// - `data.len() == FRAME_LEN` 且 magic == `FRAME_MAGIC` → [`dispatch_frame`]
+/// - `data.len() == RESPONSE_LEN` 且 magic == `RESPONSE_MAGIC` → [`dispatch_response_frame`]
+///   （仅消费 `NonceHello` 以同步 session nonce；其余 Response 变体静默丢弃）
 /// - 其它：静默丢弃（未知 magic、长度不符、太短读不出 magic 都在此汇合）
+///
+/// # 谁调用本函数
+/// 仅 [`crate::receiver::run_receive_loop`]（Endpoint 侧）。Coordinator 侧的
+/// [`crate::notifier::run_receive_loop`] 有独立的 match（自己处理 Response 的
+/// AnnounceReply upsert / AssignId），**不**走本函数——因此本函数对 `NonceHello`
+/// 的采纳只作用于 Endpoint，Coordinator 作为 nonce 的**发布方**不会误采纳他人 nonce。
 pub(crate) fn dispatch_packet(data: &[u8], ctx: DispatchCtx) {
   if data.len() < 2 {
     #[cfg(feature = "defmt")]
@@ -69,8 +78,9 @@ pub(crate) fn dispatch_packet(data: &[u8], ctx: DispatchCtx) {
   match magic {
     COMMAND_MAGIC if data.len() == COMMAND_LEN => dispatch_command_frame(data, ctx),
     FRAME_MAGIC if data.len() == FRAME_LEN => dispatch_frame(data, ctx),
+    RESPONSE_MAGIC if data.len() == RESPONSE_LEN => dispatch_response_frame(data),
     _ => {
-      // 未知 magic 或长度不匹配：静默丢弃（可能是 Response 帧或对端 broadcast 回环）
+      // 未知 magic 或长度不匹配：静默丢弃（对端 broadcast 回环等）
       #[cfg(feature = "defmt")]
       defmt::trace!(
         "dispatch: drop packet (magic={=u16:04x}, len={=usize})",
@@ -78,6 +88,39 @@ pub(crate) fn dispatch_packet(data: &[u8], ctx: DispatchCtx) {
         data.len()
       );
     }
+  }
+}
+
+/// 处理入站 Response —— **仅** 消费 `NonceHello` 以同步 session nonce（K3 bootstrap）
+///
+/// # 背景（跨设备 nonce 同步）
+/// Coordinator 用 [`session_nonce`](controller_protocol::session_nonce) 作为 HMAC
+/// 前缀签发 Command，并周期广播 `NonceHello`。Endpoint 必须采纳同一个 nonce，
+/// 才能：(1) 验签 Coordinator 下发的 Command（含 `Announce` / `AssignId`）；
+/// (2) 用同一 nonce 签自己出站的 Response（`AnnounceReply` / `Ack`），让 Coordinator
+/// 能验签通过。
+///
+/// # 为什么免鉴权读取
+/// `NonceHello` 的 HMAC 以其自身携带的 nonce 为前缀，Endpoint 在拿到 nonce 前
+/// 无法验签（鸡蛋悖论）。这里用 [`peek_nonce_hello`](controller_protocol::peek_nonce_hello)
+/// 只校验 magic/version/kind/CRC 后取出 nonce，安全权衡见该函数文档。
+///
+/// # 幂等
+/// Coordinator 每 5s 重播同一 nonce；仅当与当前值不同才写入，避免无谓的
+/// `Release` 存储。其余 Response 变体（`Ack` / `Error` / `BatterySnapshot` /
+/// `AnnounceReply`）对 Endpoint 无意义，静默丢弃。
+fn dispatch_response_frame(data: &[u8]) {
+  let Some(nonce) = peek_nonce_hello(data) else {
+    // 非 NonceHello（或损坏）的 Response：Endpoint 不消费，静默丢弃
+    return;
+  };
+  if session_nonce() != nonce {
+    init_session_nonce(nonce);
+    #[cfg(feature = "defmt")]
+    defmt::debug!(
+      "dispatch: adopted session nonce 0x{=u32:08x} from NonceHello",
+      nonce
+    );
   }
 }
 

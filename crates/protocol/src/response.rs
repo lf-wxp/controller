@@ -494,6 +494,49 @@ pub fn decode_response(buf: &[u8]) -> Result<CommandResponse, ResponseDecodeErro
   })
 }
 
+/// 从一条 [`ResponseBody::NonceHello`] 广播里**免鉴权**提取 session nonce（K3 bootstrap）
+///
+/// # 为什么需要"免鉴权"读取
+/// `NonceHello` 的 HMAC 以其**自身携带的 nonce** 为前缀计算
+/// （`HMAC(secret, nonce || bytes)`）。接收方在拿到 nonce **之前**无法完成
+/// [`decode_response`] 的 HMAC 校验——这就是跨设备 nonce 同步的"鸡蛋悖论"。
+/// 本函数只校验 magic + version + kind + CRC（保证不是噪声/损坏帧），
+/// **跳过 HMAC**，直接返回内嵌的 nonce，供接收方 [`init_session_nonce`] 采纳。
+///
+/// # 返回
+/// - `Some(nonce)`：确实是一条结构完好的 `NonceHello`
+/// - `None`：长度 / magic / version / kind / CRC 任一不符（含非 NonceHello 的其它 Response）
+///
+/// # ⚠️ 安全说明
+/// 免鉴权读取意味着攻击者可注入伪造 nonce 使接收方与协调者**失步**（DoS）；
+/// 但攻击者无共享密钥仍**无法伪造后续 Command**（那些帧的 HMAC 仍需真密钥）。
+/// 协调者按固定周期重播 `NonceHello`，失步可自愈。若部署环境需要更强保证，
+/// 应在链路层加白名单 / 速率限制，而非依赖本函数鉴权。
+#[must_use]
+pub fn peek_nonce_hello(buf: &[u8]) -> Option<u32> {
+  if buf.len() != RESPONSE_LEN {
+    return None;
+  }
+  if u16::from_le_bytes([buf[0], buf[1]]) != RESPONSE_MAGIC {
+    return None;
+  }
+  let (_key_id_nibble, protocol_version) = unpack_version_byte(buf[2]);
+  if protocol_version != RESPONSE_VERSION {
+    return None;
+  }
+  if buf[7] != ResponseKind::NonceHello as u8 {
+    return None;
+  }
+  // CRC 校验（廉价的完整性过滤；HMAC 有意跳过，见函数级文档）
+  let expected_crc = crc16_ibm(&buf[..CRC_OFFSET]);
+  let actual_crc = u16::from_le_bytes([buf[CRC_OFFSET], buf[CRC_OFFSET + 1]]);
+  if expected_crc != actual_crc {
+    return None;
+  }
+  // payload 从 offset 8 起；NonceHello 的 nonce 占 payload[0..4]（LE）
+  Some(u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]))
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -667,6 +710,43 @@ mod tests {
       Err(ResponseDecodeError::UnsupportedKeyId(k)) => assert_eq!(k as usize, KEY_SLOTS),
       other => panic!("expected UnsupportedKeyId, got {:?}", other),
     }
+  }
+
+  #[test]
+  fn peek_nonce_hello_extracts_nonce_without_hmac() {
+    // NonceHello 免鉴权读取：即使当前 session_nonce 与广播里的 nonce 不一致
+    // （receiver 尚未同步），也应能取出内嵌 nonce。
+    for nonce in [1_u32, 42, 0x1234_5678, u32::MAX] {
+      let bytes = encode_response(&CommandResponse::nonce_hello(nonce));
+      assert_eq!(peek_nonce_hello(&bytes), Some(nonce));
+    }
+  }
+
+  #[test]
+  fn peek_nonce_hello_rejects_non_nonce_responses() {
+    // 其它 Response 变体不应被误判为 NonceHello。
+    let ack = encode_response(&CommandResponse::ack(7));
+    assert_eq!(peek_nonce_hello(&ack), None);
+    let battery = encode_response(&CommandResponse::battery(1, 80));
+    assert_eq!(peek_nonce_hello(&battery), None);
+  }
+
+  #[test]
+  fn peek_nonce_hello_rejects_bad_length_magic_and_crc() {
+    let good = encode_response(&CommandResponse::nonce_hello(0xABCD_1234));
+
+    // 长度不符
+    assert_eq!(peek_nonce_hello(&good[..RESPONSE_LEN - 1]), None);
+
+    // magic 损坏
+    let mut bad_magic = good;
+    bad_magic[0] ^= 0xFF;
+    assert_eq!(peek_nonce_hello(&bad_magic), None);
+
+    // CRC 损坏（篡改 payload 但不修 CRC）
+    let mut bad_crc = good;
+    bad_crc[8] ^= 0xFF;
+    assert_eq!(peek_nonce_hello(&bad_crc), None);
   }
 
   #[test]
