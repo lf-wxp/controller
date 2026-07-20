@@ -9,7 +9,7 @@
 //!   ┌──────────────────────────┐
 //!   │ RECV  seq=12345  gap=2   │  顶部状态行
 //!   ├──────────────────────────┤
-//!   │ [B1][B2][B3][B4][JB][SW] │  6 键方块
+//!   │ [B1][B2][B3][B4]         │  4 键方块
 //!   │                          │
 //!   │ Joy ( +12000, -50 )      │  摇杆 + 十字准星
 //!   │                          │
@@ -304,17 +304,17 @@ where
 // 主渲染入口
 // ============================================================
 
-/// 按钮定义（6 键：Btn1-4 + JoyBtn + Switch）。
-const BTN_DEFS: [(ButtonBits, &str); 6] = [
+/// 按钮定义（4 键：Btn1-4）。
+///
+/// JoyBtn / Switch 不再展示：Switch(IO15) 已改作彩灯输出、不再是输入；
+/// JoyBtn 仅用于手柄本机长按开选择器，无需在接收端画面上呈现。
+const BTN_DEFS: [(ButtonBits, &str); 4] = [
   (ButtonBits::Btn1, "B1"),
   (ButtonBits::Btn2, "B2"),
   (ButtonBits::Btn3, "B3"),
   (ButtonBits::Btn4, "B4"),
-  (ButtonBits::JoyBtn, "JB"),
-  (ButtonBits::Switch, "SW"),
 ];
-//   240 宽 = 8(左边距) + 6*btn_w + 5*gap + 8(右边距)
-//   btn_w=34, gap=4 => 8 + 204 + 20 + 8 = 240
+//   4 键左对齐：8(左边距) + 4*btn_w + 3*gap = 8 + 136 + 12 = 156，右侧留白
 const BTN_W: u32 = 34;
 const BTN_GAP: i32 = 4;
 

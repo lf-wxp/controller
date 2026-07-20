@@ -2,7 +2,7 @@
 //!
 //! 使用纯 SVG + CSS：
 //! - 摇杆：外圈 + 内小圆点（相对 X/Y 偏移）
-//! - 按钮：4 个圆形亮灯 + JoyBtn + Switch1（一共 6 个）
+//! - 按钮：Btn1-4 共 4 个圆形亮灯
 //! - 旋钮：两根垂直进度条
 
 use controller_protocol::state::ButtonBits;
@@ -33,7 +33,6 @@ pub fn GamepadVisual() -> impl IntoView {
             let s = state.gamepad.get();
             let cx = SVG_RADIUS + (s.joy_x as f64 / AXIS_RANGE as f64) * (SVG_RADIUS - DOT_RADIUS);
             let cy = SVG_RADIUS - (s.joy_y as f64 / AXIS_RANGE as f64) * (SVG_RADIUS - DOT_RADIUS);
-            let joy_btn_pressed = (s.buttons & (1 << ButtonBits::JoyBtn as u16)) != 0;
             view! {
               <svg viewBox={format!("0 0 {} {}", SVG_RADIUS * 2.0, SVG_RADIUS * 2.0)}
                    class="joystick-svg" aria-hidden="true">
@@ -46,12 +45,10 @@ pub fn GamepadVisual() -> impl IntoView {
                 <line x1="6" y1={SVG_RADIUS} x2={SVG_RADIUS * 2.0 - 6.0} y2={SVG_RADIUS}
                       class="joystick-cross" />
                 // 摇杆点
-                <circle cx={cx} cy={cy} r={DOT_RADIUS}
-                        class={if joy_btn_pressed { "joystick-dot dot-pressed" } else { "joystick-dot" }} />
+                <circle cx={cx} cy={cy} r={DOT_RADIUS} class="joystick-dot" />
               </svg>
               <div class="joystick-readout mono">
-                {format!("X={:+05} Y={:+05}{}", s.joy_x, s.joy_y,
-                  if joy_btn_pressed { " ⏺" } else { "" })}
+                {format!("X={:+05} Y={:+05}", s.joy_x, s.joy_y)}
               </div>
             }
           }}
@@ -65,7 +62,6 @@ pub fn GamepadVisual() -> impl IntoView {
             <ButtonLamp label="Btn2" bit={ButtonBits::Btn2} />
             <ButtonLamp label="Btn3" bit={ButtonBits::Btn3} />
             <ButtonLamp label="Btn4" bit={ButtonBits::Btn4} />
-            <ButtonLamp label="Sw1" bit={ButtonBits::Switch} />
           </div>
         </div>
 
