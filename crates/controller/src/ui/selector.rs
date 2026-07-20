@@ -420,11 +420,19 @@ fn detect_switch_long_press(
   }
 }
 
-/// 进入 Selecting 模式；pending_mask 从 active mask 继承
+/// 进入 Selecting 模式；pending_mask 从 active mask 继承（广播态视作空选集）
+///
+/// # 为什么广播态要以"空选集"进入
+/// 默认 active 是 [`BROADCAST_MASK`]（32 位全 1），其中含 31 个**根本不存在**的
+/// peer 的"幽灵位"。若直接继承，UI 会把它们都当成"已选中"，用户"取消选择"某个
+/// 真实 peer 后 mask 仍非 0（幽灵位还在），却恰好把该 peer 排除 → 该接收方从此
+/// 收不到帧（且永远回不到广播）。因此把"广播"理解为"未做任何限制"，进入时呈现
+/// 为空选集；只有非广播的具体 mask 才继承下来，供用户在既有选择上编辑。
 fn enter_selecting(inner: &mut TargetSelectorInner, now: Instant) {
   inner.mode = UiMode::Selecting;
   inner.cursor = 0;
-  inner.pending_mask = active_dest_mask();
+  let active = active_dest_mask();
+  inner.pending_mask = if active == BROADCAST_MASK { 0 } else { active };
   inner.entered_at = now;
   inner.last_activity_at = now;
   // 进入模式时清掉可能残留的摇杆 latch，避免 UI 一开就跳选
@@ -432,9 +440,19 @@ fn enter_selecting(inner: &mut TargetSelectorInner, now: Instant) {
 }
 
 /// 退出 Selecting 并把 pending_mask 提升为生效
+///
+/// # 空选集回退为广播
+/// 未选任何目标（`pending_mask == 0`）时保存为 [`BROADCAST_MASK`]（发给所有接收方），
+/// 而**不是** `0`。`0` 在协议里是"静默丢弃"（所有接收方都收不到），只应作为显式
+/// "暂停下发"的入口，绝不能由"打开列表→没选/取消选择→退出"这种常规操作误触。
 fn exit_selecting_saving(inner: &mut TargetSelectorInner) {
   inner.mode = UiMode::Normal;
-  ACTIVE_DEST_MASK.store(inner.pending_mask, Ordering::Relaxed);
+  let mask = if inner.pending_mask == 0 {
+    BROADCAST_MASK
+  } else {
+    inner.pending_mask
+  };
+  ACTIVE_DEST_MASK.store(mask, Ordering::Relaxed);
   inner.switch_press_started_at = None;
 }
 
