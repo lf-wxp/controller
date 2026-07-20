@@ -216,6 +216,30 @@ const JOY_DOT: i32 = 3;
 /// 旋钮条几乎不填充。dashboard 端 (`gamepad_visual.rs`) 也用这个值。
 const AXIS_RANGE: i32 = 1000;
 
+/// 旋钮显示滞回阈值（0..=AXIS_RANGE 量程内的点数）。
+///
+/// 旋钮电位器的 ADC 采样即便在手柄端做过 4 点移动平均，中位读数仍会在低位
+/// 持续 ±数点抖动，c6 若原样显示就表现为数字/进度条跳动。这里在**显示层**
+/// 加一层滞回吸收抖动，不影响协议传输值，也不改手柄采样逻辑。
+const KNOB_DISPLAY_HYSTERESIS: u16 = 8;
+
+/// 对旋钮显示值做滞回：与上次显示值相差不足 [`KNOB_DISPLAY_HYSTERESIS`] 时
+/// 沿用旧值，抖动即被吸收。
+///
+/// 两端极值（`0` / `AXIS_RANGE`，电位器机械到底、读数本就稳定）直接透传，
+/// 避免"旋到底却显示不到 0 / 满量程"。
+#[must_use]
+pub fn stabilize_knob(prev: u16, new: u16) -> u16 {
+  if new == 0 || new >= AXIS_RANGE as u16 {
+    return new;
+  }
+  if new.abs_diff(prev) < KNOB_DISPLAY_HYSTERESIS {
+    prev
+  } else {
+    new
+  }
+}
+
 /// 计算摇杆光点中心像素坐标：joy_x/joy_y 是 i16，量程为 **±AXIS_RANGE**
 /// （不是 ±i16::MAX），映射到区域中心 ± `span`。
 fn joy_dot_center(pos: Point, joy_x: i16, joy_y: i16) -> Point {

@@ -107,10 +107,16 @@ fn on_frame(_src: CommandSource, frame: &Frame) {
       vm.gap_count = vm.gap_count.saturating_add(1);
     }
   }
+  // 旋钮显示滞回：先记下上次显示值，覆盖后再吸收 ADC 抖动（不影响其它字段）
+  let prev_knob_1 = vm.state.knob_1;
+  let prev_knob_2 = vm.state.knob_2;
+
   vm.have_data = true;
   vm.last_seq = frame.header.seq;
   vm.ok_count = vm.ok_count.saturating_add(1);
   vm.state = frame.payload;
+  vm.state.knob_1 = crate::display::stabilize_knob(prev_knob_1, vm.state.knob_1);
+  vm.state.knob_2 = crate::display::stabilize_knob(prev_knob_2, vm.state.knob_2);
   vm.receiver_id = MY_ID.load(core::sync::atomic::Ordering::Relaxed);
   vm.assigned = vm.receiver_id != INITIAL_RECEIVER_ID;
   sender.send(vm);
