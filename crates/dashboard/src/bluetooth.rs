@@ -42,6 +42,7 @@
 
 use controller_protocol::{
   Command, FRAME_LEN, RESPONSE_LEN, ResponseBody, decode_frame, decode_response, encode_command,
+  init_session_nonce, peek_nonce_hello,
 };
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use leptos::prelude::*;
@@ -434,6 +435,19 @@ async fn subscribe_response(
       )));
       return;
     }
+
+    // NonceHello 必须**免 HMAC** 读取（K3 鸡蛋悖论）：dashboard 在拿到 nonce
+    // 之前无法验签任何带签名的响应。这里镜像 receiver（comm::dispatch）的做法，
+    // 先 peek 出广播 nonce 并同步进 protocol 层的全局 SESSION_NONCE —— 之后
+    // Ack / AnnounceReply 等响应才能通过 decode_response 的 HMAC 校验，
+    // 手柄接收方列表也才能正确显示。
+    if let Some(nonce) = peek_nonce_hello(&bytes) {
+      init_session_nonce(nonce);
+      state.session_nonce.set(Some(nonce));
+      state.push_event(EventEntry::rx(format!("NonceHello=0x{nonce:08x}"), bytes));
+      return;
+    }
+
     match decode_response(&bytes) {
       Ok(resp) => {
         let summary = match &resp.body {

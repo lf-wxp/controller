@@ -207,6 +207,9 @@ async fn main(spawner: Spawner) -> ! {
   }
   spawner.spawn(nonce_broadcast_task().expect("Failed to build nonce_broadcast_task token"));
 
+  // BLE 侧响应中继：向 dashboard 补发 NonceHello + 转发 REGISTRY 接收方目录
+  spawner.spawn(ble_response_relay_task().expect("Failed to build ble_response_relay_task token"));
+
   // ============================================================
   // K4 + P: 持久化配置——启动时载入、后台异步落盘
   //
@@ -557,4 +560,55 @@ async fn nonce_broadcast_task() -> ! {
     comm::DEFAULT_NONCE_BROADCAST_INTERVAL,
   )
   .await
+}
+
+// ============================================================
+// BLE 响应中继：向 dashboard 周期推送 NonceHello + 接收方目录
+// ============================================================
+//
+// dashboard 经 BLE 连接，但此前"看不到"接收方列表，根因有二：
+//   1. NonceHello 仅经 ESP-NOW 广播（nonce_broadcast_task 用 esp_now::RESP_SIG），
+//      BLE 侧从不发送 —— dashboard 拿不到 session nonce，AUTH_ENABLED=true 下
+//      **任何**带 HMAC 的响应（Ack / AnnounceReply）验签都失败被丢弃。
+//   2. AnnounceReply 是 comm 内部发现机制，upsert 进 REGISTRY 后不转发到 BLE。
+//
+// 本任务在 BLE 已连接时周期性：先补一条 NonceHello（让 dashboard 免鉴权
+// bootstrap nonce），再把 REGISTRY 快照逐条以 AnnounceReply 推给 dashboard。
+// RESPONSE_SIGNAL 是覆盖式，故每条之间留 gap 让 BLE tx 任务先取走再发下一条。
+const BLE_RELAY_PERIOD_MS: u64 = 2000;
+const BLE_RELAY_GAP_MS: u64 = 80;
+
+#[embassy_executor::task]
+async fn ble_response_relay_task() -> ! {
+  use comm::{CommandResponse, KeyId, RSSI_UNKNOWN, session_nonce};
+  use controller::transport::ble_hid::signal_response;
+  use controller::ui::BLE_CONNECTED;
+
+  loop {
+    if BLE_CONNECTED.load(Ordering::Relaxed) {
+      // 1) NonceHello —— dashboard 借此免鉴权 bootstrap session nonce
+      signal_response(CommandResponse::nonce_hello(session_nonce()));
+      Timer::after(Duration::from_millis(BLE_RELAY_GAP_MS)).await;
+
+      // 2) REGISTRY 快照 → 逐条 AnnounceReply（携带 controller 侧 role / rssi）
+      for peer in controller::REGISTRY.snapshot().iter() {
+        // comm 的未知 RSSI 哨兵是 i8::MIN(-128)，协议约定的未知值是 -127；
+        // 映射后 dashboard 才会显示 "--" 而非 -128dBm
+        let rssi = if peer.rssi_dbm == RSSI_UNKNOWN {
+          -127
+        } else {
+          peer.rssi_dbm
+        };
+        signal_response(CommandResponse::announce_reply(
+          0,
+          KeyId::DEFAULT,
+          peer.mac,
+          rssi,
+          peer.role,
+        ));
+        Timer::after(Duration::from_millis(BLE_RELAY_GAP_MS)).await;
+      }
+    }
+    Timer::after(Duration::from_millis(BLE_RELAY_PERIOD_MS)).await;
+  }
 }
