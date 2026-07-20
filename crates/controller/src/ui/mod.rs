@@ -300,10 +300,14 @@ pub type OledDisplay<I2C> =
 ///
 /// 见 [`OledDisplay`] 的泛型定义。为了让 embassy `#[task]` 能生成 spawn token，
 /// 调用方（main.rs）需要用具体的 `esp_hal::i2c::master::I2c` 类型实例化。
+/// 开机 POST 摘要屏停留时长（毫秒）——展示完自检结果后再进入正常刷新。
+pub const POST_SCREEN_MS: u64 = 1500;
+
 #[embassy_executor::task]
 pub async fn oled_task(
   mut display: OledDisplay<esp_hal::i2c::master::I2c<'static, esp_hal::Blocking>>,
   signal: &'static UiFrameSignal,
+  post: crate::hal::post::PostReport,
 ) -> ! {
   use ssd1306::mode::DisplayConfig;
 
@@ -315,6 +319,12 @@ pub async fn oled_task(
   }
   display.clear(BinaryColor::Off).ok();
   let _ = display.flush();
+
+  // 开机 POST 摘要：进入正常刷新循环前，短暂展示一屏自检结果
+  if layout::render_post(&mut display, &post).is_ok() {
+    let _ = display.flush();
+    Timer::after(Duration::from_millis(POST_SCREEN_MS)).await;
+  }
 
   // 最近一次收到的 Frame（未收到时用零帧兄底）
   let mut latest = Frame::new(0, Default::default());

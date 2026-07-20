@@ -7,6 +7,7 @@
 //! - [`joystick`]：双轴摇杆 + 按下键
 //! - [`led`]：数字 LED 输出
 //! - [`battery`]：电池电量监测（真实 ADC 或模拟递减）
+//! - [`post`]：硬件开机自检（OLED I²C 探测 + ADC 通道读数，非致命诊断）
 //! - [`rng`]：硬件随机数（session nonce / 密钥派生的熵源，Q 选项）
 //!
 //! 这些组件对"硬件用途"完全无感——按钮不知道自己是"激光键"还是"巡视键"，
@@ -19,6 +20,7 @@ pub mod joystick;
 pub mod led;
 pub mod led_effects;
 pub mod persist;
+pub mod post;
 pub mod rng;
 pub mod switch;
 

@@ -360,8 +360,20 @@ async fn main(spawner: Spawner) -> ! {
   let knob_2_pin = adc_config.enable_pin(peripherals.GPIO39, Attenuation::_11dB);
   let mut adc = Adc::new(peripherals.ADC1, adc_config);
 
-  let joystick_x = AnalogInput::new(joystick_x_pin, JOYSTICK_DEADZONE);
-  let joystick_y = AnalogInput::new(joystick_y_pin, JOYSTICK_DEADZONE);
+  let mut joystick_x = AnalogInput::new(joystick_x_pin, JOYSTICK_DEADZONE);
+  let mut joystick_y = AnalogInput::new(joystick_y_pin, JOYSTICK_DEADZONE);
+  let mut knob_1 = AnalogInput::new(knob_1_pin, /* deadzone = */ 0);
+  let mut knob_2 = AnalogInput::new(knob_2_pin, 0);
+
+  // ---- 硬件 POST：ADC 通道各采一次原始值并校验（非致命） ----
+  let adc_ok = {
+    let jx = joystick_x.read_raw(&mut adc);
+    let jy = joystick_y.read_raw(&mut adc);
+    let k1 = knob_1.read_raw(&mut adc);
+    let k2 = knob_2.read_raw(&mut adc);
+    controller::hal::post::check_adc(&[("JOY_X", jx), ("JOY_Y", jy), ("KNOB1", k1), ("KNOB2", k2)])
+  };
+
   let mut joystick = Joystick::new(joystick_x, joystick_y, joystick_btn);
 
   // ---- 摇杆上电校准 ----
@@ -374,9 +386,6 @@ async fn main(spawner: Spawner) -> ! {
   // AnalogInput::calibrate 会拒绝并回退到 ADC_MID，同时打 warn 日志。
   let (joy_x_zero, joy_y_zero) = joystick.calibrate(&mut adc);
   info!("[JOY] calibrated zero: x={} y={}", joy_x_zero, joy_y_zero);
-
-  let knob_1 = AnalogInput::new(knob_1_pin, /* deadzone = */ 0);
-  let knob_2 = AnalogInput::new(knob_2_pin, 0);
 
   // 2 个 LED（active_high 点亮）——所有权直接交给 led_effects_task
   let led_1: Led<'static> = Led::new(
@@ -408,10 +417,14 @@ async fn main(spawner: Spawner) -> ! {
   //   构造 I²C → 包装成 Ssd1306 → StaticCell 泄漏为 'static → spawn 后台任务
   // ============================================================
   let i2c_config = I2cConfig::default().with_frequency(Rate::from_hz(I2C_FREQ_HZ));
-  let i2c = I2c::new(peripherals.I2C0, i2c_config)
+  let mut i2c = I2c::new(peripherals.I2C0, i2c_config)
     .expect("Failed to init I2C for OLED")
     .with_sda(peripherals.GPIO21)
     .with_scl(peripherals.GPIO22);
+
+  // ---- 硬件 POST：探测 OLED 是否在总线上应答（非致命，无屏也继续启动） ----
+  let oled_present =
+    controller::hal::post::probe_oled(&mut i2c, controller::hal::post::OLED_I2C_ADDR);
 
   // 让 I2c 拿到 'static 生命周期（OLED 任务永不返回）
   static I2C_BUS: StaticCell<I2c<'static, Blocking>> = StaticCell::new();
@@ -432,7 +445,17 @@ async fn main(spawner: Spawner) -> ! {
   static UI_SIGNAL: StaticCell<UiFrameSignal> = StaticCell::new();
   let ui_signal: &'static UiFrameSignal = UI_SIGNAL.init(UiFrameSignal::new());
 
-  spawner.spawn(oled_task(display, ui_signal).expect("Failed to build oled_task token"));
+  // 汇总开机自检结果 → oled_task 在进入正常刷新前先展示一屏 POST 摘要。
+  // protocol/radio 能走到这里即代表已越过各自初始化（失败会提前 panic）。
+  let post_report = controller::hal::post::PostReport {
+    protocol_ok: true,
+    radio_ok: true,
+    oled_present,
+    adc_ok,
+  };
+
+  spawner
+    .spawn(oled_task(display, ui_signal, post_report).expect("Failed to build oled_task token"));
 
   // ============================================================
   // 聚合成 InputSampler + 挂上复合 Transport（BLE HID + ESP-NOW）

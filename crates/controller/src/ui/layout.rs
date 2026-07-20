@@ -25,6 +25,7 @@ use heapless::String;
 
 use crate::config::display::{LINE_H, OLED_HEIGHT, OLED_WIDTH};
 use crate::hal::battery::BatteryLevel;
+use crate::hal::post::PostReport;
 use crate::protocol::state::ButtonBits;
 
 use super::selector::{BROADCAST_MASK, PeerInfo, SelectorSnapshot, VISIBLE_ROWS};
@@ -109,6 +110,44 @@ where
   // ---- Toast 覆盖层（若存在则遮住底部两行）----
   if let Some(toast) = state.toast.as_ref() {
     draw_toast(target, style, toast)?;
+  }
+
+  Ok(())
+}
+
+/// 绘制开机 POST 摘要屏：逐项列出自检结果，供 [`oled_task`](super::oled_task)
+/// 在进入正常刷新循环前短暂停留展示。
+///
+/// # 返回值
+/// - `Ok(())`：绘制成功
+/// - `Err(D::Error)`：底层 `DrawTarget` 报错
+pub fn render_post<D>(target: &mut D, report: &PostReport) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = BinaryColor>,
+{
+  target.clear(BinaryColor::Off)?;
+
+  let style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+  draw_text(target, style, "BOOT SELF-TEST", 0, 0)?;
+
+  // 分隔线
+  Line::new(
+    Point::new(0, LINE_H),
+    Point::new(OLED_WIDTH as i32 - 1, LINE_H),
+  )
+  .into_styled(PrimitiveStyle::with_stroke(BinaryColor::On, 1))
+  .draw(target)?;
+
+  let rows: [(&str, bool); 4] = [
+    ("SELF ", report.protocol_ok),
+    ("RADIO", report.radio_ok),
+    ("OLED ", report.oled_present),
+    ("ADC  ", report.adc_ok),
+  ];
+  for (i, (label, ok)) in rows.iter().enumerate() {
+    let mut buf = LineBuf::new();
+    let _ = write!(&mut buf, "{}  {}", label, if *ok { "OK" } else { "FAIL" });
+    draw_text(target, style, &buf, 0, LINE_H * (i as i32 + 2))?;
   }
 
   Ok(())
