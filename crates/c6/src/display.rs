@@ -21,7 +21,7 @@
 use controller_protocol::{ButtonBits, GamepadState};
 use embedded_graphics::{
   mono_font::{
-    MonoTextStyle,
+    MonoTextStyleBuilder,
     ascii::{FONT_6X10, FONT_8X13_BOLD},
   },
   pixelcolor::Rgb565,
@@ -97,11 +97,18 @@ where
     .draw(display)
 }
 
+/// 画文字：`bg` 作为**字形背景色**一起绘制。
+///
+/// 传背景色是增量重绘的关键：每个字符会连同其背景单元格一次性写入，
+/// 因此新文本能**原地覆盖**旧文本，无需先清屏（清屏正是闪烁的根因）。
+/// 对会变长/变短的字段，调用方用固定宽度格式化（如 `{:<5}` / `{:+6}`），
+/// 让尾随空格的背景把残留字符抹掉。
 fn draw_text<D>(
   display: &mut D,
   s: &str,
   pos: Point,
   color: Rgb565,
+  bg: Rgb565,
   bold: bool,
 ) -> Result<(), D::Error>
 where
@@ -109,10 +116,18 @@ where
 {
   let text_style = TextStyleBuilder::new().baseline(Baseline::Top).build();
   if bold {
-    let style = MonoTextStyle::new(&FONT_8X13_BOLD, color);
+    let style = MonoTextStyleBuilder::new()
+      .font(&FONT_8X13_BOLD)
+      .text_color(color)
+      .background_color(bg)
+      .build();
     Text::with_text_style(s, pos, style, text_style).draw(display)?;
   } else {
-    let style = MonoTextStyle::new(&FONT_6X10, color);
+    let style = MonoTextStyleBuilder::new()
+      .font(&FONT_6X10)
+      .text_color(color)
+      .background_color(bg)
+      .build();
     Text::with_text_style(s, pos, style, text_style).draw(display)?;
   }
   Ok(())
@@ -145,10 +160,11 @@ where
     .into_styled(block_style)
     .draw(display)?;
 
-  // 居中文字（8x13 字号，label 长度 1-4 char）
+  // 居中文字（8x13 字号，label 长度 1-4 char）；背景传按钮底色 `bg`，
+  // 让字形单元格与方块底色一致（而非强制黑底）。
   let text_x = pos.x + (size.width as i32 - (label.len() as i32) * 8) / 2;
   let text_y = pos.y + (size.height as i32 - 13) / 2;
-  draw_text(display, label, Point::new(text_x, text_y), fg, true)?;
+  draw_text(display, label, Point::new(text_x, text_y), fg, bg, true)?;
   Ok(())
 }
 
@@ -187,41 +203,90 @@ where
   Ok(())
 }
 
-/// 摇杆十字准星，joy_x/joy_y 是 i16，映射到 96x96 的区域
-fn draw_joystick<D>(display: &mut D, pos: Point, joy_x: i16, joy_y: i16) -> Result<(), D::Error>
+/// 摇杆区域边长（正方形）。
+const JOY_REGION: i32 = 80;
+/// 摇杆光点半边长（光点是 `2*JOY_DOT+? ` 的小方块）。
+const JOY_DOT: i32 = 3;
+
+/// 计算摇杆光点中心像素坐标：joy_x/joy_y 是 i16（-32768..=32767），
+/// 映射到区域中心 ± (REGION/2 - 4)。
+fn joy_dot_center(pos: Point, joy_x: i16, joy_y: i16) -> Point {
+  let cx = pos.x + JOY_REGION / 2;
+  let cy = pos.y + JOY_REGION / 2;
+  let px = cx + ((joy_x as i32) * (JOY_REGION / 2 - 4)) / i32::from(i16::MAX);
+  let py = cy - ((joy_y as i32) * (JOY_REGION / 2 - 4)) / i32::from(i16::MAX);
+  Point::new(px, py)
+}
+
+/// 画摇杆的十字准星（两条 1px 线）。光点移动后需要补画，避免残留缺口。
+fn draw_joy_crosshair<D>(display: &mut D, pos: Point) -> Result<(), D::Error>
 where
   D: DrawTarget<Color = Rgb565>,
 {
-  const REGION: i32 = 80;
-  let region_size = Size::new(REGION as u32, REGION as u32);
-
-  // 背景框
-  Rectangle::new(pos, region_size)
-    .into_styled(
-      PrimitiveStyleBuilder::new()
-        .stroke_color(OFF)
-        .stroke_width(1)
-        .fill_color(BG)
-        .build(),
-    )
-    .draw(display)?;
-
-  // 十字线
-  let cx = pos.x + REGION / 2;
-  let cy = pos.y + REGION / 2;
-  Rectangle::new(Point::new(pos.x, cy), Size::new(REGION as u32, 1))
+  let cx = pos.x + JOY_REGION / 2;
+  let cy = pos.y + JOY_REGION / 2;
+  Rectangle::new(Point::new(pos.x, cy), Size::new(JOY_REGION as u32, 1))
     .into_styled(PrimitiveStyle::with_fill(OFF))
     .draw(display)?;
-  Rectangle::new(Point::new(cx, pos.y), Size::new(1, REGION as u32))
+  Rectangle::new(Point::new(cx, pos.y), Size::new(1, JOY_REGION as u32))
     .into_styled(PrimitiveStyle::with_fill(OFF))
     .draw(display)?;
+  Ok(())
+}
 
-  // 点：joy_x / joy_y 是 i16（-32768..=32767），映射到 -REGION/2..=REGION/2
-  let px = cx + ((joy_x as i32) * (REGION / 2 - 4)) / i32::from(i16::MAX);
-  let py = cy - ((joy_y as i32) * (REGION / 2 - 4)) / i32::from(i16::MAX);
-  Rectangle::new(Point::new(px - 3, py - 3), Size::new(6, 6))
-    .into_styled(PrimitiveStyle::with_fill(ACCENT))
-    .draw(display)?;
+/// 画摇杆光点（`fill` 传 [`ACCENT`] 画点、传 [`BG`] 则擦除）。
+fn draw_joy_dot<D>(display: &mut D, center: Point, fill: Rgb565) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = Rgb565>,
+{
+  Rectangle::new(
+    Point::new(center.x - JOY_DOT, center.y - JOY_DOT),
+    Size::new((JOY_DOT * 2) as u32, (JOY_DOT * 2) as u32),
+  )
+  .into_styled(PrimitiveStyle::with_fill(fill))
+  .draw(display)
+}
+
+/// 摇杆十字准星 + 光点，**增量式**：`prev_joy` 为 `None` 时整块重画（边框 +
+/// 十字 + 光点）；为 `Some` 时只擦除旧光点、补画十字、画新光点，避免每帧刷整块
+/// 80×80 造成的局部闪烁（摇杆值常因 ADC 噪声逐帧微变）。
+fn draw_joystick<D>(
+  display: &mut D,
+  pos: Point,
+  joy_x: i16,
+  joy_y: i16,
+  prev_joy: Option<(i16, i16)>,
+) -> Result<(), D::Error>
+where
+  D: DrawTarget<Color = Rgb565>,
+{
+  let new_center = joy_dot_center(pos, joy_x, joy_y);
+
+  match prev_joy {
+    // 首帧 / 切页：画边框 + 十字 + 光点
+    None => {
+      Rectangle::new(pos, Size::new(JOY_REGION as u32, JOY_REGION as u32))
+        .into_styled(
+          PrimitiveStyleBuilder::new()
+            .stroke_color(OFF)
+            .stroke_width(1)
+            .fill_color(BG)
+            .build(),
+        )
+        .draw(display)?;
+      draw_joy_crosshair(display, pos)?;
+      draw_joy_dot(display, new_center, ACCENT)?;
+    }
+    // 增量：擦旧点 → 补十字 → 画新点（边框保持不动）
+    Some((ox, oy)) => {
+      let old_center = joy_dot_center(pos, ox, oy);
+      if old_center != new_center {
+        draw_joy_dot(display, old_center, BG)?;
+        draw_joy_crosshair(display, pos)?;
+        draw_joy_dot(display, new_center, ACCENT)?;
+      }
+    }
+  }
   Ok(())
 }
 
@@ -229,119 +294,163 @@ where
 // 主渲染入口
 // ============================================================
 
-/// 把整个 [`ViewModel`] 一次性画到屏幕上（简单全画法，避免脏矩形跟踪）。
-pub fn render<D>(display: &mut D, vm: &ViewModel) -> Result<(), D::Error>
+/// 按钮定义（6 键：Btn1-4 + JoyBtn + Switch）。
+const BTN_DEFS: [(ButtonBits, &str); 6] = [
+  (ButtonBits::Btn1, "B1"),
+  (ButtonBits::Btn2, "B2"),
+  (ButtonBits::Btn3, "B3"),
+  (ButtonBits::Btn4, "B4"),
+  (ButtonBits::JoyBtn, "JB"),
+  (ButtonBits::Switch, "SW"),
+];
+//   240 宽 = 8(左边距) + 6*btn_w + 5*gap + 8(右边距)
+//   btn_w=34, gap=4 => 8 + 204 + 20 + 8 = 240
+const BTN_W: u32 = 34;
+const BTN_GAP: i32 = 4;
+
+/// **增量重绘**：只重画相对 `prev` 发生变化的部件，避免整屏清屏导致的闪烁。
+///
+/// # 为什么不再整屏 `fill_screen`
+/// 原实现每帧 `fill_screen(BG)` 再全量重画：整块 240×240 先刷黑再重绘，
+/// 在 20MHz SPI 上单帧要几十毫秒，且"刷黑→重绘"的过程肉眼可见——手柄状态帧
+/// 高频到达时就表现为持续闪烁。
+///
+/// # 策略
+/// - `prev == None`：首帧 / 切页，整屏清一次并全量绘制静态元素（K1/K2 标签等）。
+/// - `prev == Some(p)`：逐字段比较，只重画变化的部件。
+/// - 文本统一带 `BG` 背景色绘制（见 [`draw_text`]），原地覆盖旧值；变长数值用
+///   固定宽度格式化，靠尾随空格背景抹除残留。
+/// - 方块 / 进度条 / 摇杆本身每次都会用底色填满自己的矩形，天然自清除，只是
+///   通过 diff 控制"是否调用"，未变化则完全不动。
+pub fn render<D>(display: &mut D, vm: &ViewModel, prev: Option<&ViewModel>) -> Result<(), D::Error>
 where
   D: DrawTarget<Color = Rgb565>,
 {
-  fill_screen(display, BG)?;
+  let full = prev.is_none();
+  if full {
+    fill_screen(display, BG)?;
+  }
 
   // —— 顶部状态行 ——
-  let (title, title_color) = if vm.have_data {
-    ("RECV", OK)
-  } else {
-    ("WAIT", WARN)
-  };
-  draw_text(display, title, Point::new(4, 4), title_color, true)?;
+  if full || prev.is_some_and(|p| p.have_data != vm.have_data) {
+    let (title, title_color) = if vm.have_data {
+      ("RECV", OK)
+    } else {
+      ("WAIT", WARN)
+    };
+    draw_text(display, title, Point::new(4, 4), title_color, BG, true)?;
+  }
 
-  let mut buf = heapless_str::<24>();
-  let _ = core::fmt::write(&mut buf, format_args!("seq={}", vm.last_seq));
-  draw_text(display, buf.as_str(), Point::new(50, 6), FG, false)?;
+  if full || prev.is_some_and(|p| p.last_seq != vm.last_seq) {
+    let mut buf = heapless_str::<24>();
+    let _ = core::fmt::write(&mut buf, format_args!("seq={:<10}", vm.last_seq));
+    draw_text(display, buf.as_str(), Point::new(50, 6), FG, BG, false)?;
+  }
 
-  let mut buf2 = heapless_str::<24>();
-  let _ = core::fmt::write(&mut buf2, format_args!("gap={}", vm.gap_count));
-  draw_text(
-    display,
-    buf2.as_str(),
-    Point::new(140, 6),
-    if vm.gap_count > 0 { WARN } else { OFF },
-    false,
-  )?;
-
-  let mut buf3 = heapless_str::<24>();
-  let _ = core::fmt::write(&mut buf3, format_args!("ok={}", vm.ok_count));
-  draw_text(display, buf3.as_str(), Point::new(190, 6), OFF, false)?;
-
-  // —— 按钮行（6 键：Btn1-4 + JoyBtn + Switch）——
-  //   240 宽 = 8(左边距) + 6*btn_w + 5*gap + 8(右边距)
-  //   取 btn_w=36, gap=3 => 8 + 216 + 15 + 8 = 247，稍紧凑；改用 btn_w=34, gap=4 => 8+204+20+8=240
-  let btn_defs: [(ButtonBits, &str); 6] = [
-    (ButtonBits::Btn1, "B1"),
-    (ButtonBits::Btn2, "B2"),
-    (ButtonBits::Btn3, "B3"),
-    (ButtonBits::Btn4, "B4"),
-    (ButtonBits::JoyBtn, "JB"),
-    (ButtonBits::Switch, "SW"),
-  ];
-  const BTN_W: u32 = 34;
-  const BTN_GAP: i32 = 4;
-  for (i, (bit, label)) in btn_defs.iter().enumerate() {
-    let x = 8 + (i as i32) * (BTN_W as i32 + BTN_GAP);
-    draw_button(
+  if full || prev.is_some_and(|p| p.gap_count != vm.gap_count) {
+    let mut buf2 = heapless_str::<24>();
+    let _ = core::fmt::write(&mut buf2, format_args!("gap={:<4}", vm.gap_count));
+    draw_text(
       display,
-      label,
-      Point::new(x, 28),
-      BTN_W,
-      vm.state.is_pressed(*bit),
+      buf2.as_str(),
+      Point::new(140, 6),
+      if vm.gap_count > 0 { WARN } else { OFF },
+      BG,
+      false,
     )?;
   }
 
-  // —— 摇杆区域 ——
-  draw_joystick(display, Point::new(8, 72), vm.state.joy_x, vm.state.joy_y)?;
+  if full || prev.is_some_and(|p| p.ok_count != vm.ok_count) {
+    let mut buf3 = heapless_str::<24>();
+    let _ = core::fmt::write(&mut buf3, format_args!("ok={:<5}", vm.ok_count));
+    draw_text(display, buf3.as_str(), Point::new(190, 6), OFF, BG, false)?;
+  }
 
-  // 摇杆数值
-  let mut jx = heapless_str::<24>();
-  let _ = core::fmt::write(&mut jx, format_args!("X:{:+6}", vm.state.joy_x));
-  draw_text(display, jx.as_str(), Point::new(96, 80), FG, false)?;
+  // —— 按钮行 ——：逐键只在按压状态翻转时重画
+  for (i, (bit, label)) in BTN_DEFS.iter().enumerate() {
+    let pressed = vm.state.is_pressed(*bit);
+    if full || prev.is_some_and(|p| p.state.is_pressed(*bit) != pressed) {
+      let x = 8 + (i as i32) * (BTN_W as i32 + BTN_GAP);
+      draw_button(display, label, Point::new(x, 28), BTN_W, pressed)?;
+    }
+  }
 
-  let mut jy = heapless_str::<24>();
-  let _ = core::fmt::write(&mut jy, format_args!("Y:{:+6}", vm.state.joy_y));
-  draw_text(display, jy.as_str(), Point::new(96, 96), FG, false)?;
+  // —— 摇杆区域 + 数值 ——：仅在坐标变化时重画（增量移动光点）
+  if full || prev.is_some_and(|p| p.state.joy_x != vm.state.joy_x || p.state.joy_y != vm.state.joy_y) {
+    let prev_joy = prev.map(|p| (p.state.joy_x, p.state.joy_y));
+    draw_joystick(display, Point::new(8, 72), vm.state.joy_x, vm.state.joy_y, prev_joy)?;
+    let mut jx = heapless_str::<24>();
+    let _ = core::fmt::write(&mut jx, format_args!("X:{:+6}", vm.state.joy_x));
+    draw_text(display, jx.as_str(), Point::new(96, 80), FG, BG, false)?;
+    let mut jy = heapless_str::<24>();
+    let _ = core::fmt::write(&mut jy, format_args!("Y:{:+6}", vm.state.joy_y));
+    draw_text(display, jy.as_str(), Point::new(96, 96), FG, BG, false)?;
+  }
 
-  // —— 旋钮 ——
-  draw_text(display, "K1", Point::new(8, 164), FG, true)?;
-  draw_bar(display, Point::new(32, 164), 180, 12, vm.state.knob_1)?;
-  let mut k1 = heapless_str::<24>();
-  let _ = core::fmt::write(&mut k1, format_args!("{}", vm.state.knob_1));
-  draw_text(display, k1.as_str(), Point::new(32, 180), OFF, false)?;
+  // —— 旋钮 ——：静态标签只在首帧画；进度条 + 数值仅在旋钮值变化时重画
+  if full {
+    draw_text(display, "K1", Point::new(8, 164), FG, BG, true)?;
+  }
+  if full || prev.is_some_and(|p| p.state.knob_1 != vm.state.knob_1) {
+    draw_bar(display, Point::new(32, 164), 180, 12, vm.state.knob_1)?;
+    let mut k1 = heapless_str::<24>();
+    let _ = core::fmt::write(&mut k1, format_args!("{:<5}", vm.state.knob_1));
+    draw_text(display, k1.as_str(), Point::new(32, 180), OFF, BG, false)?;
+  }
 
-  draw_text(display, "K2", Point::new(8, 200), FG, true)?;
-  draw_bar(display, Point::new(32, 200), 180, 12, vm.state.knob_2)?;
-  let mut k2 = heapless_str::<24>();
-  let _ = core::fmt::write(&mut k2, format_args!("{}", vm.state.knob_2));
-  draw_text(display, k2.as_str(), Point::new(32, 216), OFF, false)?;
+  if full {
+    draw_text(display, "K2", Point::new(8, 200), FG, BG, true)?;
+  }
+  if full || prev.is_some_and(|p| p.state.knob_2 != vm.state.knob_2) {
+    draw_bar(display, Point::new(32, 200), 180, 12, vm.state.knob_2)?;
+    let mut k2 = heapless_str::<24>();
+    let _ = core::fmt::write(&mut k2, format_args!("{:<5}", vm.state.knob_2));
+    draw_text(display, k2.as_str(), Point::new(32, 216), OFF, BG, false)?;
+  }
 
   // —— 底部 peer 状态行（y=228~239）——
   //
   // 显示：本机 receiver_id、是否被手柄分配过、被 dest_mask 过滤的帧数、发出的 AnnounceReply 数
-  // 格式（示例）：`id=3*  filt=12  rep=2`；`*` 表示已被 AssignId 分配过（未分配显示 `.`）。
-  let mut peer = heapless_str::<48>();
-  let mark = if vm.assigned { '*' } else { '.' };
+  // 格式（示例）：`id= 3*  filt=12    rep=2`；`*` 表示已被 AssignId 分配过（未分配显示 `.`）。
   // 未分配时 receiver_id 是 UNASSIGNED_ID（`u8::MAX`）哨兵，显示 `-` 而非裸 255。
-  let _ = if vm.assigned {
-    core::fmt::write(
-      &mut peer,
-      format_args!(
-        "id={}{}  filt={}  rep={}",
-        vm.receiver_id, mark, vm.filtered_count, vm.reply_count
-      ),
-    )
-  } else {
-    core::fmt::write(
-      &mut peer,
-      format_args!(
-        "id=-{}  filt={}  rep={}",
-        mark, vm.filtered_count, vm.reply_count
-      ),
-    )
-  };
-  draw_text(
-    display,
-    peer.as_str(),
-    Point::new(4, 228),
-    if vm.assigned { OK } else { OFF },
-    false,
-  )?;
+  if full
+    || prev.is_some_and(|p| {
+      p.receiver_id != vm.receiver_id
+        || p.assigned != vm.assigned
+        || p.filtered_count != vm.filtered_count
+        || p.reply_count != vm.reply_count
+    })
+  {
+    let mut peer = heapless_str::<48>();
+    let mark = if vm.assigned { '*' } else { '.' };
+    // filt / rep 单调递增，固定宽度 `{:<6}` 的尾随空格足以抹除历史残留；
+    // id 右对齐到 2 列，未分配时占位 "-"，两种情况列宽一致。
+    let _ = if vm.assigned {
+      core::fmt::write(
+        &mut peer,
+        format_args!(
+          "id={:>2}{}  filt={:<6}  rep={:<6}",
+          vm.receiver_id, mark, vm.filtered_count, vm.reply_count
+        ),
+      )
+    } else {
+      core::fmt::write(
+        &mut peer,
+        format_args!(
+          "id={:>2}{}  filt={:<6}  rep={:<6}",
+          "-", mark, vm.filtered_count, vm.reply_count
+        ),
+      )
+    };
+    draw_text(
+      display,
+      peer.as_str(),
+      Point::new(4, 228),
+      if vm.assigned { OK } else { OFF },
+      BG,
+      false,
+    )?;
+  }
 
   Ok(())
 }
@@ -374,7 +483,7 @@ where
   fill_screen(display, BG)?;
 
   // —— 标题 ——
-  draw_text(display, "SELF-TEST", Point::new(72, 8), ACCENT, true)?;
+  draw_text(display, "SELF-TEST", Point::new(72, 8), ACCENT, BG, true)?;
 
   // 分隔线
   Rectangle::new(Point::new(4, 26), Size::new(232, 1))
@@ -388,7 +497,7 @@ where
     let y = start_y + (i as i32) * row_h;
 
     // 项目名
-    draw_text(display, item.label(), Point::new(8, y), FG, true)?;
+    draw_text(display, item.label(), Point::new(8, y), FG, BG, true)?;
 
     // 状态标签
     let status = report.status_of(*item);
@@ -397,11 +506,11 @@ where
       SelfTestStatus::Ok => ("[ OK ]", OK),
       SelfTestStatus::Fail(_) => ("[FAIL]", WARN),
     };
-    draw_text(display, tag, Point::new(96, y), color, true)?;
+    draw_text(display, tag, Point::new(96, y), color, BG, true)?;
 
     // 失败原因
     if let SelfTestStatus::Fail(reason) = status {
-      draw_text(display, reason, Point::new(160, y + 2), WARN, false)?;
+      draw_text(display, reason, Point::new(160, y + 2), WARN, BG, false)?;
     }
   }
 
@@ -423,6 +532,7 @@ where
     summary,
     Point::new(8, summary_y + 6),
     summary_color,
+    BG,
     true,
   )?;
 

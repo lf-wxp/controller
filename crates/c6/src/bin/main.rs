@@ -241,28 +241,25 @@ async fn main(spawner: Spawner) -> ! {
   // 渲染主循环：订阅 Watch，收到就重画
   // -----------------------------------------------------------------
   let mut receiver_ch = watch.receiver().expect("watch receiver");
-  let mut last_vm = ViewModel::empty();
-  // 先画一次初始 (WAIT) 画面
-  if render(&mut display, &last_vm).is_err() {
+  let mut vm = ViewModel::empty();
+  // 先整屏画一次初始 (WAIT) 画面（prev = None ⇒ 全量绘制 + 清屏一次）
+  if render(&mut display, &vm, None).is_err() {
     warn!("render error at boot");
   }
+  let mut prev = vm;
 
   loop {
-    // 等新数据；如超过 500ms 也重画一次（避免屏幕不刷）
-    match embassy_futures::select::select(
-      receiver_ch.changed(),
-      Timer::after(Duration::from_millis(500)),
-    )
-    .await
-    {
-      embassy_futures::select::Either::First(vm) => {
-        last_vm = vm;
-      }
-      embassy_futures::select::Either::Second(_) => {}
-    }
+    // 阻塞等待下一帧状态。Watch 覆盖式保留最新值，消费慢时自动丢弃中间帧。
+    //
+    // 之前这里用 500ms 超时强制重画以"避免屏幕不刷"，但 LCD 会保持已绘制内容，
+    // 无需周期性全刷；而每次 render 现在是增量的（只画变化部件），静止时不再有
+    // 任何绘制动作，因此也不会闪烁。
+    vm = receiver_ch.changed().await;
 
-    if render(&mut display, &last_vm).is_err() {
+    // 增量重绘：只重画相对 prev 变化的部件，避免整屏清屏造成的闪烁。
+    if render(&mut display, &vm, Some(&prev)).is_err() {
       warn!("render error");
     }
+    prev = vm;
   }
 }

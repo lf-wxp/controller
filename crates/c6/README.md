@@ -201,8 +201,10 @@ flowchart LR
 1. **`recv_task`** — 常驻协程（双路分派）
    - **Frame 通路**（25B `0xC71E`）：`decode_frame` → `dest_mask` 过滤 → seq gap 检测 → 更新 `ViewModel` → `Watch::send`
    - **Command 通路**（24B `0xCB01`）：`decode_command` → 抗重放窗口 → `Announce`（广播 `AnnounceReply`）/ `AssignId`（更新 `PeerCtx.receiver_id`）
-2. **主循环** — 双源触发
-   `select(Watch.changed(), Timer(500ms))` → `render()` 全屏重绘
+2. **主循环** — 单源触发 + 增量重绘
+   `Watch.changed()` → `render(vm, Some(prev))`：逐字段与上一帧比较，**只重画变化的部件**
+   （文本带背景色原地覆盖，方块/进度条/摇杆自清除矩形）。首帧 `prev=None` 时整屏清一次并全量绘制。
+   避免了早期"每帧 `fill_screen` 全屏刷黑再重绘"导致的持续闪烁。
 3. **中间通道** — 零拷贝广播
    `embassy_sync::watch::Watch<CriticalSectionRawMutex, ViewModel, 1>`
 4. **PeerCtx** — 控制面上下文
@@ -229,7 +231,7 @@ sequenceDiagram
                 Recv->>Recv: seq gap 检测
                 Recv->>W: send(ViewModel)
                 W-->>Main: changed()
-                Main->>LCD: render()
+                Main->>LCD: render(vm, Some(prev)) 增量重绘
             else dest_mask 未命中
                 Recv-->>Recv: filtered_count++
             end
@@ -248,10 +250,7 @@ sequenceDiagram
         end
     end
 
-    loop 每 500ms
-        Main->>Main: Timer fires
-        Main->>LCD: render()（兜底刷新）
-    end
+    note over Main,LCD: 静止（无新帧）时主循环阻塞在 changed()，<br/>不做任何绘制，LCD 保持已有画面 ⇒ 零闪烁
 ```
 
 ---
