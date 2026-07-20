@@ -114,13 +114,15 @@ where
   Ok(())
 }
 
-/// 顶部标题栏：`Ctl B●N●H● >#03 99%`
+/// 顶部标题栏：`Ctl B●N●H●          >#03`
 ///
 /// 布局分区（x 坐标）：
 /// - `Ctl`（3 char，0..18）
 /// - `B● N● H●`（三个状态灯，22..57）
-/// - 目标指示器 `>#XX` / `>ALL` / `>---`（4 char，右对齐到电量前）
-/// - `99%`（电量，右对齐到 128px）
+/// - 目标指示器 `>#XX` / `>ALL` / `>---`（右对齐到屏幕右缘）
+///
+/// 注：电量图标已移除——本硬件电池经充放电模块 + AMS1117 LDO 稳压后供电，
+/// ESP32 无电池原始电压采样通路，无法测量真实电量（详见 `hal::battery`）。
 fn draw_header<D>(
   target: &mut D,
   style: MonoTextStyle<'_, BinaryColor>,
@@ -145,17 +147,9 @@ where
   draw_text(target, style, "H", base_x + 26, 0)?;
   draw_status_dot(target, base_x + 32, 3, state.host_heartbeat_alive)?;
 
-  // 电量文字（右对齐到 128px 边缘）
-  let mut battery_buf = LineBuf::new();
-  let _ = write!(&mut battery_buf, "{:3}%", state.battery);
-  let battery_w = battery_buf.len() as i32 * 6;
-  let battery_x = OLED_WIDTH as i32 - battery_w;
-  draw_text(target, style, &battery_buf, battery_x, 0)?;
-
-  // 目标指示器：介于 H 灯（x=54, 宽 6px → 60）与电量之间
-  // 提前 2px 预留间隙；可用宽度 = battery_x - 62
+  // 目标指示器：介于 H 灯与屏幕右缘之间（电量图标已移除，右侧空间全给指示器）
   let indicator_x = base_x + 38;
-  let indicator_max_w = battery_x - indicator_x - 2;
+  let indicator_max_w = OLED_WIDTH as i32 - indicator_x - 2;
   if indicator_max_w >= 24 {
     draw_target_indicator(target, style, state.active_dest_mask, indicator_x)?;
   }

@@ -33,7 +33,6 @@ use static_cell::StaticCell;
 
 use controller::config::display::{I2C_FREQ_HZ, OLED_ROTATION};
 use controller::config::tuning::{INPUT_SCAN_INTERVAL_MS, JOYSTICK_DEADZONE, TRANSMIT_INTERVAL_MS};
-use controller::hal::battery::{IS_SIMULATED, battery_monitor_simulated_task};
 use controller::hal::led_effects::led_effects_task;
 use controller::hal::persist::{
   InMemoryStorage, NvsStorage, load_or_default, persist_worker_in_memory_task,
@@ -257,17 +256,13 @@ async fn main(spawner: Spawner) -> ! {
     );
   }
   // ============================================================
-  // 电池监测（当前走模拟递减；接入真实分压硬件后改为 battery_monitor_real_task）
-  // —— 任务会每 5 秒写一次 crate::ui::BATTERY_LEVEL，UI 与 BLE 同步时看到
+  // 电池监测：暂不启用
+  // —— 本硬件电池经充放电模块 + AMS1117 LDO 稳压后给 ESP32 供电，没有任何一路
+  //    电池原始电压引到 ADC 引脚，MCU 物理上无法测量电量。故不再 spawn 模拟任务
+  //    （模拟递减只会给出假读数 + 假的低电量告警）；OLED 电量图标也已移除。
+  //    若日后加一路“电池 → 分压 → GPIO34”的采样线，再启用真实测量任务即可。
   // ============================================================
-  if IS_SIMULATED {
-    spawner
-      .spawn(battery_monitor_simulated_task().expect("Failed to build battery monitor task token"));
-  } else {
-    // TODO(hardware): 接入 GPIO34 分压硬件后，在这里 spawn battery_monitor_real_task
-    // 同时把 config::battery::SIMULATE 改为 false
-    info!("[BAT] Real battery monitor path not wired up yet");
-  }
+  info!("[BAT] battery monitoring disabled (no ADC sense path on this hardware)");
 
   let ble_transport = BleConnector::new(peripherals.BT, Default::default()).unwrap();
   let ble_controller = ExternalController::<_, 1>::new(ble_transport);
