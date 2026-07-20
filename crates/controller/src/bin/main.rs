@@ -39,7 +39,7 @@ use controller::hal::persist::{
   InMemoryStorage, NvsStorage, load_or_default, persist_worker_in_memory_task,
   persist_worker_nvs_task,
 };
-use controller::hal::{AnalogInput, Button, Joystick, Led, Switch};
+use controller::hal::{AnalogInput, Button, Joystick, Led};
 use controller::input::{InputSampler, apply_sensitivity, update_button_led_state};
 use controller::protocol::Frame;
 use controller::transport::ble_hid::{
@@ -72,7 +72,7 @@ async fn main(spawner: Spawner) -> ! {
   let peripherals = esp_hal::init(config);
 
   // ==== 参考启动引脚（strapping pin）====
-  // GPIO0 / GPIO2 / GPIO5 (LED_1) / GPIO12 (JOY_BTN) / GPIO15 (SWITCH_1)
+  // GPIO0 / GPIO2 / GPIO5 (LED_1) / GPIO12 (JOY_BTN) / GPIO15 (COLOR_LED)
   // 项目未使用、被模块本身占用的引脚：
   let _ = peripherals.GPIO6;
   let _ = peripherals.GPIO7;
@@ -340,18 +340,6 @@ async fn main(spawner: Spawner) -> ! {
   let button_3 = Button::new(Input::new(peripherals.GPIO25, input_pullup), false);
   let button_4 = Button::new(Input::new(peripherals.GPIO23, input_pullup), false);
 
-  // 拨动开关（IO15 strapping，Pull::Up）
-  //
-  // 电气结构：一端接 GND，另一端接 IO15；拨到 ON 位置时短接 GND → 拉低。
-  // 若诊断日志显示 raw_high 恒为 true 且拨动无变化，可能：
-  //   1. 开关未拨到接通侧（先确认物理位置切换到了另一侧）
-  //   2. 开关的另一端未接到 GND（浮空），需检查焊接
-  let switch_1 = Switch::new(
-    Input::new(peripherals.GPIO15, input_pullup),
-    /* active_high = */ false,
-    /* initial_on  = */ false,
-  );
-
   // 摇杆按下键（IO12，标准 KY-023 / PS2 摇杆接法：一端 GND、按下拉低）
   //
   // 电气结构（见 hal/joystick.rs 文件头注释）：
@@ -402,8 +390,20 @@ async fn main(spawner: Spawner) -> ! {
     true,
   );
 
-  // Spawn LED 特效任务（LED 硬件从主循环转移到此任务）
-  spawner.spawn(led_effects_task(led_1, led_2).expect("Failed to build led_effects_task token"));
+  // 彩灯（IO15，4 颗并联 LED，阳极接 IO15、阴极接 GND，每路带限流电阻）
+  //
+  // ⚠️ IO15 是 strapping pin：复位阶段需为高才正常启动。此处在 app 启动后
+  // （复位采样早已完成）才配成推挽输出，故不影响启动；以 Level::Low 初始化即可。
+  // active_high = true：置高 = 灌电流点亮。所有权交给 led_effects_task 持续闪烁。
+  let color_led: Led<'static> = Led::new(
+    Output::new(peripherals.GPIO15, Level::Low, output_default),
+    true,
+  );
+
+  // Spawn LED 特效任务（LED1/LED2 + 彩灯 硬件从主循环转移到此任务）
+  spawner.spawn(
+    led_effects_task(led_1, led_2, color_led).expect("Failed to build led_effects_task token"),
+  );
 
   // ============================================================
   // OLED（SSD1306 128x64 via I²C，IO21=SDA / IO22=SCL）
@@ -440,7 +440,7 @@ async fn main(spawner: Spawner) -> ! {
   // 聚合成 InputSampler + 挂上复合 Transport（BLE HID + ESP-NOW）
   // ============================================================
   let mut sampler = InputSampler::new(
-    button_1, button_2, button_3, button_4, switch_1, joystick, knob_1, knob_2,
+    button_1, button_2, button_3, button_4, joystick, knob_1, knob_2,
   );
 
   // 一次 send()，同时送达 BLE + ESP-NOW + OLED；任一失败不影响其它
@@ -469,39 +469,32 @@ async fn main(spawner: Spawner) -> ! {
     let mut sample = sampler.poll(&mut adc);
     update_button_led_state(&sample);
 
-    // ---- 硬件极性诊断：每 1s（100 tick）打一次 JoyBtn/Switch 的原始电平 ----
+    // ---- 硬件极性诊断：每 1s（100 tick）打一次 JoyBtn(IO12) 的原始电平 ----
     //
-    // 用于验证 `main.rs` 里对 IO12 / IO15 的 `Pull` + `active_high` 配置是否与
-    // 实际接线一致：若"按下/拨到 ON"时看到 raw 电平**没有变化**，说明该 pin
-    // 根本没被接通到预期电压；若 raw 变化了但 state=false，说明极性配置反了。
-    // 排查完成后请删除此块。
+    // 用于验证 IO12 的 `Pull` + `active_high` 配置是否与实际接线一致：若按下时
+    // raw 电平**没有变化**，说明该 pin 没被接通到预期电压；若 raw 变化了但
+    // state=false，说明极性配置反了。排查完成后请删除此块。
+    // （IO15 已改为彩灯输出，不再读输入，故不在此诊断。）
     if tick.is_multiple_of(100) {
       info!(
-        "[DIAG] joy_btn raw_high={} down={} | switch raw_high={} on={}",
+        "[DIAG] joy_btn raw_high={} down={}",
         sampler.joy_btn_raw_is_high(),
         sample.joy_button.is_down(),
-        sampler.switch_raw_is_high(),
-        sample.switch_on,
       );
     }
 
     // ---- 应用灵敏度缩放（可能被 Host 命令动态修改）----
     apply_sensitivity(&mut sample.state);
 
-    // ---- 驱动接收方选择器：长按 Switch 切换模式、摇杆 Y 移光标、Btn1/Btn2 加减目标 ----
+    // ---- 驱动接收方选择器：长按切换模式、摇杆 Y 移光标、Btn1/Btn2 加减目标 ----
     //
     // Selecting 模式下选择器会把 `suppress_frame_send` 置 true，此时下面的
     // `transport.send(&frame)` 会被跳过，避免摇杆游走干扰接收端。
     //
-    // ⚠️ 临时改动（HW-WORKAROUND-SWITCH-IO15）：
-    // IO15 拨动开关物理故障（诊断日志显示 raw_high 恒 true，无论如何拨动都不变），
-    // 已用 sampler.poll() 后加"joy_button 覆盖 switch_on"的方式验证过 —— 上层代码
-    // 路径完全正常，问题在 IO15 硬件（开关/焊盘/走线/引脚）。
-    //
-    // 为了在硬件修好前也能验证 selector→Announce→receiver 列表这条完整链路，
-    // 此处**临时**把长按触发源从 `sample.switch_on`（IO15）替换成
-    // `sample.joy_button.is_down()`（IO12）。硬件修好后，把下面这行改回
-    // `switch_on: sample.switch_on,` 即可恢复原设计。
+    // 长按触发源 = IO12 摇杆按钮：IO15 原为拨动开关输入，但实际是 4 颗彩灯的
+    // 驱动节点（见 config::pins::COLOR_LED），已改为输出驱动彩灯、不再作输入，
+    // 故长按进入 Selecting 固定用 IO12（`SelectorInput.switch_on` 只是选择器内部
+    // 的"长按触发"抽象字段名，与物理拨动开关无关）。
     //
     // 副作用提示：
     // - 长按 IO12 摇杆按钮 ≥800ms 会进入 Selecting，此期间 Frame 发送被抑制

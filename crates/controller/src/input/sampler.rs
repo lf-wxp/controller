@@ -4,7 +4,7 @@ use esp_hal::Blocking;
 use esp_hal::analog::adc::{Adc, AdcChannel};
 use esp_hal::peripherals::ADC1;
 
-use crate::hal::{AnalogInput, Button, ButtonState, Joystick, JoystickReading, Switch};
+use crate::hal::{AnalogInput, Button, ButtonState, Joystick, JoystickReading};
 use crate::protocol::state::{ButtonBits, GamepadState};
 
 /// 一次采样的**完整**产出
@@ -23,8 +23,6 @@ pub struct SampleOutput {
   pub joy_button: ButtonState,
   /// 摇杆连续量读数（含 x/y）
   pub joystick: JoystickReading,
-  /// 拨动开关当前是否为"开"
-  pub switch_on: bool,
 }
 
 /// 输入采样器
@@ -43,7 +41,6 @@ where
   button_2: Button<'d>,
   button_3: Button<'d>,
   button_4: Button<'d>,
-  switch_1: Switch<'d>,
   joystick: Joystick<'d, X, Y>,
   knob_1: AnalogInput<'d, K1>,
   knob_2: AnalogInput<'d, K2>,
@@ -66,7 +63,6 @@ where
     button_2: Button<'d>,
     button_3: Button<'d>,
     button_4: Button<'d>,
-    switch_1: Switch<'d>,
     joystick: Joystick<'d, X, Y>,
     knob_1: AnalogInput<'d, K1>,
     knob_2: AnalogInput<'d, K2>,
@@ -76,7 +72,6 @@ where
       button_2,
       button_3,
       button_4,
-      switch_1,
       joystick,
       knob_1,
       knob_2,
@@ -92,7 +87,6 @@ where
     let b2 = self.button_2.poll();
     let b3 = self.button_3.poll();
     let b4 = self.button_4.poll();
-    let sw_on = self.switch_1.poll();
 
     // 摇杆（读 X/Y + 按下键）
     let joy = self.joystick.read(adc);
@@ -114,20 +108,13 @@ where
     state.set_button(ButtonBits::Btn3, b3.is_down());
     state.set_button(ButtonBits::Btn4, b4.is_down());
     state.set_button(ButtonBits::JoyBtn, joy.is_button_down());
-    state.set_button(ButtonBits::Switch, sw_on);
 
     SampleOutput {
       state,
       buttons: [b1, b2, b3, b4],
       joy_button: joy.button,
       joystick: joy,
-      switch_on: sw_on,
     }
-  }
-
-  /// **仅用于诊断**：拨动开关引脚的原始电平（未经 `active_high` 反转、未消抖）
-  pub fn switch_raw_is_high(&self) -> bool {
-    self.switch_1.raw_is_high()
   }
 
   /// **仅用于诊断**：摇杆按下键引脚的原始电平（未经 `active_high` 反转、未消抖）

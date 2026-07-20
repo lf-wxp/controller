@@ -9,7 +9,7 @@
 //! - 摇杆 Y 轴：IO33（ADC1_CH5）
 //! - 摇杆按钮：IO12  ⚠️ strapping pin，需 Pull::Down
 //! - 按钮 1-4  ：IO27 / IO13 / IO25 / IO23，按下拉低，使用内部上拉
-//! - 拨动开关  ：IO15  ⚠️ strapping pin，需 Pull::Up
+//! - 彩灯输出  ：IO15  ⚠️ strapping pin；4 颗并联彩灯（阳极接 IO15、阴极接 GND）驱动脚，推挽输出置高点亮（详见 pins::COLOR_LED）
 //! - 旋钮 1    ：IO36（ADC1_CH0，SENSOR_VP）
 //! - 旋钮 2    ：IO39（ADC1_CH3，SENSOR_VN）
 //!
@@ -40,9 +40,17 @@ pub mod pins {
   pub const BUTTON_3: u8 = 25;
   pub const BUTTON_4: u8 = 23;
 
-  // ==== 拨动开关 ====
-  /// 拨动开关（同时物理上驱动 4 颗彩灯）⚠️ strapping pin
-  pub const SWITCH_1: u8 = 15;
+  // ==== 彩灯（IO15）====
+  /// 彩灯驱动脚（IO15，驱动 4 颗并联彩灯 LED1–LED4）⚠️ strapping pin
+  ///
+  /// 原理图实测接线：4 颗 LED 并联，**阳极接 IO15、阴极接 GND**（右轨经 LED3 接地），
+  /// 每路带限流电阻。要点亮必须由 IO15 **主动输出高电平**灌电流，因此本脚配成
+  /// 推挽输出（`active_high = true`，置高 = 亮），由 `led_effects_task` 驱动闪烁。
+  ///
+  /// 历史说明：早期固件把它当"接地拨键"读输入，但该网络无接地通路 + 内部弱上拉
+  /// （~45kΩ，几十 µA）带不动 LED，故读输入恒为 HIGH、彩灯也不亮；现改为输出驱动。
+  /// ⚠️ strapping：复位阶段需为高才正常启动，故在 app 启动后（复位采样完成）再配输出。
+  pub const COLOR_LED: u8 = 15;
 
   // ==== 旋钮 ====
   /// 旋钮 1（ADC1_CH0，SENSOR_VP，仅输入）

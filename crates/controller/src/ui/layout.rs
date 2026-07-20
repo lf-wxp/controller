@@ -232,15 +232,15 @@ where
 {
   draw_text(target, style, "Btn", 0, y)?;
 
-  // 6 个按钮：Btn1..Btn4 + JoyBtn + Switch
-  // 每个占 12 像素宽（字符 + 间距）
-  let labels: [(ButtonBits, &str); 6] = [
+  // 5 个按钮：Btn1..Btn4 + JoyBtn
+  // （IO15 原为拨动开关，已改为彩灯输出、不再上报 Switch 位，故不再展示 "S"）
+  // 每个占 15 像素宽（字符 + 间距）
+  let labels: [(ButtonBits, &str); 5] = [
     (ButtonBits::Btn1, "1"),
     (ButtonBits::Btn2, "2"),
     (ButtonBits::Btn3, "3"),
     (ButtonBits::Btn4, "4"),
     (ButtonBits::JoyBtn, "J"),
-    (ButtonBits::Switch, "S"),
   ];
 
   let start_x: i32 = 24;

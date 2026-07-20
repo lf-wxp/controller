@@ -30,7 +30,7 @@ use defmt::info;
 use embassy_futures::select::{Either, select};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use crate::hal::Led;
 
@@ -102,10 +102,14 @@ pub fn signal_led_effect(led_idx: u8, count: u8, period_ms: u16) {
 /// 空闲态刷新周期（毫秒）：主循环写完 BUTTON_LED_STATE 后至少 20ms 内会同步到硬件
 const IDLE_REFRESH_MS: u64 = 20;
 
+/// 彩灯（IO15）连续闪烁的半周期（毫秒）：亮 400ms / 灭 400ms ≈ 1.25Hz
+const COLOR_BLINK_HALF_MS: u64 = 400;
+
 /// LED 特效后台任务
 ///
 /// # 传参
 /// - `led1` / `led2`：LED 硬件所有权（从 main 移交）
+/// - `color_led`：彩灯（IO15，4 颗并联 LED）硬件所有权；独立于按键/特效持续闪烁
 ///
 /// # 状态机
 /// ```text
@@ -117,7 +121,11 @@ const IDLE_REFRESH_MS: u64 = 20;
 ///                                    ──► [Idle]
 /// ```
 #[embassy_executor::task]
-pub async fn led_effects_task(mut led1: Led<'static>, mut led2: Led<'static>) -> ! {
+pub async fn led_effects_task(
+  mut led1: Led<'static>,
+  mut led2: Led<'static>,
+  mut color_led: Led<'static>,
+) -> ! {
   info!("[LED-FX] Task started");
 
   loop {
@@ -135,7 +143,15 @@ pub async fn led_effects_task(mut led1: Led<'static>, mut led2: Led<'static>) ->
         apply_idle_state(&mut led1, &mut led2);
       }
     }
+    // 彩灯（IO15）独立于按键/特效，按固定节拍持续闪烁（特效播放的短暂间隙不更新，无碍）
+    apply_color_blink(&mut color_led);
   }
+}
+
+/// 彩灯闪烁：用单调时钟算相位，鲁棒于 tick 抖动（亮/灭各 [`COLOR_BLINK_HALF_MS`]）
+fn apply_color_blink(color_led: &mut Led<'static>) {
+  let phase = (Instant::now().as_millis() / COLOR_BLINK_HALF_MS) % 2;
+  color_led.set(phase == 0);
 }
 
 /// 空闲态：读 [`BUTTON_LED_STATE`] 应用到 LED
