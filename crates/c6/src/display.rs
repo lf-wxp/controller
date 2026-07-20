@@ -168,7 +168,7 @@ where
   Ok(())
 }
 
-/// 画一个水平进度条，val 归一化到 0..=u16::MAX
+/// 画一个水平进度条，val 归一化到 0..=AXIS_RANGE（旋钮量程）
 fn draw_bar<D>(
   display: &mut D,
   pos: Point,
@@ -190,8 +190,8 @@ where
     )
     .draw(display)?;
 
-  // 填充
-  let filled_w = (u32::from(val) * (width - 2)) / u32::from(u16::MAX);
+  // 填充（val 量程 0..=AXIS_RANGE，clamp 防止越界填出外框）
+  let filled_w = ((u32::from(val) * (width - 2)) / AXIS_RANGE as u32).min(width - 2);
   if filled_w > 0 {
     Rectangle::new(
       Point::new(pos.x + 1, pos.y + 1),
@@ -208,14 +208,24 @@ const JOY_REGION: i32 = 80;
 /// 摇杆光点半边长（光点是 `2*JOY_DOT+? ` 的小方块）。
 const JOY_DOT: i32 = 3;
 
-/// 计算摇杆光点中心像素坐标：joy_x/joy_y 是 i16（-32768..=32767），
-/// 映射到区域中心 ± (REGION/2 - 4)。
+/// 摇杆/旋钮坐标满量程（与手柄端 `config::tuning::AXIS_RANGE` 对齐）。
+///
+/// ⚠️ 手柄归一化后摇杆是 `-AXIS_RANGE..=+AXIS_RANGE`、旋钮是 `0..=AXIS_RANGE`
+/// （见 `controller_protocol::GamepadState` 字段注释），**不是 i16/u16 满量程**。
+/// 早期这里误用 `i16::MAX`/`u16::MAX` 做映射，导致满偏时光点只移动约 ±1px、
+/// 旋钮条几乎不填充。dashboard 端 (`gamepad_visual.rs`) 也用这个值。
+const AXIS_RANGE: i32 = 1000;
+
+/// 计算摇杆光点中心像素坐标：joy_x/joy_y 是 i16，量程为 **±AXIS_RANGE**
+/// （不是 ±i16::MAX），映射到区域中心 ± `span`。
 fn joy_dot_center(pos: Point, joy_x: i16, joy_y: i16) -> Point {
   let cx = pos.x + JOY_REGION / 2;
   let cy = pos.y + JOY_REGION / 2;
-  let px = cx + ((joy_x as i32) * (JOY_REGION / 2 - 4)) / i32::from(i16::MAX);
-  let py = cy - ((joy_y as i32) * (JOY_REGION / 2 - 4)) / i32::from(i16::MAX);
-  Point::new(px, py)
+  // 留出光点半径 + 边框余量，保证满偏时光点不压到边框
+  let span = JOY_REGION / 2 - JOY_DOT - 2;
+  let dx = ((joy_x as i32) * span / AXIS_RANGE).clamp(-span, span);
+  let dy = ((joy_y as i32) * span / AXIS_RANGE).clamp(-span, span);
+  Point::new(cx + dx, cy - dy)
 }
 
 /// 画摇杆的十字准星（两条 1px 线）。光点移动后需要补画，避免残留缺口。
@@ -376,9 +386,17 @@ where
   }
 
   // —— 摇杆区域 + 数值 ——：仅在坐标变化时重画（增量移动光点）
-  if full || prev.is_some_and(|p| p.state.joy_x != vm.state.joy_x || p.state.joy_y != vm.state.joy_y) {
+  if full
+    || prev.is_some_and(|p| p.state.joy_x != vm.state.joy_x || p.state.joy_y != vm.state.joy_y)
+  {
     let prev_joy = prev.map(|p| (p.state.joy_x, p.state.joy_y));
-    draw_joystick(display, Point::new(8, 72), vm.state.joy_x, vm.state.joy_y, prev_joy)?;
+    draw_joystick(
+      display,
+      Point::new(8, 72),
+      vm.state.joy_x,
+      vm.state.joy_y,
+      prev_joy,
+    )?;
     let mut jx = heapless_str::<24>();
     let _ = core::fmt::write(&mut jx, format_args!("X:{:+6}", vm.state.joy_x));
     draw_text(display, jx.as_str(), Point::new(96, 80), FG, BG, false)?;
