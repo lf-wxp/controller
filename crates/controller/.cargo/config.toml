@@ -1,5 +1,10 @@
+# 原始 ESP32-WROOM 只有 USB-UART、没有内置 USB-JTAG，**不能用 probe-rs** 烧录/运行。
+# 因此 `cargo run --bin controller` 通过 espflash 走串口烧录并进入 defmt 日志监听
+# （与 `cargo make controller-run` 一致）。若你确实接了外置 JTAG 探针（ESP-Prog/FTDI）
+# 想用 probe-rs，可临时改回：
+#   runner = "probe-rs run --chip=esp32 --preverify --always-print-stacktrace --no-location"
 [target.xtensa-esp32-none-elf]
-runner = "probe-rs run --chip=esp32 --preverify --always-print-stacktrace --no-location"
+runner = "espflash flash --monitor"
 # 只在 xtensa-esp32 target 下应用这些链接参数：
 # - `-nostartfiles`：ESP32 无标准 C runtime，跳过 crt0
 # - `-Z stack-protector=all`：全栈 canary，esp channel nightly 支持
