@@ -55,7 +55,7 @@
 //! - **no_std by default**，直接依赖 embassy 家族（`embassy-sync` /
 //!   `embassy-time` / `embassy-futures`）；不做运行时无关抽象
 //! - **`CommLink` 是唯一的可插拔点**——ESP-NOW / UART / loopback 各自实现
-//! - **协议逻辑复用 `controller-protocol`**，本 crate 只负责编排
+//! - **协议逻辑复用 `protocol`**，本 crate 只负责编排
 //! - **零 heap 分配**：所有集合走 `heapless::Vec<T, N>`
 
 #![no_std]
@@ -120,7 +120,7 @@ pub type Coordinator<L> = Notifier<L>;
 pub type Endpoint<L> = Receiver<L>;
 
 // 常用协议类型 re-export，避免用户额外 depend 一次 protocol
-pub use controller_protocol::{
+pub use protocol::{
   Command, CommandBody, CommandResponse, ErrorCode, Frame, GamepadState, KeyId, ResponseBody,
   session_nonce,
 };

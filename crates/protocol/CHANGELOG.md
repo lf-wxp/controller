@@ -1,6 +1,6 @@
 # Changelog
 
-本文件记录 `controller-protocol` crate 的版本演进。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
+本文件记录 `protocol` crate 的版本演进。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
 > 提示：在 0.x 阶段，MINOR 号的跳动即视为 **可能包含破坏性变更**（SemVer 0.x 语义）。请查看具体条目的 `Breaking` 标记。
 
@@ -52,13 +52,13 @@
 
 1. **Cargo 依赖**：把下游项目里的
    ```toml
-   controller-protocol = { git = "…", tag = "protocol-v0.1.0", … }
+   protocol = { git = "…", tag = "protocol-v0.1.0", … }
    ```
    改为
    ```toml
-   controller-protocol = { git = "…", tag = "protocol-v0.2.0", … }
+   protocol = { git = "…", tag = "protocol-v0.2.0", … }
    ```
-   并执行 `cargo update -p controller-protocol`。
+   并执行 `cargo update -p protocol`。
 2. **传输层缓冲区**：把接收/发送缓冲区从 `[u8; 21]` / `[u8; 20]` 分别扩到 `[u8; 25]` / `[u8; 24]`（或直接引用常量 `FRAME_LEN` / `COMMAND_LEN` / `RESPONSE_LEN`）。
 3. **`Frame` 构造**：
    - 只要广播 → 继续调用 `Frame::new(seq, state)`（行为等价）。

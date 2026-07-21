@@ -268,10 +268,13 @@ fn main() {
     // ================================================================
     println!("① Notifier.discover() → Receiver 应自动回 AnnounceReply → Notifier 自动回 AssignId");
     {
-      use controller_protocol::{Command, CommandBody as CB, encode_command};
+      use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig.signal(encode_command(&cmd));
+      ns.cmd_sig
+        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+          encode_command(&cmd),
+        ));
     }
     wait_for(
       || rs.my_id.load(Ordering::Relaxed) != u8::MAX && ns.peers.len() == 1,
@@ -289,7 +292,7 @@ fn main() {
     // ================================================================
     println!("② Notifier.send_command(LedBlink count=3) → Receiver handler 触发");
     {
-      use controller_protocol::{Command, CommandBody as CB, encode_command};
+      use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(
         seq,
@@ -300,7 +303,10 @@ fn main() {
           period_ms: 100,
         },
       );
-      ns.cmd_sig.signal(encode_command(&cmd));
+      ns.cmd_sig
+        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+          encode_command(&cmd),
+        ));
     }
     wait_for(
       || HANDLER_INVOCATIONS.load(Ordering::Relaxed) >= 1,
@@ -320,7 +326,7 @@ fn main() {
     // ================================================================
     println!("③ Notifier.send_frame(GamepadState) → 通过编排通道广播");
     {
-      use controller_protocol::{ButtonBits, encode_frame};
+      use protocol::{ButtonBits, encode_frame};
       let mut state = GamepadState::EMPTY;
       state.set_button(ButtonBits::Btn1, true);
       state.joy_x = 12_345;

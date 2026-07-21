@@ -90,9 +90,9 @@ version = "0.1.0"
 # 引用方式二选一：
 #   1) 本地 path（同一 monorepo / 二次开发调试）
 #   2) git tag（推荐生产使用，锁定协议版本）
-controller-protocol = { path = "../controller/crates/protocol", default-features = false, features = ["defmt"] }
+protocol = { path = "../controller/crates/protocol", default-features = false, features = ["defmt"] }
 # 或：
-# controller-protocol = { git = "https://github.com/YOUR_ORG/controller", tag = "protocol-v0.2.0", default-features = false, features = ["defmt"] }
+# protocol = { git = "https://github.com/YOUR_ORG/controller", tag = "protocol-v0.2.0", default-features = false, features = ["defmt"] }
 
 esp-hal = { version = "~1.1.0", features = ["defmt", "esp32", "unstable"] }
 esp-rtos = { version = "0.3.0", features = [
@@ -135,7 +135,7 @@ use esp_hal::clock::CpuClock;
 use portable_atomic::{AtomicBool, AtomicU32, Ordering};
 
 // 协议层：与手柄 100% 对齐（24 B Command / Response，25 B Frame）
-use controller_protocol::{
+use protocol::{
   auth::{init_session_nonce, KeyId},
   command::{encode_command, Command, CommandBody, COMMAND_LEN},
   frame::FRAME_LEN,
@@ -158,7 +158,7 @@ static NONCE_READY: AtomicBool = AtomicBool::new(false);
 static NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
 
 /// 收到 Response 的通知（用于匹配请求 seq）
-static RESPONSE_SIGNAL: Signal<CriticalSectionRawMutex, controller_protocol::response::CommandResponse> =
+static RESPONSE_SIGNAL: Signal<CriticalSectionRawMutex, protocol::response::CommandResponse> =
   Signal::new();
 
 // ============================================================
@@ -369,8 +369,8 @@ Frame  `dest_mask: u32`，位图指定"哪些 `receiver_id` 应处理该帧"：
 **构造示例**（假设 host 想同时给 `receiver_id=1` 与 `receiver_id=5` 下发）：
 
 ```rust
-use controller_protocol::frame::{Frame, BROADCAST_DEST_MASK};
-use controller_protocol::state::GamepadState;
+use protocol::frame::{Frame, BROADCAST_DEST_MASK};
+use protocol::state::GamepadState;
 
 let mask = (1_u32 << 1) | (1_u32 << 5);
 let frame = Frame::with_dest(seq, GamepadState::EMPTY, mask);
@@ -512,7 +512,7 @@ let cmd = Command::with_key(seq, key_id, CommandBody::Nop);
 - 控制端与手柄的 **HMAC 密钥不一致** → 检查两侧 `SECRET_V1` / `SECRET_V2`
 - 控制端**尚未收到 NonceHello** 就发了命令 → 检查 `NONCE_READY` 逻辑
 - 控制端 seq 回退（例如重启后从 1 重新开始）→ 从 NVS 恢复 seq 或换 key_id
-- 🆕 **协议版本不一致**：两端 `controller-protocol` 依赖版本不一致会得到
+- 🆕 **协议版本不一致**：两端 `protocol` 依赖版本不一致会得到
   `UnsupportedVersion` 而不是 `AuthFailed`；确保两端依赖同一版本
 
 ### Q2: `NonceHello` 一直收不到

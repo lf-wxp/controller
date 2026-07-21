@@ -6,7 +6,7 @@
 //!
 //! ## 使用侧
 //! - **手柄端**：通过 `crate::config::auth` / `crate::config::keyring` re-export 引用
-//! - **Dashboard 端**：直接 `use controller_protocol::config::keyring::*`
+//! - **Dashboard 端**：直接 `use protocol::config::keyring::*`
 //! - **协议内部**：`use crate::config::auth::*`（相对本 crate）
 
 /// 认证子系统配置

@@ -1,4 +1,4 @@
-//! # controller-protocol
+//! # protocol
 //!
 //! ESP32 游戏手柄的**纯协议层** —— 无硬件依赖、可跨 target 复用。
 //!

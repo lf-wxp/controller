@@ -45,10 +45,10 @@ pub mod builder;
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use controller_protocol::{Command, CommandResponse, ErrorCode, Frame, ResponseBody};
+use protocol::{Command, CommandResponse, ErrorCode, Frame, ResponseBody};
 // 仅 `endpoint-initiated-command` opt-in 下才用到；默认关闭时避免 unused import warning。
 #[cfg(feature = "endpoint-initiated-command")]
-use controller_protocol::{CommandBody, encode_command};
+use protocol::{CommandBody, encode_command};
 
 use crate::dispatch::{DispatchCtx, dispatch_packet};
 use crate::keyring::Keyring;
@@ -305,7 +305,12 @@ impl<L: CommLink> Receiver<L> {
   pub fn send_command(&self, body: CommandBody) {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), body);
-    self.command_signal.signal(encode_command(&cmd));
+    // Endpoint 主动命令仍走广播（Phase 1 只单播 Notifier→Endpoint 的 AssignId）。
+    self
+      .command_signal
+      .signal(crate::notifier::signals::OutboundCommand::broadcast(
+        encode_command(&cmd),
+      ));
   }
 }
 

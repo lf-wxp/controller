@@ -20,6 +20,6 @@ pub use crate::replay::ReplayGuard;
 pub use crate::selector::{DEST_MASK_ALL, DEST_MASK_NONE, DestMask, Selector};
 
 // 协议类型
-pub use controller_protocol::{
+pub use protocol::{
   Command, CommandBody, CommandResponse, ErrorCode, Frame, GamepadState, KeyId, ResponseBody,
 };

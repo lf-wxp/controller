@@ -201,11 +201,11 @@ pub mod battery {
 /// 密钥环（O 选项：HMAC 密钥轮换）
 ///
 /// # 迁移说明
-/// 全部密钥常量已下沉到 [`controller_protocol::config::keyring`] 供 dashboard/WASM 端
+/// 全部密钥常量已下沉到 [`protocol::config::keyring`] 供 dashboard/WASM 端
 /// 复用；本模块作为向后兼容的 re-export。旧路径 `crate::config::keyring::*`
 /// 全部保持可用。
 pub mod keyring {
-  pub use controller_protocol::config::keyring::{
+  pub use protocol::config::keyring::{
     DEFAULT_KEY_ID, KEY_SLOTS, SECRET_V1, SECRET_V2, SHARED_SECRETS,
   };
 }

@@ -7,8 +7,8 @@
 //! - ShowToast { text }
 //! - SetBatteryMode { simulate }
 
-use controller_protocol::{Command, CommandBody, KeyId};
 use leptos::prelude::*;
+use protocol::{Command, CommandBody, KeyId};
 
 use crate::bluetooth::{StoredHandles, send_command};
 use crate::state::{AppState, EventEntry};

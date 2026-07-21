@@ -45,7 +45,7 @@ pub mod builder;
 pub mod nonce;
 pub mod signals;
 
-use controller_protocol::{
+use protocol::{
   COMMAND_LEN, COMMAND_MAGIC, Command, CommandBody, CommandResponse, FRAME_LEN, FRAME_MAGIC, Frame,
   KeyId, RESPONSE_LEN, RESPONSE_MAGIC, ResponseBody, decode_response, encode_command, encode_frame,
 };
@@ -61,7 +61,7 @@ pub use builder::{CommandHandlerConfig, NotifierBuilder};
 pub use nonce::{
   DEFAULT_NONCE_BROADCAST_INTERVAL, EntropySource, init_session, run_nonce_broadcast_loop,
 };
-pub use signals::{CommandOutSignal, FrameSignal, ResponseSignal};
+pub use signals::{CommandDest, CommandOutSignal, FrameSignal, OutboundCommand, ResponseSignal};
 
 /// 上报 Response 处理闭包（供上层业务消费 Receiver 主动 report 的数据）
 ///
@@ -162,7 +162,10 @@ impl<L: CommLink> Notifier<L> {
   pub fn discover(&self) {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), CommandBody::Announce);
-    self.command_signal.signal(encode_command(&cmd));
+    // Announce 必须广播：目标恰恰是"尚未发现的" receiver，无 MAC 可单播。
+    self
+      .command_signal
+      .signal(OutboundCommand::broadcast(encode_command(&cmd)));
   }
 
   /// 发送任意 Command（比如 LedBlink / ShowToast）
@@ -176,7 +179,45 @@ impl<L: CommLink> Notifier<L> {
   pub fn send_command(&self, body: CommandBody) {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), body);
-    self.command_signal.signal(encode_command(&cmd));
+    // 广播式 send_command：发给全网所有 receiver（fire-and-forget，无 ACK）。
+    self
+      .command_signal
+      .signal(OutboundCommand::broadcast(encode_command(&cmd)));
+  }
+
+  /// 单播一条 Command 给指定 `receiver_id`（**Phase 2：定向命令**）
+  ///
+  /// 从 [`PeerRegistry`](crate::PeerRegistry) 反查该 id 的 MAC，走
+  /// [`CommandDest::Unicast`]：ESP-NOW MAC 层 ACK + `run_broadcast_loop` 有界重试，
+  /// 送达可靠性远高于广播。适合 LedBlink / ShowToast / SetSensitivity 等只想发给
+  /// **某一台** receiver 的业务命令。
+  ///
+  /// # Errors
+  /// - [`NotifierError::NoTarget`]：`receiver_id` 尚未在 registry 里（未发现 / 已过期）
+  ///
+  /// # ⚠️ 单目标限制（覆盖式信号）
+  /// [`CommandOutSignal`] 是**覆盖式** `Signal`（后写覆盖前写），因此**不要**在紧凑
+  /// 循环里对多个目标连发——除最后一条外都会在被 `broadcast_loop` 消费前被覆盖丢弃。
+  /// 需要"发给多台"请分帧节流，或等未来把命令出站通道换成有界队列后再支持组播。
+  pub fn send_command_to(&self, receiver_id: u8, body: CommandBody) -> Result<(), NotifierError> {
+    let mac = self
+      .peers
+      .lookup_mac_for_id(receiver_id)
+      .ok_or(NotifierError::NoTarget)?;
+    self.send_command_to_mac(mac, body);
+    Ok(())
+  }
+
+  /// 单播一条 Command 给指定 MAC（跳过 registry 反查）
+  ///
+  /// 当调用方**已经**持有目标 MAC（比如来自一次 AnnounceReply 快照）时用它，省一次
+  /// 反查。语义与 [`send_command_to`](Self::send_command_to) 相同，见其"单目标限制"。
+  pub fn send_command_to_mac(&self, mac: [u8; 6], body: CommandBody) {
+    let seq = self.keyring.next_seq();
+    let cmd = Command::with_key(seq, self.keyring.active(), body);
+    self
+      .command_signal
+      .signal(OutboundCommand::unicast(mac, encode_command(&cmd)));
   }
 
   /// 拿 peer 列表快照（用于 UI 渲染 / 选择器候选）
@@ -272,14 +313,29 @@ impl<L: CommLink> Notifier<L> {
 /// 2. `Response`（低频回执，从命令 handler 侧塞入）
 /// 3. `CommandOut`（Announce / 自发 Command）
 ///
-/// 任何一路就绪即取出编码后广播出去；失败时静默日志（不 panic，避免链路故障
+/// 任何一路就绪即取出编码后发出；失败时静默日志（不 panic，避免链路故障
 /// 导致整机 crash）。
+///
+/// # 命令通路的寻址与可靠性（Phase 1）
+/// `CommandOut` 载荷为 [`OutboundCommand`]，可选广播或单播：
+/// - [`CommandDest::Broadcast`]：与 Frame / Response 相同的 fire-and-forget 广播
+/// - [`CommandDest::Unicast`]：把 MAC 经 `L::Addr::from` 转成链路地址后单播；ESP-NOW
+///   会给 MAC 层 ACK，`send` 返回 `Err` 才说明彻底失败。此时做 [`MAX_UNICAST_SEND_RETRIES`]
+///   次有界补发（次数刻意很小，避免拖累与本 loop 共享的高频 Frame 出站节拍）。
+///
+/// # `L::Addr: From<[u8; 6]>` 约束
+/// 单播目标以 MAC-48 表达；本 loop 需要把它转成具体链路地址。所有真实链路
+/// （ESP-NOW / loopback）的 `Addr` 都是 `[u8; 6]`，`From` 为自反实现，零成本；
+/// `Addr = ()` 的 `DummyLink` 不会进本 loop，故不受影响。
 pub async fn run_broadcast_loop<L: CommLink>(
   mut link: L,
   frame_signal: &'static FrameSignal,
   command_signal: &'static CommandOutSignal,
   response_signal: &'static ResponseSignal,
-) -> ! {
+) -> !
+where
+  L::Addr: From<[u8; 6]>,
+{
   use embassy_futures::select::{Either3, select3};
   loop {
     match select3(
@@ -295,15 +351,35 @@ pub async fn run_broadcast_loop<L: CommLink>(
         let _ = link.send(L::BROADCAST, &bytes).await;
       }
       Either3::Second(resp) => {
-        let bytes = controller_protocol::encode_response(&resp);
+        let bytes = protocol::encode_response(&resp);
         let _ = link.send(L::BROADCAST, &bytes).await;
       }
-      Either3::Third(cmd_bytes) => {
-        let _ = link.send(L::BROADCAST, &cmd_bytes).await;
-      }
+      Either3::Third(out) => match out.dest {
+        CommandDest::Broadcast => {
+          let _ = link.send(L::BROADCAST, &out.bytes).await;
+        }
+        CommandDest::Unicast(mac) => {
+          let dst = L::Addr::from(mac);
+          let mut attempt = 0_u8;
+          loop {
+            match link.send(dst, &out.bytes).await {
+              Ok(()) => break,
+              Err(_) if attempt < MAX_UNICAST_SEND_RETRIES => attempt += 1,
+              Err(_) => break, // 放弃：下一轮 AnnounceReply 仍会幂等补发（见 handle_incoming_response）
+            }
+          }
+        }
+      },
     }
   }
 }
+
+/// 单播命令在 `send` 返回 `Err` 后的应用层补发次数上限。
+///
+/// ESP-NOW 硬件本身已在 MAC 层重传若干次；这里的补发只覆盖 `add_peer` 时序 /
+/// 瞬时队列满等边界。刻意取小值，避免离线单播目标把与本 loop 共享的高频 Frame
+/// 出站节拍拖垮。
+pub const MAX_UNICAST_SEND_RETRIES: u8 = 2;
 
 /// **接收 loop** —— 从 link 里连续 recv，解析并派发
 ///
@@ -425,17 +501,19 @@ fn handle_incoming_response(
     } => {
       // 无论首次入库（`Inserted`）还是刷新已有条目（`Updated`），都回一条 AssignId。
       //
-      // # 为什么 `Updated` 也要重发？
-      // AssignId 走的是**覆盖式** `CommandOutSignal` + **无 Ack** 的广播下发，
-      // 存在两条丢失路径：(1) 信号在被 `broadcast_loop` 消费前被后续命令覆盖；
-      // (2) 射频/链路丢包。若只在 `Inserted` 时下发一次，一旦那条 AssignId 丢失，
-      // 该 peer 会**永久**停留在 [`crate::receiver::UNASSIGNED_ID`]——因为它已经
-      // 在 registry 里，后续 AnnounceReply 只会返回 `Updated`，再也不会补发。
+      // # Phase 1：AssignId 单播 + MAC 层 ACK + 有界重试
+      // AssignId 现在**单播**到该 peer 的 MAC（[`OutboundCommand::unicast`]）：
+      // - ESP-NOW 单播带 MAC 层 ACK + 硬件重传，`run_broadcast_loop` 再做少量应用层
+      //   补发，送达可靠性远高于旧的广播 fire-and-forget。
+      // - 目标 MAC 现成（就是本次 AnnounceReply 的 `mac`），无需反查。
       //
-      // 每次 AnnounceReply 都重发是**幂等**的：同一 MAC 的 `receiver_id` 由
-      // registry 稳定保序分配、不会变化，receiver 重复写入同一个 id 无副作用。
-      // 用极低频的发现流量（AnnounceReply 仅在 controller 广播 Announce 后出现）
-      // 换取"只要还能通信，peer 最终一定拿到 id"的自愈能力。
+      // # 为什么仍在每次 AnnounceReply（含 `Updated`）都重发？
+      // 保留这份**幂等自愈**作为兜底：单播仍可能因 (1) 覆盖式 `CommandOutSignal`
+      // 在被 `broadcast_loop` 消费前被后续命令覆盖、(2) peer 离线导致重试耗尽而失败。
+      // 若只在 `Inserted` 时发一次，一旦丢失，该 peer 会**永久**停留在
+      // [`crate::receiver::UNASSIGNED_ID`]。每次重发是幂等的：同一 MAC 的
+      // `receiver_id` 由 registry 稳定保序分配、不会变化。发现流量极低频
+      // （仅在 controller 广播 Announce 后出现），成本可忽略。
       let assigned = match peers.upsert(mac, role_tag, rssi_dbm, embassy_time::Instant::now()) {
         UpsertOutcome::Inserted { receiver_id } | UpsertOutcome::Updated { receiver_id } => {
           Some(receiver_id)
@@ -449,7 +527,7 @@ fn handle_incoming_response(
           keyring.active(),
           CommandBody::AssignId { mac, receiver_id },
         );
-        command_signal.signal(encode_command(&cmd));
+        command_signal.signal(OutboundCommand::unicast(mac, encode_command(&cmd)));
       }
     }
     _ => {

@@ -162,17 +162,19 @@ async fn main(spawner: Spawner) -> ! {
   static WIFI_CTRL: StaticCell<esp_radio::wifi::WifiController<'static>> = StaticCell::new();
   let _wifi_ctrl_static = WIFI_CTRL.init(wifi_controller);
 
-  // 拆出 esp_now 的 sender / receiver；分别包成 comm::CommLink 的两半
+  // 拆出 esp_now 的 manager / sender / receiver；分别包成 comm::CommLink 的两半
   let (esp_now_manager, esp_now_sender, esp_now_receiver) = esp_now_iface.split();
-  // manager 本项目不用，但 drop 会关闭 ESP-NOW，同样泄漏为 'static
+  // manager 泄漏为 'static：一是 drop 会关闭 ESP-NOW（保活），二是 send_link
+  // 需要它做单播 peer 惰性 `add_peer`（AssignId 单播，Phase 1）。
   static ESP_NOW_MANAGER: StaticCell<esp_radio::esp_now::EspNowManager<'static>> =
     StaticCell::new();
-  let _esp_now_manager_static = ESP_NOW_MANAGER.init(esp_now_manager);
+  let esp_now_manager_static: &'static esp_radio::esp_now::EspNowManager<'static> =
+    ESP_NOW_MANAGER.init(esp_now_manager);
 
   // 用 EspNowSendLink / EspNowRecvLink 把 esp-radio 的两半包成 comm::CommLink，
   // 交给 comm::Notifier 门面的两个 loop 驱动。Frame/Command/Response 三路 signal
   // 已在 esp_now/mod.rs 以 static 形式定义，无需 StaticCell。
-  let send_link = EspNowSendLink::new(esp_now_sender);
+  let send_link = EspNowSendLink::new(esp_now_sender, esp_now_manager_static);
   let recv_link = EspNowRecvLink::new(esp_now_receiver);
 
   // Spawn Notifier broadcast loop（对应旧 esp_now_broadcast_task）
@@ -539,8 +541,11 @@ async fn main(spawner: Spawner) -> ! {
         controller::SESSION_KEYRING.active(),
         controller::protocol::CommandBody::Announce,
       );
-      controller::transport::esp_now::CMD_OUT_SIG
-        .signal(controller::protocol::encode_command(&cmd));
+      controller::transport::esp_now::CMD_OUT_SIG.signal(
+        comm::notifier::signals::OutboundCommand::broadcast(controller::protocol::encode_command(
+          &cmd,
+        )),
+      );
     }
 
     // ---- 每 TRANSMIT_EVERY_N 次采样发一帧，Selecting 时静默不发 ----

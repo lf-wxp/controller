@@ -6,7 +6,7 @@
 //! - Sd   : SD 卡是否成功挂载（由外部传入结果，可选：无卡不阻塞）
 //! - Wifi : WiFi controller 是否成功创建（由外部传入结果）
 //! - Now  : ESP-NOW 收发器是否成功创建（由外部传入结果）
-//! - Codec: `controller-protocol` 编解码 loopback 是否 OK
+//! - Codec: `protocol` 编解码 loopback 是否 OK
 //!   （能间接验证 CRC/HMAC/密钥已正确注入）
 //! - Ch   : 全局 Watch 通道是否可正常发布/订阅
 //!
@@ -18,7 +18,7 @@
 //! // ... 每个 mark 后可用 render_self_test 刷屏
 //! ```
 
-use controller_protocol::{Frame, GamepadState, decode_frame, encode_frame};
+use protocol::{Frame, GamepadState, decode_frame, encode_frame};
 
 /// 自检的项目，`ITEM_COUNT` 需要与该枚举个数保持一致
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,7 +150,7 @@ pub fn run_heap_check() -> SelfTestStatus {
   SelfTestStatus::Ok
 }
 
-/// Codec: 用 controller-protocol 做一次 encode -> decode round-trip
+/// Codec: 用 protocol 做一次 encode -> decode round-trip
 ///
 /// 若密钥未正确注入（例如全 0），`decode_frame` 会在 HMAC 校验时失败；
 /// 因此这一项能间接验证：

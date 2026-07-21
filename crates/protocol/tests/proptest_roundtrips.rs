@@ -1,4 +1,4 @@
-//! # Property-based tests for controller-protocol
+//! # Property-based tests for protocol
 //!
 //! 使用 [`proptest`] 对协议编解码函数做**随机往返验证**：
 //! 手工挑选的边界值容易漏掉边角情况，proptest 用随机输入 + 缩小失败样例的
@@ -17,19 +17,19 @@
 //! ## 运行
 //! ```bash
 //! # Host target 下运行（不能用默认 xtensa-esp32-none-elf）
-//! cargo test -p controller-protocol --target x86_64-apple-darwin
+//! cargo test -p protocol --target x86_64-apple-darwin
 //! # 或（Apple Silicon）
-//! cargo test -p controller-protocol --target aarch64-apple-darwin
+//! cargo test -p protocol --target aarch64-apple-darwin
 //! ```
 
-use controller_protocol::auth::{KeyId, init_session_nonce};
-use controller_protocol::crc::crc16_ibm;
-use controller_protocol::{
+use proptest::prelude::*;
+use protocol::auth::{KeyId, init_session_nonce};
+use protocol::crc::crc16_ibm;
+use protocol::{
   AntiReplayWindow, Command, CommandBody, CommandKind, CommandResponse, ErrorCode, Frame,
   FrameHeader, GamepadState, PROTOCOL_VERSION, ResponseBody, decode_command, decode_frame,
   decode_response, encode_command, encode_frame, encode_response,
 };
-use proptest::prelude::*;
 
 // ============================================================
 // Strategy 生成器
@@ -157,7 +157,7 @@ proptest! {
     // Arrange
     let frame = Frame {
       header: FrameHeader {
-        magic: controller_protocol::FRAME_MAGIC,
+        magic: protocol::FRAME_MAGIC,
         version: PROTOCOL_VERSION,
         seq,
       },
@@ -189,7 +189,7 @@ proptest! {
     // Arrange: encode 一个合法帧
     let frame = Frame {
       header: FrameHeader {
-        magic: controller_protocol::FRAME_MAGIC,
+        magic: protocol::FRAME_MAGIC,
         version: PROTOCOL_VERSION,
         seq,
       },

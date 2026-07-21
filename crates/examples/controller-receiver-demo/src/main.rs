@@ -33,10 +33,10 @@
 //! "直接从 `Vec<[u8; 21]>` 里迭代"，其它逻辑完全一致。
 //!
 //! **CI 每次运行 `cargo test` / `cargo run` 都会验证这段代码 —— 一旦
-//! controller-protocol API 变更（Frame 字段增减、ButtonBits 变体调整等），
+//! protocol API 变更（Frame 字段增减、ButtonBits 变体调整等），
 //! 本 demo 会立刻编译失败，防止 receiver.md 里的示例代码腐化。**
 
-use controller_protocol::{
+use protocol::{
   ButtonBits, DecodeError, FRAME_LEN, Frame, GamepadState, decode_frame, encode_frame,
 };
 

@@ -34,7 +34,7 @@
 ## 📌 项目简介
 
 `c6` 是一个 **端到端** 的嵌入式接收端参考实现：手柄侧通过 ESP-NOW 广播 25 字节
-[`controller-protocol`](https://github.com/lf-wxp/controller) **v0.2.0** `Frame`，
+[`protocol`](https://github.com/lf-wxp/controller) **v0.2.0** `Frame`，
 `c6` 常驻监听并将其解码为 `ViewModel`，通过 `embassy_sync::Watch` 派发到 UI 协程实时刷屏。
 **零连接握手、亚毫秒级唤醒、单 crate 单 firmware**。
 
@@ -81,7 +81,7 @@
 
 ## ✨ 功能特性
 
-> **🆕 已适配 `controller-protocol` v0.2.0**（breaking）：帧长 21B → **25B**、
+> **🆕 已适配 `protocol` v0.2.0**（breaking）：帧长 21B → **25B**、
 > 新增 `dest_mask` 位图寻址、按键位从 4 键扩到 **6 键**（Btn1-4 + JoyBtn + Switch）、
 > `GamepadState.buttons` 由 `u8` → `u16`。上层 API（`FRAME_LEN` / `decode_frame`
 > / `Frame::new` / `GamepadState::EMPTY`）保持兼容，接入方**零改动**。
@@ -210,6 +210,31 @@ flowchart LR
 4. **PeerCtx** — 控制面上下文
    存放 `receiver_id`（动态分配）+ `AntiReplayWindow`（64 位滑动窗），纯内存态、重启自愈
 
+> **📥 业务命令当前被静默忽略（如需下发，看这里）**
+>
+> `on_command`（`src/radio.rs`）目前只让 comm 自动处理 `Announce` / `AssignId`；其余业务命令
+> （`LedBlink` / `ShowToast` / `SetSensitivity` …）一律返回 `CommandOutcome::NoReply` → **收到但不执行**。
+>
+> 手柄侧的 comm 已具备**定向单播下发**能力（`Notifier::send_command_to(receiver_id, body)` /
+> `send_command_to_mac`，带 MAC 层 ACK + 有界重试；详见
+> [`crates/comm/README.md` 的「命令寻址：广播 vs 单播」](../comm/README.md#命令寻址广播-vs-单播)）。
+> 也就是说**"发给某台 c6"这条路手柄侧已经通了**——差的只是 c6 这端把命令落地执行。
+>
+> 要让某条业务命令在 c6 真正生效，只需在 `on_command` 里给对应 `CommandBody` 分支补执行逻辑，
+> 并返回 `CommandOutcome::Ok`（或 `Respond(..)` 回执）：
+>
+> ```rust,ignore
+> fn on_command(_src: CommandSource, cmd: &Command) -> CommandOutcome {
+>   match cmd.body {
+>     CommandBody::LedBlink { count, .. } => { blink_led(count); CommandOutcome::Ok }
+>     CommandBody::ShowToast { len, bytes } => { show_toast(&bytes[..len as usize]); CommandOutcome::Ok }
+>     _ => CommandOutcome::NoReply, // Announce / AssignId 已由 comm 自动处理，无需在此管
+>   }
+> }
+> ```
+>
+> `dest_mask` / 单播寻址、抗重放、HMAC 都在到达 `on_command` 之前完成——进到这里的命令都是**已验签、且确实发给本机**的。
+
 ### ⏱ 时序图
 
 ```mermaid
@@ -327,7 +352,7 @@ let sd    = embedded_sdmmc::SdCard::new(sd_spi, Delay::new());
 
 ## �🔐 依赖注入密钥
 
-`controller-protocol` 关闭了 `embed-default-secrets`，**必须**通过编译期环境变量注入 HMAC 密钥（32 字节 UTF-8 字符串）。
+`protocol` 关闭了 `embed-default-secrets`，**必须**通过编译期环境变量注入 HMAC 密钥（32 字节 UTF-8 字符串）。
 在 [`.cargo/config.toml`](.cargo/config.toml) 的 `[env]` 段配置：
 
 ```toml
@@ -339,7 +364,7 @@ CONTROLLER_SECRET_V2 = "YOUR_32_BYTE_SECRET_KEY_V2_HERE!"
 > ⚠️ **注意**：Frame 广播不做 HMAC 校验，密钥错误不会影响本项目现有功能；
 > 但若未来加入 Command 下发（Host → 手柄），**收发两端密钥必须完全一致**。
 
-> 🔒 **生产环境**：务必替换成 32 字节高熵密钥，详见 [`controller-protocol/USAGE.md`](https://github.com/lf-wxp/controller/blob/main/crates/protocol/USAGE.md)。
+> 🔒 **生产环境**：务必替换成 32 字节高熵密钥，详见 [`protocol/USAGE.md`](https://github.com/lf-wxp/controller/blob/main/crates/protocol/USAGE.md)。
 
 ---
 
@@ -536,7 +561,7 @@ cargo make ci    # fmt-check + clippy + build + release
 - ⚡ [**embassy**](https://embassy.dev) — 优雅的 no_std 异步运行时
 - 🎨 [**mipidsi**](https://github.com/almindor/mipidsi) — ST7789 驱动
 - 🖼 [**embedded-graphics**](https://github.com/embedded-graphics/embedded-graphics) — 嵌入式 2D 渲染
-- 🎮 [**controller-protocol**](https://github.com/lf-wxp/controller) — 手柄协议定义
+- 🎮 [**protocol**](https://github.com/lf-wxp/controller) — 手柄协议定义
 - 💽 [**embedded-sdmmc**](https://github.com/rust-embedded-community/embedded-sdmmc-rs) — FAT16 / FAT32 SD 卡驱动
 - 📡 [**probe-rs**](https://probe.rs/) — 一站式嵌入式调试工具链
 

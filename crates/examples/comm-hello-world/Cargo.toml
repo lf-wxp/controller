@@ -26,7 +26,7 @@ publish = false
 # 目标 crate 本体 —— 打开 loopback feature 才能拿到 LoopbackLink
 comm = { path = "../../comm", features = ["loopback"] }
 # 直接引用 protocol 主要是为了构造 Command / GamepadState 示例
-controller-protocol = { path = "../../protocol" }
+protocol = { path = "../../protocol" }
 
 # host 上驱动 embassy async loop 所需的三兄弟
 embassy-futures = { version = "0.1", default-features = false }

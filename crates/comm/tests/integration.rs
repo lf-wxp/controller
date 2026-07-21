@@ -201,10 +201,13 @@ fn discovery_and_assign_id_flow() {
   pool.run_until(async move {
     // 触发 discover：往 CMD_SIG 塞一条 Announce
     {
-      use controller_protocol::{Command, CommandBody as CB, encode_command};
+      use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig.signal(encode_command(&cmd));
+      ns.cmd_sig
+        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+          encode_command(&cmd),
+        ));
     }
 
     // 期望：Receiver 拿到 id (my_id != u8::MAX) 且 Notifier 侧 peer 目录有 1 条
@@ -255,7 +258,7 @@ fn command_flow_triggers_handler_and_returns_ack() {
   pool.run_until(async move {
     // 直接注入一条 LedBlink（跳过发现流程，用同 default key）
     {
-      use controller_protocol::{Command, CommandBody as CB, encode_command};
+      use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(
         seq,
@@ -266,7 +269,10 @@ fn command_flow_triggers_handler_and_returns_ack() {
           period_ms: 100,
         },
       );
-      ns.cmd_sig.signal(encode_command(&cmd));
+      ns.cmd_sig
+        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+          encode_command(&cmd),
+        ));
     }
     wait_for(|| HANDLER_INVOCATIONS.load(Ordering::Relaxed) >= 1, 10_000).await;
   });
@@ -299,7 +305,7 @@ fn anti_replay_rejects_duplicate_seq() {
   );
 
   pool.run_until(async move {
-    use controller_protocol::{Command, CommandBody as CB, encode_command};
+    use protocol::{Command, CommandBody as CB, encode_command};
     let cmd = Command::with_key(
       42,
       ns.keyring.active(),
@@ -310,7 +316,8 @@ fn anti_replay_rejects_duplicate_seq() {
       },
     );
     let bytes = encode_command(&cmd);
-    ns.cmd_sig.signal(bytes);
+    ns.cmd_sig
+      .signal(comm::notifier::signals::OutboundCommand::broadcast(bytes));
     // 等第一条到达
     wait_for(
       || REPLAY_HANDLER_INVOCATIONS.load(Ordering::Relaxed) >= 1,
@@ -322,7 +329,8 @@ fn anti_replay_rejects_duplicate_seq() {
     for _ in 0..50 {
       embassy_futures::yield_now().await;
     }
-    ns.cmd_sig.signal(bytes);
+    ns.cmd_sig
+      .signal(comm::notifier::signals::OutboundCommand::broadcast(bytes));
     // 再多跑一些 tick，让第二条走完 wire；handler 不应被再次调用
     for _ in 0..2_000 {
       embassy_futures::yield_now().await;
@@ -353,10 +361,13 @@ fn selector_reflects_discovered_peer() {
   );
 
   pool.run_until(async move {
-    use controller_protocol::{Command, CommandBody as CB, encode_command};
+    use protocol::{Command, CommandBody as CB, encode_command};
     let seq = ns.keyring.next_seq();
     let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-    ns.cmd_sig.signal(encode_command(&cmd));
+    ns.cmd_sig
+      .signal(comm::notifier::signals::OutboundCommand::broadcast(
+        encode_command(&cmd),
+      ));
     wait_for(|| !ns.peers.is_empty(), 10_000).await;
   });
 
@@ -468,12 +479,15 @@ fn frame_dest_mask_filters_by_id() {
   );
 
   pool.run_until(async move {
-    use controller_protocol::{Command, CommandBody as CB, encode_command};
+    use protocol::{Command, CommandBody as CB, encode_command};
 
     // 先走一遍 discover，让 receiver 拿到 id=0
     let seq = ns.keyring.next_seq();
     let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-    ns.cmd_sig.signal(encode_command(&cmd));
+    ns.cmd_sig
+      .signal(comm::notifier::signals::OutboundCommand::broadcast(
+        encode_command(&cmd),
+      ));
     wait_for(|| rs.my_id.load(Ordering::Relaxed) != u8::MAX, 10_000).await;
     assert_eq!(rs.my_id.load(Ordering::Relaxed), 0);
 
@@ -503,7 +517,7 @@ fn frame_dest_mask_filters_by_id() {
 
 use core::sync::atomic::AtomicBool;
 
-use controller_protocol::ResponseBody;
+use protocol::ResponseBody;
 
 static REPORT_HANDLER_INVOCATIONS: AtomicU32 = AtomicU32::new(0);
 static REPORT_LAST_PERCENT: AtomicU32 = AtomicU32::new(0);
@@ -551,10 +565,13 @@ fn receiver_report_reaches_notifier() {
   pool.run_until(async move {
     // 先走一遍 discover，让链路彻底跑通（也顺便验证 AnnounceReply 不会漏进 response_handler）
     {
-      use controller_protocol::{Command, CommandBody as CB, encode_command};
+      use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig.signal(encode_command(&cmd));
+      ns.cmd_sig
+        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+          encode_command(&cmd),
+        ));
     }
     wait_for(|| rs.my_id.load(Ordering::Relaxed) != u8::MAX, 10_000).await;
 
@@ -772,10 +789,12 @@ fn assign_id_resends_on_updated_and_self_heals() {
   let rs_my_id = rs.my_id;
 
   let send_announce = move || {
-    use controller_protocol::{Command, CommandBody as CB, encode_command};
+    use protocol::{Command, CommandBody as CB, encode_command};
     let seq = ns_keyring.next_seq();
     let cmd = Command::with_key(seq, ns_keyring.active(), CB::Announce);
-    ns_cmd.signal(encode_command(&cmd));
+    ns_cmd.signal(comm::notifier::signals::OutboundCommand::broadcast(
+      encode_command(&cmd),
+    ));
   };
 
   pool.run_until(async move {
@@ -818,7 +837,7 @@ fn assign_id_resends_on_updated_and_self_heals() {
 // 因此这里断言的是"全局 nonce 被 dispatch 改成广播值"——先置一个不同的
 // 初值，再验证它被 NonceHello 覆盖。
 
-use controller_protocol::{CommandResponse, init_session_nonce, session_nonce};
+use protocol::{CommandResponse, init_session_nonce, session_nonce};
 
 #[test]
 fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
@@ -852,4 +871,84 @@ fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
     BROADCAST_NONCE,
     "receiver 的 dispatch 应免鉴权采纳 NonceHello 里的 nonce"
   );
+}
+
+// ============================================================
+// 测试：Phase 2 —— 定向单播命令 send_command_to
+// ============================================================
+//
+// 不 spawn loop：send_command_to 只做 registry 反查 + 写覆盖式 CommandOutSignal，
+// 直接用 `try_take()` 观察写出的 OutboundCommand 即可验证寻址正确。用 DummyLink
+// 构造 Notifier（本方法不触碰 link），共享真实的 peers / keyring / cmd_sig。
+#[test]
+fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
+  use comm::link::DummyLink;
+  use comm::notifier::signals::CommandDest;
+  use comm::notifier::{Notifier, NotifierError};
+  use embassy_time::Instant;
+  use protocol::COMMAND_MAGIC;
+
+  let keyring = Box::leak(Box::new(Keyring::new()));
+  let peers = Box::leak(Box::new(PeerRegistry::new()));
+  let replay = Box::leak(Box::new(ReplayGuard::new()));
+  let selector = Box::leak(Box::new(Selector::broadcast_all()));
+  let frame_sig = Box::leak(Box::new(FrameSignal::new()));
+  let cmd_sig = Box::leak(Box::new(CommandOutSignal::new()));
+  let resp_sig = Box::leak(Box::new(ResponseSignal::new()));
+
+  let notifier: Notifier<DummyLink> = Notifier::builder()
+    .link(DummyLink)
+    .keyring(keyring)
+    .peers(peers)
+    .replay(replay)
+    .selector(selector)
+    .frame_signal(frame_sig)
+    .command_signal(cmd_sig)
+    .response_signal(resp_sig)
+    .build();
+
+  // 空 registry：定向发送应报 NoTarget，且不写出任何命令
+  assert_eq!(
+    notifier.send_command_to(0, CommandBody::Nop),
+    Err(NotifierError::NoTarget)
+  );
+  assert!(
+    cmd_sig.try_take().is_none(),
+    "NoTarget 不应向出站通道写入任何命令"
+  );
+
+  // 注册一个 peer（首个入库 → receiver_id = 0）
+  let mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+  let _ = peers.upsert(mac, *b"led", -20, Instant::from_ticks(0));
+
+  // 定向发送 → 应写出一条 Unicast(mac) 的 OutboundCommand
+  notifier
+    .send_command_to(
+      0,
+      CommandBody::LedBlink {
+        led_idx: 0,
+        count: 3,
+        period_ms: 100,
+      },
+    )
+    .expect("已注册 peer 应是合法目标");
+
+  let out = cmd_sig
+    .try_take()
+    .expect("send_command_to 应向出站通道写入一条命令");
+  assert_eq!(
+    out.dest,
+    CommandDest::Unicast(mac),
+    "目标寻址应为该 peer 的单播 MAC"
+  );
+  assert_eq!(
+    u16::from_le_bytes([out.bytes[0], out.bytes[1]]),
+    COMMAND_MAGIC,
+    "写出的字节应是合法编码的 Command 帧"
+  );
+
+  // send_command_to_mac 直发路径同样产生 Unicast
+  notifier.send_command_to_mac(mac, CommandBody::Nop);
+  let out2 = cmd_sig.try_take().expect("send_command_to_mac 应写入命令");
+  assert_eq!(out2.dest, CommandDest::Unicast(mac));
 }

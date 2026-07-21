@@ -29,6 +29,7 @@
     - [Prelude](#prelude)
   - [Feature 矩阵](#feature-矩阵)
   - [双身份 Notifier](#双身份-notifier)
+  - [命令寻址：广播 vs 单播](#命令寻址广播-vs-单播)
   - [Endpoint 主动上报](#endpoint-主动上报)
     - [主动 `send_command` — 危险 API](#主动-send_command--危险-api)
   - [替换物理链路](#替换物理链路)
@@ -185,11 +186,14 @@ let receiver = Receiver::builder()
 
 | 类别 | 方法 |
 |---|---|
-| 主动出站 | `send_frame(&Frame)` / `send_command(CommandBody)` / `report(ResponseBody)` |
+| 主动出站（广播） | `send_frame(&Frame)` / `send_command(CommandBody)` |
+| 主动出站（**单播**） | `send_command_to(receiver_id, CommandBody)` / `send_command_to_mac(mac, CommandBody)` |
 | 发现 | `discover()` — 广播一次 `Announce` |
 | Peer 目录 | `peers()` — 返回 `PeerInfo` 只读快照 `Vec`（非借出 registry） |
 | 目标选择 | `select_targets(mask)` / `selector()` |
 | Getter | `response_signal()` / `keyring()` |
+
+> 广播与单播的语义差异、可靠性、以及使用注意，见下文 [命令寻址：广播 vs 单播](#命令寻址广播-vs-单播)。
 
 ### Receiver 方法
 
@@ -225,7 +229,7 @@ use comm::prelude::*;
 |---|:---:|---|---|
 | *（无 feature）* | ✅ | 纯 `no_std`，可在 esp32 / wasm32 / host 上编译 | — |
 | `defmt` | ❌ | 全类型 & dispatch 静默丢弃点接入 `defmt` 日志 | field debug / logic-analyzer 场景 |
-| `serde` | ❌ | 与 `controller-protocol/serde` 联动，`PeerInfo` 等可 (de)serialize | Dashboard / gRPC bridge |
+| `serde` | ❌ | 与 `protocol/serde` 联动，`PeerInfo` 等可 (de)serialize | Dashboard / gRPC bridge |
 | `loopback` | ❌ | 内置一个 `std::sync::mpsc` 版 `CommLink`（`LoopbackLink::pair`） | host 端集成测试 / 演示 |
 | `test-utils` | ❌ | 暴露 `DummyLink` + `test_receiver_from_parts` 等测试 fixture | 集成测试 / 依赖侧单元测试 |
 | `endpoint-initiated-command` | ❌ | ⚠️ 开启 `Receiver::send_command` — Endpoint 主动发 Command | 特殊拓扑（多 Coordinator / 对等发现） |
@@ -261,6 +265,36 @@ let notifier = Notifier::builder()
 ```
 
 > 若同时接 BLE 和 ESP-NOW 两条链路，请分别搭 2 套 Notifier。
+
+---
+
+## 命令寻址：广播 vs 单播
+
+Coordinator 下发的 `Command` 可以选择**广播给全网**或**单播给某一台** receiver。寻址信息由 `CommandOutSignal` 的载荷 [`OutboundCommand`] 携带（`dest: CommandDest { Broadcast | Unicast([u8; 6]) }` + 已编码字节），由 `run_broadcast_loop` 在出站时解释。
+
+| 方法 | 目标 | 底层寻址 | 可靠性 |
+|---|---|---|---|
+| `send_command(body)` | 全网所有 receiver | `CommandDest::Broadcast` → 链路广播地址 | fire-and-forget，**无 ACK** |
+| `send_command_to(id, body)` | `receiver_id == id` 的那台 | 反查 `PeerRegistry` 得 MAC → `CommandDest::Unicast` | ESP-NOW MAC 层 ACK + 有界重试 |
+| `send_command_to_mac(mac, body)` | 指定 MAC（跳过反查） | 直接 `CommandDest::Unicast` | 同上 |
+
+```rust,ignore
+// 广播：发给所有 receiver（比如全体闪灯）
+notifier.send_command(CommandBody::LedBlink { led_idx: 0, count: 3, period_ms: 100 });
+
+// 单播：只发给 receiver_id == 2 的那台；未发现该 id 时返回 NotifierError::NoTarget
+notifier.send_command_to(2, CommandBody::LedBlink { led_idx: 0, count: 3, period_ms: 100 })?;
+
+// 已持有 MAC（例如来自一次 peers() 快照）时，直发省一次反查
+notifier.send_command_to_mac(peer.mac, CommandBody::ShowToast { len, bytes });
+```
+
+**可靠性**：单播走 ESP-NOW 单播地址，能拿到 MAC 层 ACK；`run_broadcast_loop` 在 `send` 返回 `Err` 时再做 `MAX_UNICAST_SEND_RETRIES` 次有界补发。首次单播到某个未登记 MAC 时，链路侧（如 ESP-NOW）需惰性 `add_peer`——这属于 `CommLink` 实现细节，`comm` 只负责传目标地址。
+
+> **⚠️ 覆盖式信号，勿在紧凑循环里连发多台**
+> `CommandOutSignal` 是 embassy `Signal`（后写覆盖前写）。连续 `send_command_to(a)` → `send_command_to(b)` 若快过 `broadcast_loop` 消费，**只有最后一条能出站**。要"发给多台"请分帧节流（每帧一台），或等命令出站通道升级为有界队列后再支持真正的组播。
+
+> **接收端配套**：单播只解决"送到哪台"。receiver 侧仍需在自己的 `command_handler` 里对相应 `CommandBody` 分支写执行逻辑——`comm` 只自动处理 `Announce` / `AssignId`，业务命令默认不执行（返回 `NoReply` 即被忽略）。
 
 ---
 
@@ -384,7 +418,7 @@ receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 
 - **`no_std` by default** — 直接依赖 embassy 家族（`embassy-sync` / `embassy-time` / `embassy-futures`）；不做运行时无关抽象
 - **`CommLink` 是唯一的可插拔点** — ESP-NOW / UART / loopback 各自实现
-- **协议逻辑复用 `controller-protocol`** — 本 crate 只负责编排
+- **协议逻辑复用 `protocol`** — 本 crate 只负责编排
 - **零 heap 分配** — 所有集合走 `heapless::Vec<T, N>`
 - **编译期尺寸护栏** — `Frame` / `Command` / `CommandResponse` / `PeerInfo` 有 `size_of` 断言，防止意外膨胀
 - **实用主义 builder** — 8 个必填字段用 `Option` + `expect`，而非 typestate 展开 `2^8` impl
@@ -407,5 +441,6 @@ MIT。详见 [`LICENSE`](../../LICENSE)。
 [`CommLink`]: https://docs.rs/comm/latest/comm/trait.CommLink.html
 [`Notifier<L>`]: https://docs.rs/comm/latest/comm/struct.Notifier.html
 [`Receiver<L>`]: https://docs.rs/comm/latest/comm/struct.Receiver.html
+[`OutboundCommand`]: https://docs.rs/comm/latest/comm/notifier/signals/struct.OutboundCommand.html
 [`Coordinator<L>`]: https://docs.rs/comm/latest/comm/type.Coordinator.html
 [`Endpoint<L>`]: https://docs.rs/comm/latest/comm/type.Endpoint.html

@@ -7,7 +7,7 @@ publish = false
 
 # ============================================================
 # 说明：
-# 本 crate 是 controller-protocol 的**纯 host 侧状态帧订阅演示**
+# 本 crate 是 protocol 的**纯 host 侧状态帧订阅演示**
 # （无 esp-hal 依赖）
 #
 # 用途：
@@ -24,4 +24,4 @@ publish = false
 # ============================================================
 
 [dependencies]
-controller-protocol = {path = "../../protocol"}
+protocol = {path = "../../protocol"}

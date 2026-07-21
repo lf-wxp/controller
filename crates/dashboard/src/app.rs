@@ -41,7 +41,7 @@ pub fn App() -> impl IntoView {
 
       <footer class="app-footer">
         <p class="footer-note">
-          "🎮 controller-dashboard · 使用同一 controller-protocol crate 与 ESP32 手柄通信"
+          "🎮 controller-dashboard · 使用同一 protocol crate 与 ESP32 手柄通信"
         </p>
         <p class="footer-note">
           "浏览器需支持 WebBluetooth（Chrome / Edge 最新版）；地址必须是 "

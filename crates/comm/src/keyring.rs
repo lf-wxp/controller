@@ -1,7 +1,7 @@
 //! # Keyring —— 运行时密钥槽状态
 //!
-//! ## 与 [`controller_protocol`] 的分工
-//! `controller-protocol` 的 [`SHARED_SECRETS`](controller_protocol::config::keyring::SHARED_SECRETS)
+//! ## 与 [`protocol`] 的分工
+//! `protocol` 的 [`SHARED_SECRETS`](protocol::config::keyring::SHARED_SECRETS)
 //! 是 **编译期常量数组**（`build.rs` 从 `CONTROLLER_SECRET_V*` 环境变量注入）；
 //! 密钥字节本身**不能在运行时改变**。
 //!
@@ -17,14 +17,14 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use controller_protocol::KeyId;
-use controller_protocol::config::keyring::KEY_SLOTS;
+use protocol::KeyId;
+use protocol::config::keyring::KEY_SLOTS;
 
 /// 手柄默认使用的 `key_id`（=0，对应 `SHARED_SECRETS[0]`）
 ///
-/// re-export 自 [`controller_protocol::config::keyring::DEFAULT_KEY_ID`]，避免调用方
+/// re-export 自 [`protocol::config::keyring::DEFAULT_KEY_ID`]，避免调用方
 /// 再依赖 protocol crate 的深层路径。
-pub const DEFAULT_KEY_ID: u8 = controller_protocol::config::keyring::DEFAULT_KEY_ID;
+pub const DEFAULT_KEY_ID: u8 = protocol::config::keyring::DEFAULT_KEY_ID;
 
 /// 当 `active` 存储的原始字节意外越界时使用的 fallback slot 索引
 ///
@@ -106,7 +106,7 @@ impl Keyring {
     if !new_id.is_slot_supported() {
       return Err(KeyringError::SlotOutOfRange(raw));
     }
-    if controller_protocol::config::keyring::SHARED_SECRETS[raw as usize].is_none() {
+    if protocol::config::keyring::SHARED_SECRETS[raw as usize].is_none() {
       return Err(KeyringError::SlotDisabled(raw));
     }
     self.active.store(raw, Ordering::Relaxed);

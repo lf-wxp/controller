@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# scripts/gen-secrets.sh —— 生成 controller-protocol 编译期密钥
+# scripts/gen-secrets.sh —— 生成 protocol 编译期密钥
 # ============================================================
 #
 # 用途：为生产 build 生成两个 32 字节高熵密钥，输出 .env 风格文本。

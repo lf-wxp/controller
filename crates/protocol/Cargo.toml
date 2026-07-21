@@ -1,12 +1,12 @@
 [package]
-name = "controller-protocol"
+name = "protocol"
 description = "Pure protocol layer for the ESP32 game controller — Frame / Command / Response / anti-replay / auth. no_std by default."
 authors = ["Francisco Wu <franciscowu@example.com>"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/lf-wxp/controller"
 homepage = "https://github.com/lf-wxp/controller/tree/main/crates/protocol"
-documentation = "https://docs.rs/controller-protocol"
+documentation = "https://docs.rs/protocol"
 categories = ["embedded", "no-std", "encoding"]
 keywords = ["esp32", "controller", "protocol", "hmac", "no-std"]
 version.workspace = true

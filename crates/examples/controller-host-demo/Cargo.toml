@@ -7,7 +7,7 @@ publish = false
 
 # ============================================================
 # 说明：
-# 本 crate 是 controller-protocol 的**纯 host 侧交互演示**（无 esp-hal 依赖）
+# 本 crate 是 protocol 的**纯 host 侧交互演示**（无 esp-hal 依赖）
 #
 # 用途：
 # - 展示"控制端如何组装 Command / 解析 Response"的完整流程
@@ -22,4 +22,4 @@ publish = false
 # ============================================================
 
 [dependencies]
-controller-protocol = {path = "../../protocol"}
+protocol = {path = "../../protocol"}

@@ -15,7 +15,7 @@ path = "src/main.rs"
 # ============================================================
 [dependencies]
 # 协议 crate：启用 std（Leptos 完全在 Rust 侧操作数据结构，不需要跨语言 JSON）
-controller-protocol = {path = "../protocol", features = ["std"]}
+protocol = {path = "../protocol", features = ["std"]}
 
 # Leptos 0.8 CSR（浏览器端渲染）
 leptos = {version = "0.8", features = ["csr"]}

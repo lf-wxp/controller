@@ -40,18 +40,18 @@
 //! ```
 //!
 //! ## 与协议层的关系
-//! - 协议层 (`controller_protocol::auth`) 只提供**存储**（[`SESSION_NONCE`]）
+//! - 协议层 (`protocol::auth`) 只提供**存储**（[`SESSION_NONCE`]）
 //!   与**读写 API**（[`init_session_nonce`] / [`session_nonce`]）
 //! - 本模块只做**编排**（"什么时候写"、"什么时候广播"）
 //! - 广播报文的构造仍然复用 [`CommandResponse::nonce_hello`]，避免协议漂移
 //!
-//! [`SESSION_NONCE`]: controller_protocol::SESSION_NONCE
-//! [`init_session_nonce`]: controller_protocol::init_session_nonce
-//! [`session_nonce`]: controller_protocol::session_nonce
-//! [`ResponseBody::NonceHello`]: controller_protocol::ResponseBody::NonceHello
+//! [`SESSION_NONCE`]: protocol::SESSION_NONCE
+//! [`init_session_nonce`]: protocol::init_session_nonce
+//! [`session_nonce`]: protocol::session_nonce
+//! [`ResponseBody::NonceHello`]: protocol::ResponseBody::NonceHello
 
-use controller_protocol::{CommandResponse, init_session_nonce, session_nonce};
 use embassy_time::{Duration, Timer};
+use protocol::{CommandResponse, init_session_nonce, session_nonce};
 
 use super::signals::ResponseSignal;
 
@@ -109,7 +109,7 @@ pub trait EntropySource {
 /// # 返回
 /// 实际写入的 nonce 值（便于日志打印）
 ///
-/// [`SESSION_NONCE`]: controller_protocol::SESSION_NONCE
+/// [`SESSION_NONCE`]: protocol::SESSION_NONCE
 pub fn init_session<E: EntropySource + ?Sized>(entropy: &mut E) -> u32 {
   let seed = entropy.read_u32();
   init_session_nonce(seed);
@@ -150,7 +150,7 @@ pub fn init_session<E: EntropySource + ?Sized>(entropy: &mut E) -> u32 {
 ///   声明后传入
 /// - `interval`：广播周期；日常用 [`DEFAULT_NONCE_BROADCAST_INTERVAL`]
 ///
-/// [`ResponseBody::NonceHello`]: controller_protocol::ResponseBody::NonceHello
+/// [`ResponseBody::NonceHello`]: protocol::ResponseBody::NonceHello
 pub async fn run_nonce_broadcast_loop(resp: &'static ResponseSignal, interval: Duration) -> ! {
   // 首次立即广播一次
   broadcast_once(resp);

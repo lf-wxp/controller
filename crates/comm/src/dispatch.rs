@@ -20,7 +20,7 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use controller_protocol::{
+use protocol::{
   COMMAND_LEN, COMMAND_MAGIC, Command, CommandBody, CommandDecodeError, CommandResponse, FRAME_LEN,
   FRAME_MAGIC, KeyId, RESPONSE_LEN, RESPONSE_MAGIC, ResponseBody, decode_command, decode_frame,
   init_session_nonce, peek_nonce_hello, session_nonce,
@@ -94,7 +94,7 @@ pub(crate) fn dispatch_packet(data: &[u8], ctx: DispatchCtx) {
 /// 处理入站 Response —— **仅** 消费 `NonceHello` 以同步 session nonce（K3 bootstrap）
 ///
 /// # 背景（跨设备 nonce 同步）
-/// Coordinator 用 [`session_nonce`](controller_protocol::session_nonce) 作为 HMAC
+/// Coordinator 用 [`session_nonce`](protocol::session_nonce) 作为 HMAC
 /// 前缀签发 Command，并周期广播 `NonceHello`。Endpoint 必须采纳同一个 nonce，
 /// 才能：(1) 验签 Coordinator 下发的 Command（含 `Announce` / `AssignId`）；
 /// (2) 用同一 nonce 签自己出站的 Response（`AnnounceReply` / `Ack`），让 Coordinator
@@ -102,7 +102,7 @@ pub(crate) fn dispatch_packet(data: &[u8], ctx: DispatchCtx) {
 ///
 /// # 为什么免鉴权读取
 /// `NonceHello` 的 HMAC 以其自身携带的 nonce 为前缀，Endpoint 在拿到 nonce 前
-/// 无法验签（鸡蛋悖论）。这里用 [`peek_nonce_hello`](controller_protocol::peek_nonce_hello)
+/// 无法验签（鸡蛋悖论）。这里用 [`peek_nonce_hello`](protocol::peek_nonce_hello)
 /// 只校验 magic/version/kind/CRC 后取出 nonce，安全权衡见该函数文档。
 ///
 /// # 幂等
@@ -172,7 +172,7 @@ pub(crate) fn dispatch_command_frame(data: &[u8], ctx: DispatchCtx) {
 /// 1. `frame_handler` 已注册（否则整条路径零成本 short-circuit）
 /// 2. 本机 `my_id == UNASSIGNED_ID`（尚未被 controller 分配 id）——此时**总是**
 ///    投递，让业务能观察到广播帧、通过其它渠道（比如 UI）快速判断链路联通性
-/// 3. 或者本机已分配 id 且 [`Frame::is_addressed_to`](controller_protocol::Frame::is_addressed_to)
+/// 3. 或者本机已分配 id 且 [`Frame::is_addressed_to`](protocol::Frame::is_addressed_to)
 ///    返回 `true`（含 `dest_mask == u32::MAX` 的广播场景）
 ///
 /// # 为什么"未分配 id 也投递"？

@@ -6,7 +6,7 @@
 # 根目录仅作为 workspace 根（不再含 [package]），所有 crate 均落在 crates/ 下：
 # - crates/controller   = controller（手柄固件 crate，esp32 xtensa target）【原根 package】
 # - crates/c6           = c6（ESP32-C6 接收端固件 crate，riscv32 target，与 controller 是兄弟 receiver）
-# - crates/protocol     = controller-protocol（纯协议 crate，no_std，跨 target 复用）
+# - crates/protocol     = protocol（纯协议 crate，no_std，跨 target 复用）
 # - crates/comm        = comm（通信编排：Notifier / Receiver / nonce 广播等）
 # - crates/dashboard    = controller-dashboard（Leptos WASM 前端调试台）
 # - crates/examples/controller-host-demo     = 主机侧协议交互 demo（纯 host target，防止文档腐化）

@@ -183,6 +183,23 @@ impl PeerRegistry {
     })
   }
 
+  /// 反查 `receiver_id` 对应的 MAC（[`lookup_id_for_mac`](Self::lookup_id_for_mac) 的逆）
+  ///
+  /// # 用途（Phase 2）
+  /// 定向单播命令：[`Notifier::send_command_to`](crate::Notifier::send_command_to)
+  /// 拿到用户选定的 `receiver_id` 后，反查 MAC 才能构造
+  /// [`CommandDest::Unicast`](crate::notifier::CommandDest::Unicast)。
+  #[must_use]
+  pub fn lookup_mac_for_id(&self, receiver_id: u8) -> Option<[u8; MAC_LEN]> {
+    self.inner.lock(|cell| {
+      cell
+        .borrow()
+        .iter()
+        .find(|p| p.info.receiver_id == receiver_id)
+        .map(|p| p.info.mac)
+    })
+  }
+
   /// 只读快照（Copy 后独立，不再持有内部引用）
   #[must_use]
   pub fn snapshot(&self) -> Vec<PeerInfo, MAX_PEERS> {
@@ -297,6 +314,31 @@ mod tests {
     let _ = reg.upsert(mac, *b"led", -20, now());
     assert_eq!(reg.lookup_id_for_mac(&mac), Some(0));
     assert_eq!(reg.lookup_id_for_mac(&[9, 9, 9, 9, 9, 9]), None);
+  }
+
+  #[test]
+  fn reverse_lookup_maps_id_to_mac_and_misses_unknown() {
+    let reg = PeerRegistry::new();
+    let mac_a = [1, 2, 3, 4, 5, 6];
+    let mac_b = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let _ = reg.upsert(mac_a, *b"led", -20, now()); // id 0
+    let _ = reg.upsert(mac_b, *b"srv", -30, now()); // id 1
+    assert_eq!(reg.lookup_mac_for_id(0), Some(mac_a));
+    assert_eq!(reg.lookup_mac_for_id(1), Some(mac_b));
+    // 未分配的 id → None
+    assert_eq!(reg.lookup_mac_for_id(2), None);
+    assert_eq!(reg.lookup_mac_for_id(31), None);
+  }
+
+  #[test]
+  fn reverse_lookup_round_trips_with_forward_lookup() {
+    let reg = PeerRegistry::new();
+    let mac = [0x10, 0x20, 0x30, 0x40, 0x50, 0x60];
+    let UpsertOutcome::Inserted { receiver_id } = reg.upsert(mac, *b"srv", -25, now()) else {
+      panic!("expected Inserted");
+    };
+    assert_eq!(reg.lookup_mac_for_id(receiver_id), Some(mac));
+    assert_eq!(reg.lookup_id_for_mac(&mac), Some(receiver_id));
   }
 
   #[test]

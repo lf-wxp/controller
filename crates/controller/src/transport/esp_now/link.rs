@@ -18,7 +18,10 @@
 
 use comm::{CommLink, Packet};
 use defmt::Format;
-use esp_radio::esp_now::{BROADCAST_ADDRESS, EspNowError, EspNowReceiver, EspNowSender};
+use esp_radio::esp_now::{
+  BROADCAST_ADDRESS, EspNowError, EspNowManager, EspNowReceiver, EspNowSender, EspNowWifiInterface,
+  PeerInfo,
+};
 
 /// ESP-NOW MTU：最大 250 字节 payload；本项目真实帧 Frame/Command/Response ≤ 26B，
 /// 该上限只是硬边界保护。
@@ -33,6 +36,8 @@ const ESP_NOW_MTU: usize = 250;
 pub enum SendError {
   /// 底层 esp-radio 发送失败（可能是 Wi-Fi 未初始化 / 广播队列满）
   Radio,
+  /// 单播目标 `add_peer` 失败（多为 ESP-NOW peer 表满，上限约 20）
+  PeerFull,
 }
 
 /// send-only 端被误 `recv` 时的错误
@@ -54,15 +59,45 @@ pub enum SendOnRecvError {
 // ============================================================
 
 /// [`CommLink`] 的 send-only 实现；由 [`comm::run_broadcast_loop`] 拥有。
+///
+/// # 单播 peer 惰性登记（Phase 1）
+/// ESP-NOW 单播要求目标 MAC 先 `add_peer`（广播地址由 esp-radio 初始化时自动登记）。
+/// 本 link 持有 [`EspNowManager`] 引用，在首次单播到某未登记 MAC 时惰性 `add_peer`，
+/// 从而让 comm 侧的 `CommandDest::Unicast`（当前用于 AssignId）无需感知 peer 表管理。
 pub struct EspNowSendLink {
   sender: EspNowSender<'static>,
+  manager: &'static EspNowManager<'static>,
 }
 
 impl EspNowSendLink {
-  /// 用 `esp_now.split()` 拆出的 sender 构造
+  /// 用 `esp_now.split()` 拆出的 sender + manager 构造
   #[must_use]
-  pub const fn new(sender: EspNowSender<'static>) -> Self {
-    Self { sender }
+  pub const fn new(
+    sender: EspNowSender<'static>,
+    manager: &'static EspNowManager<'static>,
+  ) -> Self {
+    Self { sender, manager }
+  }
+
+  /// 确保单播目标已在 peer 表中（幂等）。
+  ///
+  /// 广播地址由 esp-radio 自动登记，直接跳过。`add_peer` 失败（多为
+  /// peer 表满，ESP-NOW 上限约 20）时返回 [`SendError::PeerFull`]，让上层
+  /// 决定放弃 / 回退——Phase 1 里由 AnnounceReply 幂等重发兜底。
+  fn ensure_peer(&self, dst: &[u8; 6]) -> Result<(), SendError> {
+    if *dst == BROADCAST_ADDRESS || self.manager.peer_exists(dst) {
+      return Ok(());
+    }
+    self
+      .manager
+      .add_peer(PeerInfo {
+        interface: EspNowWifiInterface::Station,
+        peer_address: *dst,
+        lmk: None,
+        channel: None,
+        encrypt: false,
+      })
+      .map_err(|_e: EspNowError| SendError::PeerFull)
   }
 }
 
@@ -74,6 +109,7 @@ impl CommLink for EspNowSendLink {
   const BROADCAST: Self::Addr = BROADCAST_ADDRESS;
 
   async fn send(&mut self, dst: Self::Addr, bytes: &[u8]) -> Result<(), Self::SendError> {
+    self.ensure_peer(&dst)?;
     self
       .sender
       .send_async(&dst, bytes)

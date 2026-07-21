@@ -1,7 +1,7 @@
 # controller-dashboard
 
 **ESP32 Controller 的 WebBluetooth 调试面板**——Leptos 0.8 + Rust WASM，
-与手柄固件**共享同一份** `controller-protocol` crate，协议漂移风险 = 0。
+与手柄固件**共享同一份** `protocol` crate，协议漂移风险 = 0。
 
 ## 特性
 
@@ -35,7 +35,7 @@ trunk serve --open
 ```
 
 首次运行会：
-1. 编译 `controller-protocol` + `controller-dashboard` 到 WASM
+1. 编译 `protocol` + `controller-dashboard` 到 WASM
 2. wasm-opt 优化二进制
 3. Trunk 启动 HTTP 服务并注入 auto-reload 脚本
 
@@ -59,13 +59,13 @@ trunk build --release
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │  ESP32 手柄 (Rust, no_std, xtensa target)                    │
-│    └─ 使用 controller-protocol crate 编码 Frame/Response     │
+│    └─ 使用 protocol crate 编码 Frame/Response     │
 │                        ▲                                     │
 │                        │ BLE GATT                            │
 │                        ▼                                     │
 │  Chrome 浏览器 (WebBluetooth)                                │
 │    └─ Leptos WASM app                                        │
-│         └─ 使用同一份 controller-protocol crate              │
+│         └─ 使用同一份 protocol crate              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -76,7 +76,7 @@ trunk build --release
 
 ```
 crates/dashboard/
-├── Cargo.toml            # 依赖：leptos + wasm-bindgen + controller-protocol
+├── Cargo.toml            # 依赖：leptos + wasm-bindgen + protocol
 ├── Trunk.toml            # 打包配置（端口 / dist / wasm-opt）
 ├── rust-toolchain.toml   # 覆盖顶层 esp channel，用 stable
 ├── .cargo/config.toml    # 覆盖顶层 xtensa target，改 wasm32-unknown-unknown

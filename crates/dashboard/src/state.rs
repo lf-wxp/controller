@@ -10,8 +10,8 @@
 
 use std::collections::VecDeque;
 
-use controller_protocol::{ErrorCode, GamepadState, KeyId, ResponseBody};
 use leptos::prelude::*;
+use protocol::{ErrorCode, GamepadState, KeyId, ResponseBody};
 
 /// 事件日志方向
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

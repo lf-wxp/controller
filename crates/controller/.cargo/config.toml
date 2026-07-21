@@ -19,7 +19,7 @@ rustflags = [
 DEFMT_LOG = "info"
 
 # 默认 target：手柄固件工作流使用
-# 其它 crate（controller-protocol / controller-dashboard）会通过自己的 .cargo/config.toml
+# 其它 crate（protocol / controller-dashboard）会通过自己的 .cargo/config.toml
 # 或命令行 --target 参数覆盖。
 [build]
 target = "xtensa-esp32-none-elf"

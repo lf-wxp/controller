@@ -21,7 +21,7 @@ include = ["src/**/*", "Cargo.toml", "README.md"]
 # ============================================================
 [dependencies]
 # 协议编解码：本 crate 复用 protocol 的类型 / HMAC / anti-replay 实现
-controller-protocol = {path = "../protocol", default-features = false}
+protocol = {path = "../protocol", default-features = false}
 
 # embassy 生态：定死一个运行时；避免 anti-over-abstraction
 embassy-sync = {version = "0.7", default-features = false}
@@ -63,8 +63,8 @@ critical-section = {version = "1.2", features = ["std"]}
 # - test-utils: 暴露仅测试用的 helper（如 `PeerRegistry::clear_for_test`）
 [features]
 default = []
-defmt = ["dep:defmt", "controller-protocol/defmt"]
-serde = ["dep:serde", "controller-protocol/serde"]
+defmt = ["dep:defmt", "protocol/defmt"]
+serde = ["dep:serde", "protocol/serde"]
 loopback = []
 test-utils = []
 # 危险 opt-in：允许 Endpoint（Receiver）主动发送 Command。

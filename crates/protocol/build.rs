@@ -1,4 +1,4 @@
-//! # controller-protocol build script
+//! # protocol build script
 //!
 //! ## 职责（C-3 密钥安全修复）
 //! 把 HMAC 共享密钥从"源码明文常量"转移到"编译期通过环境变量注入"，避免：

@@ -36,7 +36,7 @@ firmware-panic = ["esp-backtrace/panic-handler"]
 
 [dependencies]
 # 协议 crate（在 crates/protocol 中），启用 defmt 集成
-controller-protocol = {path = "../protocol", features = ["defmt"]}
+protocol = {path = "../protocol", features = ["defmt"]}
 
 # 通信编排 crate（在 crates/comm 中）：提供 Notifier / Receiver / nonce 广播等能力
 comm = {path = "../comm", features = ["defmt"]}

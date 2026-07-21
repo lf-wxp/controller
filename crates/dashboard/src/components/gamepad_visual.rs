@@ -5,8 +5,8 @@
 //! - 按钮：Btn1-4 共 4 个圆形亮灯
 //! - 旋钮：两根垂直进度条
 
-use controller_protocol::state::ButtonBits;
 use leptos::prelude::*;
+use protocol::state::ButtonBits;
 
 use crate::state::AppState;
 

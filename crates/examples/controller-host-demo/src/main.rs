@@ -37,9 +37,9 @@
 //! 替换成"从 `Vec<u8>` 里拿"。
 //!
 //! **CI 每次运行 `cargo test` / `cargo run` 都会验证这段代码 —— 一旦
-//! controller-protocol API 变更，本 demo 会立刻编译失败，防止文档腐化。**
+//! protocol API 变更，本 demo 会立刻编译失败，防止文档腐化。**
 
-use controller_protocol::{
+use protocol::{
   auth::{KeyId, init_session_nonce, session_nonce},
   command::{Command, CommandBody, CommandDecodeError, decode_command, encode_command},
   replay::AntiReplayWindow,
@@ -325,8 +325,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use controller_protocol::auth::verify_hmac_tag;
-  use controller_protocol::response::ResponseDecodeError;
+  use protocol::auth::verify_hmac_tag;
+  use protocol::response::ResponseDecodeError;
 
   #[test]
   fn happy_path_nop_ack() {
@@ -382,7 +382,7 @@ mod tests {
 
   #[test]
   fn wire_bytes_length_matches_protocol_constants() {
-    use controller_protocol::{COMMAND_LEN, RESPONSE_LEN};
+    use protocol::{COMMAND_LEN, RESPONSE_LEN};
 
     init_session_nonce(DEMO_INITIAL_NONCE);
     let cmd = Command::with_key(1, KeyId::DEFAULT, CommandBody::Nop);

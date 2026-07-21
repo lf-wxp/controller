@@ -1,9 +1,9 @@
 //! # ReplayGuard —— per-key-id 抗重放窗口的实例化封装
 //!
-//! ## 与 [`controller_protocol::AntiReplayWindow`] 的分工
+//! ## 与 [`protocol::AntiReplayWindow`] 的分工
 //! [`AntiReplayWindow`] 提供**单个窗口**的算法实现（滑动位图 + `check_and_update`）；
 //! 本模块把它包装成 **`[AntiReplayWindow; KEY_SLOTS]`** 数组，因为
-//! [每个 `key_id` 拥有独立的 seq 空间](`controller_protocol::command`)，
+//! [每个 `key_id` 拥有独立的 seq 空间](`protocol::command`)，
 //! 密钥轮换时不能让新 slot 的 seq=1 被旧 slot 的 last_seq 误判为重放。
 //!
 //! ## 与手柄原代码 (`crates/controller/src/transport/control.rs::REPLAY_WINDOWS`) 的差异
@@ -18,10 +18,10 @@
 
 use core::cell::RefCell;
 
-use controller_protocol::config::keyring::KEY_SLOTS;
-use controller_protocol::{AntiReplayWindow, KeyId, ReplayError};
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use protocol::config::keyring::KEY_SLOTS;
+use protocol::{AntiReplayWindow, KeyId, ReplayError};
 
 /// [`ReplayGuard::check`] 的失败原因
 ///

@@ -21,7 +21,7 @@
 //! ```
 //!
 //! ## 与 esp32 端共享的协议逻辑
-//! `controller_protocol` crate 提供 encode/decode 的**唯一权威实现**。
+//! `protocol` crate 提供 encode/decode 的**唯一权威实现**。
 //! 手柄 fw 与 dashboard 编码/解码同一份 Rust 代码 → 协议漂移 = 0。
 
 use leptos::mount::mount_to_body;

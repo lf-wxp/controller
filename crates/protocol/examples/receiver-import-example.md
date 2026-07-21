@@ -1,4 +1,4 @@
-# Receiver 项目引用 `controller-protocol` 的最小示例
+# Receiver 项目引用 `protocol` 的最小示例
 
 本文件配合 tag [`protocol-v0.2.0`](https://github.com/lf-wxp/controller/releases/tag/protocol-v0.2.0) 使用，
 展示**另一个 receiver 项目**如何以 Git 依赖方式复用本 crate，**无需拷贝源码**。
@@ -13,7 +13,7 @@
 ```text
 tag:    protocol-v0.2.0
 commit: 5eda0a8        # git rev-parse protocol-v0.2.0^{}
-crate:  controller-protocol
+crate:  protocol
 repo:   https://github.com/lf-wxp/controller
 path:   crates/protocol         # Cargo 会自动在 workspace 中定位
 ```
@@ -31,7 +31,7 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
-controller-protocol = {
+protocol = {
   git = "https://github.com/lf-wxp/controller",
   tag = "protocol-v0.2.0",
   default-features = false,      # 关掉 embed-default-secrets，强制注入真密钥
@@ -48,7 +48,7 @@ defmt     = "1"
 
 ```toml
 [dependencies]
-controller-protocol = {
+protocol = {
   git = "https://github.com/lf-wxp/controller",
   tag = "protocol-v0.2.0",
   default-features = false,
@@ -61,7 +61,7 @@ tokio = { version = "1", features = ["full"] }
 
 ```toml
 [dependencies]
-controller-protocol = {
+protocol = {
   git = "https://github.com/lf-wxp/controller",
   tag = "protocol-v0.2.0",
   default-features = false,
@@ -86,7 +86,7 @@ wasm-bindgen = "0.2"
 #![no_std]
 #![no_main]
 
-use controller_protocol::{Frame, GamepadState, DecodeError};
+use protocol::{Frame, GamepadState, DecodeError};
 use defmt::info;
 
 /// ESP-NOW 回调里拿到的原始 25 字节 payload
@@ -120,7 +120,7 @@ fn handle_state(state: &GamepadState) {
 ## 3. 最小控制端代码（std host / 发命令 + 收响应）
 
 ```rust
-use controller_protocol::{
+use protocol::{
   Command, CommandBody, CommandResponse, KeyId,
   auth::SessionNonce, replay::AntiReplayWindow,
 };
@@ -182,9 +182,9 @@ cargo build --release
 # .github/workflows/ci.yml
 - name: Assert no dangerous features leak into release
   run: |
-    if cargo tree -e features -p controller-protocol \
+    if cargo tree -e features -p protocol \
         | grep -E "embed-default-secrets|debug-auth-bypass"; then
-      echo "::error::controller-protocol dangerous feature enabled in release build"
+      echo "::error::protocol dangerous feature enabled in release build"
       exit 1
     fi
 ```
@@ -197,7 +197,7 @@ Receiver 项目直接引用当前版本即可：
 
 ```toml
 # Cargo.toml
-controller-protocol = {
+protocol = {
   git = "https://github.com/lf-wxp/controller",
   tag = "protocol-v0.2.0",
   default-features = false,
@@ -206,7 +206,7 @@ controller-protocol = {
 ```
 
 ```bash
-cargo update -p controller-protocol
+cargo update -p protocol
 cargo build --release
 ```
 
@@ -219,8 +219,8 @@ cargo build --release
 
 打完 tag、receiver 侧拉下来后，先跑一遍这五条：
 
-- [ ] `cargo tree -p controller-protocol` 显示 tag 匹配 `protocol-v0.2.0`
-- [ ] `cargo tree -e features -p controller-protocol` **不含** `embed-default-secrets` / `debug-auth-bypass`
+- [ ] `cargo tree -p protocol` 显示 tag 匹配 `protocol-v0.2.0`
+- [ ] `cargo tree -e features -p protocol` **不含** `embed-default-secrets` / `debug-auth-bypass`
 - [ ] `env | grep CONTROLLER_SECRET_V` 两条都是 32 字节
 - [ ] 空跑一次 `Frame::decode(&[0u8; 21])` → 应返回 `Err(BadMagic)`（证明协议 crate 真的被链接进来了）
 - [ ] `KeyId::V1` 与手柄端约定的 key slot 一致（4-bit，共 16 个 slot）

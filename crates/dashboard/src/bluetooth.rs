@@ -40,13 +40,13 @@
 //! 如果后续需要抗中间人劫持的双向认证，请在**外层**（例如 WebAuthn / TLS to
 //! backend）解决，而不是在这里加密钥。
 
-use controller_protocol::{
-  Command, FRAME_LEN, RESPONSE_LEN, ResponseBody, decode_frame, decode_response, encode_command,
-  init_session_nonce, peek_nonce_hello,
-};
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use protocol::{
+  Command, FRAME_LEN, RESPONSE_LEN, ResponseBody, decode_frame, decode_response, encode_command,
+  init_session_nonce, peek_nonce_hello,
+};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;

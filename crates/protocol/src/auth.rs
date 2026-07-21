@@ -286,7 +286,7 @@ mod tests {
   /// `--test-threads=1`**：
   ///
   /// ```bash
-  /// cargo test -p controller-protocol -- --test-threads=1
+  /// cargo test -p protocol -- --test-threads=1
   /// ```
   ///
   /// 手柄单线程环境（no_std, embassy 单执行器）下不存在此问题；这是仅在

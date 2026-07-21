@@ -1,4 +1,4 @@
-# controller-protocol
+# protocol
 
 ESP32 游戏手柄的**纯协议层** —— 无硬件依赖、可跨 target 复用（`no_std` by default）。
 手柄固件、Leptos WebBluetooth Dashboard、以及 ESP-NOW 接收/控制端 demo **共用同一份源码**，
@@ -107,10 +107,10 @@ cargo test --features std proptest
 
 ```toml
 # 接收端 / 控制端（纯 no_std）
-controller-protocol = { path = "../../crates/protocol", default-features = false, features = ["defmt"] }
+protocol = { path = "../../crates/protocol", default-features = false, features = ["defmt"] }
 
 # Dashboard（WASM，需要 serde）
-controller-protocol = { path = "../../crates/protocol", default-features = false, features = ["serde"] }
+protocol = { path = "../../crates/protocol", default-features = false, features = ["serde"] }
 ```
 
 ## 相关文档

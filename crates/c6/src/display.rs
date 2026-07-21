@@ -18,7 +18,6 @@
 //!   └──────────────────────────┘
 //! ```
 
-use controller_protocol::{ButtonBits, GamepadState};
 use embedded_graphics::{
   mono_font::{
     MonoTextStyleBuilder,
@@ -29,6 +28,7 @@ use embedded_graphics::{
   primitives::{PrimitiveStyle, PrimitiveStyleBuilder, Rectangle},
   text::{Baseline, Text, TextStyleBuilder},
 };
+use protocol::{ButtonBits, GamepadState};
 
 use crate::self_test::{ALL_ITEMS, SelfTestReport, SelfTestStatus};
 
@@ -211,7 +211,7 @@ const JOY_DOT: i32 = 3;
 /// 摇杆/旋钮坐标满量程（与手柄端 `config::tuning::AXIS_RANGE` 对齐）。
 ///
 /// ⚠️ 手柄归一化后摇杆是 `-AXIS_RANGE..=+AXIS_RANGE`、旋钮是 `0..=AXIS_RANGE`
-/// （见 `controller_protocol::GamepadState` 字段注释），**不是 i16/u16 满量程**。
+/// （见 `protocol::GamepadState` 字段注释），**不是 i16/u16 满量程**。
 /// 早期这里误用 `i16::MAX`/`u16::MAX` 做映射，导致满偏时光点只移动约 ±1px、
 /// 旋钮条几乎不填充。dashboard 端 (`gamepad_visual.rs`) 也用这个值。
 const AXIS_RANGE: i32 = 1000;

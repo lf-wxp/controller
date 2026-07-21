@@ -259,7 +259,7 @@ pub const SHARED_SECRETS: [Option<&'static [u8; 32]>; 4] =
 
 ### 密钥注入（生产必读）
 
-HMAC 共享密钥 **不在源码明文存放**，由 `controller-protocol` 的 `build.rs` 在编译期从
+HMAC 共享密钥 **不在源码明文存放**，由 `protocol` 的 `build.rs` 在编译期从
 环境变量注入：
 
 | 环境变量 | 要求 | 说明 |

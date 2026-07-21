@@ -4,6 +4,7 @@
         "buildtargets",
         "CCCD",
         "characteristicvaluechanged",
+        "clippy",
         "codegen",
         "coex",
         "CSPRNG",

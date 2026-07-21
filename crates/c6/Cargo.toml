@@ -83,7 +83,7 @@ static_cell = "2.1.1"
 #   **不再需要** debug-auth-bypass —— c6 现在做真实 HMAC 校验。
 #   注意：真实校验要求 c6 与手柄注入**相同**的 CONTROLLER_SECRET_V1/V2
 #   （embed-default-secrets 已关闭，缺失密钥会在编译期 panic）。
-controller-protocol = {path = "../protocol", default-features = false, features = ["defmt"]}
+protocol = {path = "../protocol", default-features = false, features = ["defmt"]}
 
 # comm 编排层：Notifier / Receiver 门面 + CommLink trait + PeerRegistry / ReplayGuard / Keyring
 # 通过实现 CommLink 把 esp_now.split() 的两半适配进 comm 的双 task 拓扑

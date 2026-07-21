@@ -1,5 +1,5 @@
 # ============================================================
-# controller-protocol —— cargo-make 子任务定义
+# protocol —— cargo-make 子任务定义
 # ============================================================
 #
 # 让你可以直接在 `crates/protocol/` 目录里跑：
@@ -31,7 +31,7 @@ alias = "help"
 description = "列出协议 crate 的可用任务"
 script = '''
 echo ""
-echo "🧬 controller-protocol —— cargo-make 任务"
+echo "🧬 protocol —— cargo-make 任务"
 echo ""
 echo "  cargo make check     cargo check（host target）"
 echo "  cargo make clippy    cargo clippy 严格模式"
