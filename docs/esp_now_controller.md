@@ -85,14 +85,15 @@ edition = "2024"
 version = "0.1.0"
 
 [dependencies]
-# 复用本仓库的协议 crate（保证与手柄侧 Frame / Command / Response 100% 对齐）
+# 复用本仓库的协议 crate（纯 no_std，无 esp-hal / embassy 等重依赖；
+# 保证与手柄侧 Frame / Command / Response 布局 100% 一致）
 #
 # 引用方式二选一：
 #   1) 本地 path（同一 monorepo / 二次开发调试）
 #   2) git tag（推荐生产使用，锁定协议版本）
 protocol = { path = "../controller/crates/protocol", default-features = false, features = ["defmt"] }
 # 或：
-# protocol = { git = "https://github.com/YOUR_ORG/controller", tag = "protocol-v0.2.0", default-features = false, features = ["defmt"] }
+# protocol = { git = "https://github.com/lf-wxp/controller", tag = "protocol-v0.2.0", default-features = false, features = ["defmt"] }
 
 esp-hal = { version = "~1.1.0", features = ["defmt", "esp32", "unstable"] }
 esp-rtos = { version = "0.3.0", features = [
