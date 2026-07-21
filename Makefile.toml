@@ -128,6 +128,9 @@ echo ""
 [tasks.controller-check]
 description = "手柄固件 cargo check（xtensa-esp32-none-elf）"
 category = "Controller"
+# 显式 pin esp fork toolchain：根默认已是 stable，cargo make 会把启动工具链传播给
+# 子任务，故这里必须声明 esp，否则会用 stable 编译 xtensa（-Z 等 nightly flag 报错）。
+toolchain = "esp"
 cwd = "crates/controller"
 command = "cargo"
 args = ["check", "--lib", "--bins"]
@@ -135,6 +138,7 @@ args = ["check", "--lib", "--bins"]
 [tasks.controller-clippy]
 description = "手柄固件 cargo clippy 严格模式"
 category = "Controller"
+toolchain = "esp"
 cwd = "crates/controller"
 command = "cargo"
 args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
@@ -142,6 +146,7 @@ args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
 [tasks.controller-build]
 description = "手柄固件 cargo build（release 需加 --release）"
 category = "Controller"
+toolchain = "esp"
 cwd = "crates/controller"
 command = "cargo"
 args = ["build", "--bin", "controller"]
@@ -149,6 +154,7 @@ args = ["build", "--bin", "controller"]
 [tasks.controller-build-release]
 description = "手柄固件 release 构建（LTO + opt-level=s）"
 category = "Controller"
+toolchain = "esp"
 cwd = "crates/controller"
 command = "cargo"
 args = ["build", "--bin", "controller", "--release"]
@@ -226,6 +232,7 @@ script = [
 [tasks.controller-test-check]
 description = "手柄 embedded-test harness 静态检查（不真机运行）"
 category = "Controller"
+toolchain = "esp"
 cwd = "crates/controller"
 command = "cargo"
 # --no-default-features：关掉 workspace feature `firmware-panic`，
@@ -383,8 +390,9 @@ cwd = "crates/dashboard"
 [tasks.dashboard-serve]
 description = "Dashboard 开发服务器（trunk serve --open，热重载）"
 category = "Dashboard"
-# 覆盖根目录 rust-toolchain.toml（esp）为 stable，否则 trunk 子进程会沿用 esp
-# 工具链，而 esp 未安装 wasm32-unknown-unknown 的预编译 std，导致编译失败。
+# 显式用 stable 跑 trunk：dashboard 需 wasm32 + 官方 stable std。虽然根已默认
+# stable、crates/dashboard/rust-toolchain.toml 也 pin 了 stable，这里再声明一层，
+# 确保 trunk 子进程不会因工作目录/环境差异串到 esp（无 wasm32 预编译 std）等 channel。
 toolchain = "stable"
 # 若未装 trunk 会自动 cargo install
 install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
@@ -395,8 +403,9 @@ cwd = "crates/dashboard"
 [tasks.dashboard-build]
 description = "Dashboard 生产构建（wasm-opt + LTO，输出 dist/）"
 category = "Dashboard"
-# 覆盖根目录 rust-toolchain.toml（esp）为 stable，否则 trunk 子进程会沿用 esp
-# 工具链，而 esp 未安装 wasm32-unknown-unknown 的预编译 std，导致编译失败。
+# 显式用 stable 跑 trunk：dashboard 需 wasm32 + 官方 stable std。虽然根已默认
+# stable、crates/dashboard/rust-toolchain.toml 也 pin 了 stable，这里再声明一层，
+# 确保 trunk 子进程不会因工作目录/环境差异串到 esp（无 wasm32 预编译 std）等 channel。
 toolchain = "stable"
 install_crate = { crate_name = "trunk", binary = "trunk", test_arg = "--version" }
 command = "trunk"
@@ -764,6 +773,9 @@ args = ["clean"]
 [tasks.c6-check]
 description = "c6 接收端固件 cargo check（riscv32imac-unknown-none-elf）"
 category = "C6"
+# 显式 pin nightly（riscv + build-std 需要）：根默认是 stable，cargo make 会把
+# 启动工具链传播给子任务，故必须声明，否则会用 stable 编译而失败。
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["check", "--lib", "--bins"]
@@ -771,6 +783,7 @@ args = ["check", "--lib", "--bins"]
 [tasks.c6-clippy]
 description = "c6 接收端固件 cargo clippy 严格模式（riscv32imac-unknown-none-elf）"
 category = "C6"
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
@@ -778,6 +791,7 @@ args = ["clippy", "--lib", "--bins", "--", "-D", "warnings"]
 [tasks.c6-build]
 description = "c6 接收端固件 cargo build（release 需加 --release）"
 category = "C6"
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["build", "--bin", "c6"]
@@ -785,6 +799,7 @@ args = ["build", "--bin", "c6"]
 [tasks.c6-build-release]
 description = "c6 接收端固件 release 构建"
 category = "C6"
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["build", "--bin", "c6", "--release"]
@@ -792,6 +807,7 @@ args = ["build", "--bin", "c6", "--release"]
 [tasks.c6-run]
 description = "c6 通过 probe-rs 烧录并运行（带 RTT 日志，需要 JTAG 调试探针）"
 category = "C6"
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["run", "--bin", "c6", "--release"]
@@ -812,6 +828,7 @@ args = ["monitor", "--chip", "esp32c6"]
 [tasks.c6-test-check]
 description = "c6 embedded-test harness 静态检查（不真机运行）"
 category = "C6"
+toolchain = "nightly"
 cwd = "crates/c6"
 command = "cargo"
 args = ["check", "--tests"]

@@ -1,4 +1,5 @@
 [toolchain]
 # comm 是 no_std embassy crate；用官方 stable 编译，跨 target 复用。
-# 与 crates/protocol 保持一致（避开 esp channel 的 build-std 冲突）。
+# 与仓库根默认及 crates/protocol 一致（esp channel 只落在 crates/controller，
+# 此处显式 pin 保持 crate 自洽，并避开 esp channel 的 build-std 冲突）。
 channel = "stable"

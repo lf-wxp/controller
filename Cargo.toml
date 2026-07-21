@@ -17,7 +17,8 @@
 # 满足 rust-skills [proj-workspace-large] 推荐的 "crates/* 各居其位" 纯 virtual 布局，
 # 所有 crate 一律通过 `cargo build -p <name>` / `cargo make <task>` 操作，结构一致、易扩展。
 # 固件专属的 xtensa 默认 target 已下移到 crates/controller/.cargo/config.toml，
-# 不再污染 protocol / comm / dashboard 的 host / wasm 编译。
+# esp channel 也下移到 crates/controller/rust-toolchain.toml；根 rust-toolchain.toml
+# 保持中性的 stable 默认，不再污染 protocol / comm / dashboard 的 host / wasm 编译。
 # ============================================================
 members = [
   "crates/c6",

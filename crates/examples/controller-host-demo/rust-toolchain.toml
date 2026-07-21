@@ -1,4 +1,4 @@
 [toolchain]
-# controller-host-demo 是 std 环境的普通 binary，用 stable toolchain
-# 覆盖仓库根 rust-toolchain.toml 的 esp channel
+# controller-host-demo 是 std 环境的普通 binary，显式 pin stable toolchain
+# （与仓库根默认一致；显式声明保持 crate 自洽，也防未来根默认变动）
 channel = "stable"

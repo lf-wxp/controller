@@ -1,7 +1,7 @@
 [toolchain]
-# 协议 crate 是纯 no_std Rust，可以用官方 stable channel 编译（跨 target）。
-# 这里明确 override 顶层的 `esp` channel，因为：
-#   1. proptest 测试要在 host target 上跑，需要 std（esp channel 的 host std
-#      与 build-std 生成的 core 会冲突）
-#   2. WASM/Dashboard 也希望用官方 stable 编译，避免依赖 esp fork
+# 协议 crate 是纯 no_std Rust，用官方 stable channel 编译（跨 target）。
+# 与仓库根默认一致，此处显式 pin 以保持 crate 自洽，理由：
+#   1. proptest 测试要在 host target 上跑，需要 std（避免 esp channel 的 host std
+#      与 build-std 生成的 core 冲突——固件的 esp channel 只落在 crates/controller）
+#   2. WASM/Dashboard 也用官方 stable 编译，不依赖 esp fork
 channel = "stable"

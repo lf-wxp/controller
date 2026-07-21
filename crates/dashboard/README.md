@@ -78,8 +78,8 @@ trunk build --release
 crates/dashboard/
 ├── Cargo.toml            # 依赖：leptos + wasm-bindgen + protocol
 ├── Trunk.toml            # 打包配置（端口 / dist / wasm-opt）
-├── rust-toolchain.toml   # 覆盖顶层 esp channel，用 stable
-├── .cargo/config.toml    # 覆盖顶层 xtensa target，改 wasm32-unknown-unknown
+├── rust-toolchain.toml   # pin stable channel（wasm 需官方 stable，非 esp fork）
+├── .cargo/config.toml    # 默认 target = wasm32-unknown-unknown
 ├── index.html            # Trunk 入口
 ├── style.css             # 全局样式（暗色主题）
 └── src/

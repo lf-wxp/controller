@@ -1,0 +1,6 @@
+[toolchain]
+# 手柄固件编译到 xtensa-esp32-none-elf，需要 esp-rs 的 xtensa fork toolchain。
+# 与本目录 .cargo/config.toml 的默认 target（xtensa-esp32-none-elf）配套；
+# cargo make controller-* 任务通过 cwd = "crates/controller" 进入本目录后自动生效。
+# 仅本 crate 用 esp channel，其余 crate 各自 pin stable / nightly，互不影响。
+channel = "esp"

@@ -1,2 +1,10 @@
 [toolchain]
-channel = "esp"
+# Workspace 根默认工具链 = 官方 stable（中性 host 默认）。
+#
+# 固件专属的 esp channel 已下移到 crates/controller/rust-toolchain.toml（与固件
+# .cargo/config.toml 的 xtensa 默认 target 配套），各特殊 crate 也各自 pin 自己的
+# channel：controller=esp / c6=nightly / dashboard=stable+wasm。
+#
+# 根保持 stable 的好处：rust-analyzer / host 侧工具在仓库根有可预测的默认；
+# 新增 host crate 即便忘记 pin，也只会退回 stable，而不会误用 xtensa fork。
+channel = "stable"
