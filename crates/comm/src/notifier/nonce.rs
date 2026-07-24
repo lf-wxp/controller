@@ -16,17 +16,17 @@
 //! 用户在自己 crate 里只需要：
 //!
 //! 1. 提供一个实现 [`EntropySource`] 的对象（比如 `esp_hal::rng::Rng`
-//!    的封装，见 [`SimpleEntropy`]）
+//!    的封装，见手柄 crate 里的 `SimpleEntropy`）
 //! 2. 调用 [`init_session`] 一次
 //! 3. 在自己的 `#[embassy_executor::task]` 中调用 [`run_nonce_broadcast_loop`]
 //!
 //! ```ignore
-//! use comm::notifier::signals::ResponseSignal;
+//! use comm::notifier::signals::ResponseChannel;
 //! use comm::notifier::nonce::{
 //!     init_session, run_nonce_broadcast_loop, DEFAULT_NONCE_BROADCAST_INTERVAL,
 //! };
 //!
-//! static RESP_SIG: ResponseSignal = ResponseSignal::new();
+//! static RESP_SIG: ResponseChannel = ResponseChannel::new();
 //!
 //! #[embassy_executor::task]
 //! async fn nonce_task() -> ! {
@@ -40,12 +40,11 @@
 //! ```
 //!
 //! ## 与协议层的关系
-//! - 协议层 (`protocol::auth`) 只提供**存储**（[`SESSION_NONCE`]）
+//! - 协议层 (`protocol::auth`) 只提供**存储**（`SESSION_NONCE`）
 //!   与**读写 API**（[`init_session_nonce`] / [`session_nonce`]）
 //! - 本模块只做**编排**（"什么时候写"、"什么时候广播"）
 //! - 广播报文的构造仍然复用 [`CommandResponse::nonce_hello`]，避免协议漂移
 //!
-//! [`SESSION_NONCE`]: protocol::SESSION_NONCE
 //! [`init_session_nonce`]: protocol::init_session_nonce
 //! [`session_nonce`]: protocol::session_nonce
 //! [`ResponseBody::NonceHello`]: protocol::ResponseBody::NonceHello
@@ -53,7 +52,7 @@
 use embassy_time::{Duration, Timer};
 use protocol::{CommandResponse, init_session_nonce, session_nonce};
 
-use super::signals::ResponseSignal;
+use super::signals::ResponseChannel;
 
 // ============================================================
 // 常量
@@ -98,7 +97,7 @@ pub trait EntropySource {
 // init_session —— 启动阶段一次性初始化
 // ============================================================
 
-/// 从任意 [`EntropySource`] 采一次熵，装入 [`SESSION_NONCE`]
+/// 从任意 [`EntropySource`] 采一次熵，装入 `SESSION_NONCE`
 ///
 /// **必须**在 spawn 任何依赖 HMAC 的 task 之前调用一次；重复调用会覆盖旧值
 /// （出于安全考虑，应用侧应保证只调一次）。
@@ -108,8 +107,6 @@ pub trait EntropySource {
 ///
 /// # 返回
 /// 实际写入的 nonce 值（便于日志打印）
-///
-/// [`SESSION_NONCE`]: protocol::SESSION_NONCE
 pub fn init_session<E: EntropySource + ?Sized>(entropy: &mut E) -> u32 {
   let seed = entropy.read_u32();
   init_session_nonce(seed);
@@ -120,7 +117,7 @@ pub fn init_session<E: EntropySource + ?Sized>(entropy: &mut E) -> u32 {
 // run_nonce_broadcast_loop —— 后台任务主体
 // ============================================================
 
-/// 周期性把 [`ResponseBody::NonceHello`] 塞入 [`ResponseSignal`]
+/// 周期性把 [`ResponseBody::NonceHello`] 塞入 [`ResponseChannel`]
 ///
 /// 用户在自己 crate 里包一层 `#[embassy_executor::task]`（embassy 的
 /// task 宏禁止泛型 async fn，所以本 crate 无法直接标注）：
@@ -146,12 +143,12 @@ pub fn init_session<E: EntropySource + ?Sized>(entropy: &mut E) -> u32 {
 /// 严格按 `interval` 周期广播。
 ///
 /// # 参数
-/// - `resp`：`&'static ResponseSignal`，由用户在应用 crate 里 `static`
+/// - `resp`：`&'static ResponseChannel`，由用户在应用 crate 里 `static`
 ///   声明后传入
 /// - `interval`：广播周期；日常用 [`DEFAULT_NONCE_BROADCAST_INTERVAL`]
 ///
 /// [`ResponseBody::NonceHello`]: protocol::ResponseBody::NonceHello
-pub async fn run_nonce_broadcast_loop(resp: &'static ResponseSignal, interval: Duration) -> ! {
+pub async fn run_nonce_broadcast_loop(resp: &'static ResponseChannel, interval: Duration) -> ! {
   // 首次立即广播一次
   broadcast_once(resp);
   loop {
@@ -160,13 +157,15 @@ pub async fn run_nonce_broadcast_loop(resp: &'static ResponseSignal, interval: D
   }
 }
 
-/// 读取当前 [`session_nonce`] 并塞入 [`ResponseSignal`]
+/// 读取当前 [`session_nonce`] 并塞入 [`ResponseChannel`]
 ///
 /// 拆成独立 `#[inline]` 函数便于未来加日志钩子 / 单元测试。
 #[inline]
-fn broadcast_once(resp: &'static ResponseSignal) {
+fn broadcast_once(resp: &'static ResponseChannel) {
   let nonce = session_nonce();
-  resp.signal(CommandResponse::nonce_hello(nonce));
+  // 有界队列：满时丢弃本次（下一个 interval 会再发一遍，Host 最终仍拿到最新 nonce）；
+  // 丢弃计入 metrics。
+  super::signals::enqueue_response(resp, CommandResponse::nonce_hello(nonce));
 }
 
 // ============================================================
@@ -206,11 +205,11 @@ mod tests {
   fn broadcast_once_signals_current_nonce() {
     // 先固定一个 nonce
     init_session_nonce(0x1234_5678);
-    // 使用 static ResponseSignal 拿 &'static —— Signal::new 是 const fn，
+    // 使用 static ResponseChannel 拿 &'static —— Channel::new 是 const fn，
     // 不会累积 Box::leak；测试进程也不会长期占内存。
-    static SIG: ResponseSignal = ResponseSignal::new();
+    static SIG: ResponseChannel = ResponseChannel::new();
     broadcast_once(&SIG);
-    // Signal 的 API 只支持 async wait；此处只验证不 panic + 状态被 signaled
-    assert!(SIG.signaled());
+    // 有界队列：验证 broadcast_once 确实入队了一条（可 try_receive 取出）。
+    assert!(SIG.try_receive().is_ok());
   }
 }

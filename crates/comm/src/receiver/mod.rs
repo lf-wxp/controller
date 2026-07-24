@@ -21,7 +21,7 @@
 //! ## 作用
 //! 让 receiver 端（led / motor / srv 等）只用 3 步就能接入 controller 网络：
 //!
-//! 1. 实现 [`CommLink`](crate::CommLink)
+//! 1. 实现 [`CommLink`]
 //! 2. 提供一个 `command_handler` 闭包（用户业务）
 //! 3. spawn 后台任务；剩下的 AnnounceReply / Ack / HMAC / anti-replay 全部
 //!    由本 crate 自动完成
@@ -50,10 +50,10 @@ use protocol::{Command, CommandResponse, ErrorCode, Frame, ResponseBody};
 #[cfg(feature = "endpoint-initiated-command")]
 use protocol::{CommandBody, encode_command};
 
-use crate::dispatch::{DispatchCtx, dispatch_packet};
+use crate::dispatch::dispatch_packet;
 use crate::keyring::Keyring;
 use crate::link::CommLink;
-use crate::notifier::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
+use crate::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
 use crate::replay::ReplayGuard;
 
 pub use builder::ReceiverBuilder;
@@ -81,8 +81,8 @@ pub use builder::ReceiverBuilder;
 pub async fn run_broadcast_loop<L: CommLink>(
   link: L,
   frame_signal: &'static FrameSignal,
-  command_signal: &'static CommandOutSignal,
-  response_signal: &'static ResponseSignal,
+  command_signal: &'static CommandOutChannel,
+  response_signal: &'static ResponseChannel,
 ) -> !
 where
   L::Addr: From<[u8; 6]>,
@@ -129,7 +129,7 @@ pub enum CommandOutcome {
   Err(ErrorCode),
   /// 富回执 —— 用户自己构造整条 [`CommandResponse`]（比如 `BatterySnapshot`
   /// `ReceiverList` `NonceHello` 等带 payload 的响应）；comm 直接把它推入
-  /// [`ResponseSignal`]
+  /// [`ResponseChannel`]
   Respond(CommandResponse),
   /// 不需要回执（比如已经手动回复了 / 心跳类命令）
   NoReply,
@@ -175,85 +175,42 @@ pub type FrameHandler = fn(CommandSource, &Frame);
 
 /// 接收端门面
 ///
-/// # `dead_code` 说明
-/// 字段供外部 [`run_receive_loop`] 读取；本结构体自身不循环，因此本地未读，
-/// 采用字段级 `#[allow(dead_code)]` 只隔离真正无本地读写的字段。
-pub struct Receiver<L: CommLink> {
-  pub(crate) link: L,
+/// # 定位：**link 无关的编排句柄**（与 [`crate::Notifier`] 对称）
+/// 持有一套 `&'static` 共享状态 + handler，**不持有 link**。用法两类：
+/// 1. 生产者 API（`&self`）：[`report`](Self::report) / [`send_frame`](Self::send_frame) 主动上行；
+/// 2. 后台 loop：[`run_broadcast_loop`](Self::run_broadcast_loop) /
+///    [`run_receive_loop`](Self::run_receive_loop)，各吃一个 link 端，直接消费门面字段。
+pub struct Receiver {
   pub(crate) keyring: &'static Keyring,
-  #[allow(dead_code)]
   pub(crate) replay: &'static ReplayGuard,
-  pub(crate) response_signal: &'static ResponseSignal,
-  /// Frame 出站 Signal —— 供 [`Receiver::send_frame`] 主动上行
+  pub(crate) response_signal: &'static ResponseChannel,
+  /// Frame 出站 Signal —— 供 [`Receiver::send_frame`] 主动上行 / broadcast loop 消费
   pub(crate) frame_signal: &'static FrameSignal,
-  /// Command 出站 Signal —— 供 [`Receiver::send_command`] 主动上行
-  ///
-  /// # `dead_code` 说明
-  /// 仅在 `endpoint-initiated-command` feature 开启时才被 [`Receiver::send_command`]
-  /// 读取；默认关闭下无读点，用字段级 `allow` 屏蔽 lint 而不牵连整个 struct。
-  #[allow(dead_code)]
-  pub(crate) command_signal: &'static CommandOutSignal,
-  #[allow(dead_code)]
+  /// Command 出站有界队列 —— 供 [`Receiver::send_command`] 主动上行 / broadcast loop 消费
+  pub(crate) command_signal: &'static CommandOutChannel,
   pub(crate) role_tag: [u8; 3],
-  #[allow(dead_code)]
   pub(crate) my_mac: [u8; 6],
   pub(crate) my_id: &'static AtomicU8,
-  #[allow(dead_code)]
   pub(crate) handler: CommandHandler,
+  /// 入站帧默认来源（透传给 handler）
+  pub(crate) src: CommandSource,
   /// 可选的 Frame handler：`None` 时 receiver 不消费入站 `Frame`
-  #[allow(dead_code)]
   pub(crate) frame_handler: Option<FrameHandler>,
 }
 
-impl<L: CommLink> Receiver<L> {
+impl Receiver {
   /// 开始构造 Receiver
   //
   // 无需 `#[must_use]`：`ReceiverBuilder` 已在结构体层面标了 `#[must_use]`，
   // 这里再加会触发 clippy::double_must_use。
-  pub const fn builder() -> ReceiverBuilder<L> {
-    ReceiverBuilder::<L>::new()
-  }
-
-  /// 借用 link（供后台 loop 使用）
-  pub fn link_mut(&mut self) -> &mut L {
-    &mut self.link
+  pub const fn builder() -> ReceiverBuilder {
+    ReceiverBuilder::new()
   }
 
   /// 当前分配到的 receiver_id（未分配时返回 `UNASSIGNED_ID`）
   #[must_use]
   pub fn assigned_id(&self) -> u8 {
     self.my_id.load(Ordering::Relaxed)
-  }
-
-  // ---- Getter（与 [`crate::Notifier`] 对称）----
-
-  /// 借用内部 [`ResponseSignal`]（供 nonce 广播 / 外部 report 复用）
-  ///
-  /// # 用途
-  /// - `run_nonce_broadcast_loop` 需要 `&'static ResponseSignal` 才能塞
-  ///   [`CommandResponse`]；直接暴露避免用户在 crate 里再维护一份别名
-  /// - 业务侧可以复用该 signal 做自定义上报（不通过 [`Self::report`]）
-  #[must_use]
-  pub fn response_signal(&self) -> &'static ResponseSignal {
-    self.response_signal
-  }
-
-  /// 借用内部 [`Keyring`]（供 key 轮换 / 会话 nonce 初始化等场景）
-  #[must_use]
-  pub fn keyring(&self) -> &'static Keyring {
-    self.keyring
-  }
-
-  /// 本机 MAC 地址（回 AnnounceReply / 判断 AssignId 目标时使用）
-  #[must_use]
-  pub fn my_mac(&self) -> [u8; 6] {
-    self.my_mac
-  }
-
-  /// 本机 role tag（3 字节 ASCII）
-  #[must_use]
-  pub fn role_tag(&self) -> [u8; 3] {
-    self.role_tag
   }
 
   // ---- 主动出站 API（endpoint-initiated publishing）----
@@ -263,8 +220,9 @@ impl<L: CommLink> Receiver<L> {
   /// # 语义
   /// - `req_seq = 0`：表示"非请求触发"（与 [`ResponseBody::NonceHello`] 广播一致）
   /// - `key_id`：使用 keyring 当前 active key
-  /// - 覆盖式：若上一条上报还没被 [`run_broadcast_loop`] 消费，本次会覆盖它
-  ///   （高频上报场景通常只关心最新值；如需可靠队列请自行改用 channel）
+  /// - 有界队列：入 [`ResponseChannel`]（深度
+  ///   [`OUTBOUND_QUEUE_DEPTH`](crate::notifier::signals::OUTBOUND_QUEUE_DEPTH)）排队出站，
+  ///   不再像旧版覆盖式 Signal 那样把上一条挤掉；仅当队列满时才丢弃本次上报
   ///
   /// # 使用示例
   /// ```ignore
@@ -277,7 +235,7 @@ impl<L: CommLink> Receiver<L> {
       key_id: self.keyring.active(),
       body,
     };
-    self.response_signal.signal(resp);
+    crate::notifier::signals::enqueue_response(self.response_signal, resp);
   }
 
   /// 主动广播一条 [`Frame`]
@@ -325,60 +283,49 @@ impl<L: CommLink> Receiver<L> {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), body);
     // Endpoint 主动命令仍走广播（Phase 1 只单播 Notifier→Endpoint 的 AssignId）。
-    self
-      .command_signal
-      .signal(crate::notifier::signals::OutboundCommand::broadcast(
-        encode_command(&cmd),
-      ));
+    crate::notifier::signals::enqueue_command(
+      self.command_signal,
+      crate::notifier::signals::OutboundCommand::broadcast(encode_command(&cmd)),
+    );
   }
-}
 
-// ============================================================
-// 仅测试可见的构造入口
-// ============================================================
+  // ---- 后台 loop（门面自带；各吃一个 link 端）----
 
-/// 仅测试用：不依赖真实 link 构造一个 Receiver 实体
-///
-/// # 存在动机
-/// 生产 API `Receiver::builder()` 强制填入 `link`，且 link 会被 broadcast/receive
-/// loop 拿走 `&mut`。集成测试里 loop 已经用 `LoopbackSendEnd`/`LoopbackRecvEnd`
-/// spawn 掉了，此时若要**同时**验证 `Receiver::report()` / `Receiver::send_frame()`
-/// 等 `&self` API 的真实行为，就需要一个"只挂 signals & keyring、不占 link"的
-/// 轻量实体。
-///
-/// # `test-utils` feature 门控
-/// 只有开启 `test-utils` feature 时才能编译到，防止生产代码误用。
-///
-/// # 语义
-/// - `link` 用一个 dummy `()`——因此**不要**再把返回的实体拿去 spawn loop
-/// - `handler` / `frame_handler` 传 `None` 时用哨兵；本函数不消费入站帧，无所谓
-/// - 除 link 之外的字段与生产 build 完全一致
-#[cfg(feature = "test-utils")]
-#[allow(clippy::too_many_arguments)]
-#[must_use]
-pub fn test_receiver_from_parts(
-  keyring: &'static Keyring,
-  replay: &'static ReplayGuard,
-  response_signal: &'static ResponseSignal,
-  frame_signal: &'static FrameSignal,
-  command_signal: &'static CommandOutSignal,
-  role_tag: [u8; 3],
-  my_mac: [u8; 6],
-  my_id: &'static AtomicU8,
-  handler: CommandHandler,
-) -> Receiver<crate::link::DummyLink> {
-  Receiver {
-    link: crate::link::DummyLink,
-    keyring,
-    replay,
-    response_signal,
-    frame_signal,
-    command_signal,
-    role_tag,
-    my_mac,
-    my_id,
-    handler,
-    frame_handler: None,
+  /// 运行**广播 loop**（送出主动上行的 Frame / Command / Response）
+  ///
+  /// 门面版：消费自身三条出站通道，调用方只需传 **send 端** link。
+  pub async fn run_broadcast_loop<L: CommLink>(&self, link: L) -> !
+  where
+    L::Addr: From<[u8; 6]>,
+  {
+    run_broadcast_loop(
+      link,
+      self.frame_signal,
+      self.command_signal,
+      self.response_signal,
+    )
+    .await
+  }
+
+  /// 运行**接收 loop**（解码 / 抗重放 / 命令派发 / 自动回执）
+  ///
+  /// 门面版：从自身字段拼出 [`ReceiverRecvConfig`]，调用方只需传 **recv 端** link。
+  pub async fn run_receive_loop<L: CommLink>(&self, link: L) -> ! {
+    run_receive_loop(
+      link,
+      ReceiverRecvConfig {
+        keyring: self.keyring,
+        replay: self.replay,
+        response_signal: self.response_signal,
+        role_tag: self.role_tag,
+        my_mac: self.my_mac,
+        my_id: self.my_id,
+        handler: self.handler,
+        src: self.src,
+        frame_handler: self.frame_handler,
+      },
+    )
+    .await
   }
 }
 
@@ -386,13 +333,44 @@ pub fn test_receiver_from_parts(
 // 后台 loop
 // ============================================================
 
+/// [`run_receive_loop`] 的静态接线配置
+///
+/// 把接收 loop 需要的**共享 static 状态**与 handler 打包成一个 `Copy` 结构体，
+/// 替代原来的 9 个位置参数。好处：
+/// - 消掉 `#[allow(clippy::too_many_arguments)]`
+/// - 调用方用**具名字段**装配，避免同类型参数（`role_tag` / `my_mac` 等）被顺序写错
+///
+/// 本结构体**同时**充当 crate 内部派发模块的派发上下文（那边的 `DispatchCtx`
+/// 就是本类型的别名），因此接收 loop 无需再做一次逐字段搬运。
+#[derive(Clone, Copy)]
+pub struct ReceiverRecvConfig {
+  /// 共享 keyring（active key / seq）
+  pub keyring: &'static Keyring,
+  /// 抗重放窗口
+  pub replay: &'static ReplayGuard,
+  /// 出站响应队列（自动 Ack / 富回执）
+  pub response_signal: &'static ResponseChannel,
+  /// 本机 role tag（回 AnnounceReply 时携带）
+  pub role_tag: [u8; 3],
+  /// 本机 MAC（回 AnnounceReply / 判断 AssignId 目标时用）
+  pub my_mac: [u8; 6],
+  /// 收到 AssignId 后写入的 `receiver_id` 存储
+  pub my_id: &'static AtomicU8,
+  /// 用户业务命令处理器
+  pub handler: CommandHandler,
+  /// 本 loop 处理的所有入站帧默认来源（完整透传到 handler）
+  pub src: CommandSource,
+  /// 可选 Frame handler；`None` 时入站 `Frame` 被静默丢弃
+  pub frame_handler: Option<FrameHandler>,
+}
+
 /// 从 link 里连续 recv，解码 → 派发 → 自动回执
 ///
 /// # 入站帧处理
 /// - `Command`（`Announce` / `AssignId` / 业务命令）：解码 + HMAC + 抗重放 → 派发
 /// - `Frame`：解码 + `dest_mask` 过滤 → 可选 `frame_handler`
 /// - `Response`：**仅**消费 `NonceHello` 以同步 session nonce（K3 bootstrap，见
-///   [`crate::dispatch`]）；其余 Response 变体静默丢弃。这条路径让 Endpoint 无需
+///   crate 内部派发模块）；其余 Response 变体静默丢弃。这条路径让 Endpoint 无需
 ///   应用层介入即可与 Coordinator 对齐 HMAC nonce，是 Command 验签能通过的前提。
 ///
 /// # 适用场景
@@ -408,41 +386,29 @@ pub fn test_receiver_from_parts(
 /// ```ignore
 /// #[embassy_executor::task]
 /// async fn my_recv_task(link: MyLink) -> ! {
-///     comm::receiver::run_receive_loop(link, ...).await
+///     comm::receiver::run_receive_loop(
+///         link,
+///         comm::receiver::ReceiverRecvConfig {
+///             keyring: &KEYRING,
+///             replay: &REPLAY,
+///             response_signal: &RESP_SIG,
+///             role_tag: *b"led",
+///             my_mac: MY_MAC,
+///             my_id: &MY_ID,
+///             handler: on_command,
+///             src: comm::CommandSource::EspNow,
+///             frame_handler: Some(on_frame),
+///         },
+///     ).await
 /// }
 /// ```
-///
-/// # 参数
-/// - `src`：本 loop 处理的所有入站帧默认来源；完整透传到用户 handler
-/// - `frame_handler`：可选；`None` 时入站 `Frame` 被静默丢弃
-#[allow(clippy::too_many_arguments)]
-pub async fn run_receive_loop<L: CommLink>(
-  mut link: L,
-  keyring: &'static Keyring,
-  replay: &'static ReplayGuard,
-  response_signal: &'static ResponseSignal,
-  role_tag: [u8; 3],
-  my_mac: [u8; 6],
-  my_id: &'static AtomicU8,
-  handler: CommandHandler,
-  src: CommandSource,
-  frame_handler: Option<FrameHandler>,
-) -> ! {
-  let ctx = DispatchCtx {
-    keyring,
-    replay,
-    response_signal,
-    role_tag,
-    my_mac,
-    my_id,
-    handler,
-    src,
-    frame_handler,
-  };
+pub async fn run_receive_loop<L: CommLink>(mut link: L, cfg: ReceiverRecvConfig) -> ! {
+  // `ReceiverRecvConfig` 本身就是内部派发上下文（`DispatchCtx` 是它的别名），
+  // 直接原样传入，无需再逐字段搬运一遍。
   loop {
     let Ok(packet) = link.recv().await else {
       continue;
     };
-    dispatch_packet(packet.data, ctx);
+    dispatch_packet(packet.data, cfg);
   }
 }

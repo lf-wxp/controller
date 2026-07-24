@@ -150,13 +150,16 @@ pub fn run_heap_check() -> SelfTestStatus {
   SelfTestStatus::Ok
 }
 
-/// Codec: 用 protocol 做一次 encode -> decode round-trip
+/// Codec: 用 protocol 对 **Frame** 做一次 encode -> decode round-trip
 ///
-/// 若密钥未正确注入（例如全 0），`decode_frame` 会在 HMAC 校验时失败；
-/// 因此这一项能间接验证：
-///  - CRC 计算实现可用
-///  - HMAC 密钥已被正确 embed
-///  - 会话 nonce 已 init（这一点上层调用需先 init_session_nonce）
+/// **注意**：`Frame`（手柄状态广播）走的是 **CRC-only** 编码，**不含 HMAC / 会话
+/// nonce**（HMAC + nonce 只作用于 `Command` / `Response`，见 `protocol::codec`）。
+/// 因此本项**只**验证：
+///  - `encode_frame` / `decode_frame` 编解码对称
+///  - magic / version / CRC16 计算实现可用
+///
+/// 它**不能**验证密钥是否正确 embed 或 nonce 是否已 init —— 那些要靠真实
+/// Command/Response 流量在运行时暴露。
 pub fn run_codec_check() -> SelfTestStatus {
   let original = Frame::new(0x1234_5678, GamepadState::EMPTY);
   let bytes = encode_frame(&original);

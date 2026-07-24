@@ -75,7 +75,7 @@ pub struct Packet<'a, A> {
 /// comm 的派发逻辑只按 magic + 长度分流，**不会**按 `Packet::src` 过滤本机地址
 /// （`Addr` 是实现自选的泛型类型，crate 无法通用地与"本机地址"比较）。因此若
 /// 底层链路存在自回环（部分共享总线、TCP 广播被 hub 反射、某些 mesh 转发），
-/// 一个**双身份 `Notifier`**（[`crate::NotifierBuilder::with_command_handler`]）会：
+/// 一个**双身份 `Notifier`**（[`NotifierBuilder::with_command_handler`](crate::notifier::NotifierBuilder::with_command_handler)）会：
 /// - 收到自己广播的 `Announce` → 回 `AnnounceReply` → 再收到自己的 `AnnounceReply`
 ///   → 把**自己**登记成 peer 并给自己发 `AssignId`（自发现回环）
 /// - 收到自己 `send_command` 的回环 → 通过 anti-replay（新 seq）→ 在自己身上
@@ -124,9 +124,9 @@ pub trait CommLink {
 /// 仅测试可见的空 `CommLink` 实现
 ///
 /// # 用途
-/// 让 [`crate::receiver::test_receiver_from_parts`] 能在不真正持有物理链路
-/// 的前提下构造一个 [`crate::Receiver`] 实体，专门用于验证其
-/// `&self` 方法（`report` / `send_frame` / `send_command`）。
+/// 在不真正持有物理链路的前提下占位一个 [`CommLink`]，便于测试只关心
+/// `&self` 生产者 API（`report` / `send_frame` / `send_command`）而不想跑
+/// 真实收发 loop 的场景。
 ///
 /// # 语义
 /// - `send` 永远返回 `Ok(())`（吞掉数据）

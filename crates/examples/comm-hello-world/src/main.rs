@@ -37,9 +37,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use comm::loopback::{LoopbackRecvEnd, LoopbackSendEnd, pair};
-use comm::notifier::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
-use comm::notifier::{run_broadcast_loop, run_receive_loop as run_notifier_recv_loop};
-use comm::receiver::run_receive_loop as run_receiver_recv_loop;
+use comm::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
 use comm::{
   Command, CommandBody, CommandOutcome, CommandSource, ErrorCode, Frame, GamepadState, Keyring,
   Notifier, PeerRegistry, Receiver, ReplayGuard, Selector,
@@ -87,8 +85,8 @@ struct NotifierState {
   replay: &'static ReplayGuard,
   selector: &'static Selector,
   frame_sig: &'static FrameSignal,
-  cmd_sig: &'static CommandOutSignal,
-  resp_sig: &'static ResponseSignal,
+  cmd_sig: &'static CommandOutChannel,
+  resp_sig: &'static ResponseChannel,
 }
 
 impl NotifierState {
@@ -99,8 +97,8 @@ impl NotifierState {
       replay: Box::leak(Box::new(ReplayGuard::new())),
       selector: Box::leak(Box::new(Selector::broadcast_all())),
       frame_sig: Box::leak(Box::new(FrameSignal::new())),
-      cmd_sig: Box::leak(Box::new(CommandOutSignal::new())),
-      resp_sig: Box::leak(Box::new(ResponseSignal::new())),
+      cmd_sig: Box::leak(Box::new(CommandOutChannel::new())),
+      resp_sig: Box::leak(Box::new(ResponseChannel::new())),
     }
   }
 }
@@ -108,9 +106,9 @@ impl NotifierState {
 struct ReceiverState {
   keyring: &'static Keyring,
   replay: &'static ReplayGuard,
-  resp_sig: &'static ResponseSignal,
+  resp_sig: &'static ResponseChannel,
   frame_sig: &'static FrameSignal,
-  cmd_sig: &'static CommandOutSignal,
+  cmd_sig: &'static CommandOutChannel,
   my_id: &'static AtomicU8,
 }
 
@@ -119,9 +117,9 @@ impl ReceiverState {
     Self {
       keyring: Box::leak(Box::new(Keyring::new())),
       replay: Box::leak(Box::new(ReplayGuard::new())),
-      resp_sig: Box::leak(Box::new(ResponseSignal::new())),
+      resp_sig: Box::leak(Box::new(ResponseChannel::new())),
       frame_sig: Box::leak(Box::new(FrameSignal::new())),
-      cmd_sig: Box::leak(Box::new(CommandOutSignal::new())),
+      cmd_sig: Box::leak(Box::new(CommandOutChannel::new())),
       my_id: Box::leak(Box::new(AtomicU8::new(u8::MAX))),
     }
   }
@@ -129,12 +127,15 @@ impl ReceiverState {
 
 // ============================================================
 // spawn 4 个后台 loop：双端各自的 broadcast / recv
+//
+// 全部走**门面自带的 run 方法**——门面 link 无关，两条 loop 各吃一个 link 端，
+// 直接消费门面内部的 &'static 字段，调用方无需再手抄一堆参数。
 // ============================================================
 
 fn spawn_all_loops(
   pool: &LocalPool,
-  ns: &NotifierState,
-  rs: &ReceiverState,
+  notifier: &'static Notifier,
+  receiver: &'static Receiver,
   a_send: LoopbackSendEnd,
   a_recv: LoopbackRecvEnd,
   b_send: LoopbackSendEnd,
@@ -142,60 +143,20 @@ fn spawn_all_loops(
 ) {
   let spawner = pool.spawner();
 
-  // ---- Notifier 端 ----
-  let ns_frame = ns.frame_sig;
-  let ns_cmd = ns.cmd_sig;
-  let ns_resp = ns.resp_sig;
-  let ns_peers = ns.peers;
+  // ---- Notifier 端：持有 peers → Frame 单目标时自动单播 ----
   spawner
-    .spawn_local(async move {
-      // Notifier 侧传 Some(&PEERS)：Frame 单目标时自动单播
-      run_broadcast_loop(a_send, Some(ns_peers), ns_frame, ns_cmd, ns_resp).await;
-    })
+    .spawn_local(async move { notifier.run_broadcast_loop(a_send).await })
     .expect("spawn notifier broadcast_loop");
-
-  let ns_peers = ns.peers;
-  let ns_keyring = ns.keyring;
-  let ns_replay = ns.replay;
   spawner
-    .spawn_local(async move {
-      run_notifier_recv_loop(
-        a_recv, ns_peers, ns_cmd, ns_keyring, ns_replay, ns_resp, None, None,
-      )
-      .await;
-    })
+    .spawn_local(async move { notifier.run_receive_loop(a_recv).await })
     .expect("spawn notifier recv_loop");
 
-  // ---- Receiver 端 ----
-  let rs_frame = rs.frame_sig;
-  let rs_cmd = rs.cmd_sig;
-  let rs_resp = rs.resp_sig;
+  // ---- Receiver 端：无 peers → Frame 恒广播 ----
   spawner
-    .spawn_local(async move {
-      // Receiver 端无 PeerRegistry → 传 None → Frame 恒广播
-      run_broadcast_loop(b_send, None, rs_frame, rs_cmd, rs_resp).await;
-    })
+    .spawn_local(async move { receiver.run_broadcast_loop(b_send).await })
     .expect("spawn receiver broadcast_loop");
-
-  let rs_keyring = rs.keyring;
-  let rs_replay = rs.replay;
-  let rs_my_id = rs.my_id;
   spawner
-    .spawn_local(async move {
-      run_receiver_recv_loop(
-        b_recv,
-        rs_keyring,
-        rs_replay,
-        rs_resp,
-        RECEIVER_ROLE,
-        MAC_RECEIVER,
-        rs_my_id,
-        handle_command,
-        CommandSource::EspNow,
-        None,
-      )
-      .await;
-    })
+    .spawn_local(async move { receiver.run_receive_loop(b_recv).await })
     .expect("spawn receiver recv_loop");
 }
 
@@ -228,64 +189,59 @@ fn main() {
   let (a_send, a_recv, b_send, b_recv) = pair(MAC_NOTIFIER, MAC_RECEIVER);
 
   // ────────────────────────────────────────────────────────────────
-  // 展示：Notifier / Receiver builder（配置面）
+  // 门面：build 一次，`&'static` 化后**既跑后台 loop 又当生产者句柄**
   //
-  // Notifier / Receiver 结构体本身 = "配置聚合器 + 便捷 API"；
-  // 真正跑起来的是下方 spawn 的 4 个 free function loop。
-  // 这里 build 出来是为了展示"引入即用"的配置形态；实例本身在本
-  // demo 里不参与运行时（因为 loopback 一端的 endpoint 已经被 spawn 拿走了）。
+  // 门面 link 无关（不含 link 字段）；keyring / peers / signals 等 &'static 组件
+  // 都由 build 收进门面。之后：
+  // - 后台 loop：`notifier.run_broadcast_loop(send)` / `run_receive_loop(recv)`
+  // - 主循环生产：`notifier.discover()` / `send_command()` / `send_frame()`
   // ────────────────────────────────────────────────────────────────
-  let (demo_a_send, _demo_a_recv, demo_b_send, _demo_b_recv) = pair(MAC_NOTIFIER, MAC_RECEIVER);
-  let _notifier_config: Notifier<LoopbackSendEnd> = Notifier::builder()
-    .link(demo_a_send)
-    .keyring(ns.keyring)
-    .peers(ns.peers)
-    .replay(ns.replay)
-    .selector(ns.selector)
-    .frame_signal(ns.frame_sig)
-    .command_signal(ns.cmd_sig)
-    .response_signal(ns.resp_sig)
-    .build();
-  let _receiver_config: Receiver<LoopbackSendEnd> = Receiver::builder()
-    .link(demo_b_send)
-    .keyring(rs.keyring)
-    .replay(rs.replay)
-    .response_signal(rs.resp_sig)
-    .role_tag(RECEIVER_ROLE)
-    .mac(MAC_RECEIVER)
-    .my_id(rs.my_id)
-    .command_handler(handle_command)
-    .build();
-  println!("✓ Notifier::builder() / Receiver::builder() 配置面组装完毕");
+  let notifier: &'static Notifier = Box::leak(Box::new(
+    Notifier::builder()
+      .keyring(ns.keyring)
+      .peers(ns.peers)
+      .replay(ns.replay)
+      .selector(ns.selector)
+      .frame_signal(ns.frame_sig)
+      .command_signal(ns.cmd_sig)
+      .response_signal(ns.resp_sig)
+      .build(),
+  ));
+  let receiver: &'static Receiver = Box::leak(Box::new(
+    Receiver::builder()
+      .keyring(rs.keyring)
+      .replay(rs.replay)
+      .response_signal(rs.resp_sig)
+      .frame_signal(rs.frame_sig)
+      .command_signal(rs.cmd_sig)
+      .role_tag(RECEIVER_ROLE)
+      .mac(MAC_RECEIVER)
+      .my_id(rs.my_id)
+      .command_handler(handle_command)
+      .build(),
+  ));
+  println!("✓ Notifier / Receiver 门面组装完毕（link 无关，随后各喂一个 loopback 端）");
   println!();
 
   // ────────────────────────────────────────────────────────────────
-  // 真正的运行时：4 个后台 loop
+  // 真正的运行时：4 个后台 loop（全部由门面自带的 run 方法驱动）
   // ────────────────────────────────────────────────────────────────
   let mut pool = LocalPool::new();
-  spawn_all_loops(&pool, &ns, &rs, a_send, a_recv, b_send, b_recv);
+  spawn_all_loops(&pool, notifier, receiver, a_send, a_recv, b_send, b_recv);
 
   pool.run_until(async move {
     // ================================================================
     // 幕1：发现流程
     // ================================================================
     println!("① Notifier.discover() → Receiver 应自动回 AnnounceReply → Notifier 自动回 AssignId");
-    {
-      use protocol::{Command, CommandBody as CB, encode_command};
-      let seq = ns.keyring.next_seq();
-      let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig
-        .signal(comm::notifier::signals::OutboundCommand::broadcast(
-          encode_command(&cmd),
-        ));
-    }
+    notifier.discover();
     wait_for(
-      || rs.my_id.load(Ordering::Relaxed) != u8::MAX && ns.peers.len() == 1,
+      || receiver.assigned_id() != u8::MAX && notifier.peers().len() == 1,
       10_000,
       "discovery",
     )
     .await;
-    let assigned = rs.my_id.load(Ordering::Relaxed);
+    let assigned = receiver.assigned_id();
     println!("   ✓ 接收端拿到 receiver_id = {assigned}");
     println!("   ✓ 发送端 peer 目录已入库 1 条");
     println!();
@@ -294,23 +250,11 @@ fn main() {
     // 幕2：命令 + 自动 Ack
     // ================================================================
     println!("② Notifier.send_command(LedBlink count=3) → Receiver handler 触发");
-    {
-      use protocol::{Command, CommandBody as CB, encode_command};
-      let seq = ns.keyring.next_seq();
-      let cmd = Command::with_key(
-        seq,
-        ns.keyring.active(),
-        CB::LedBlink {
-          led_idx: 0,
-          count: 3,
-          period_ms: 100,
-        },
-      );
-      ns.cmd_sig
-        .signal(comm::notifier::signals::OutboundCommand::broadcast(
-          encode_command(&cmd),
-        ));
-    }
+    notifier.send_command(CommandBody::LedBlink {
+      led_idx: 0,
+      count: 3,
+      period_ms: 100,
+    });
     wait_for(
       || HANDLER_INVOCATIONS.load(Ordering::Relaxed) >= 1,
       10_000,
@@ -329,15 +273,13 @@ fn main() {
     // ================================================================
     println!("③ Notifier.send_frame(GamepadState) → 通过编排通道广播");
     {
-      use protocol::{ButtonBits, encode_frame};
+      use protocol::ButtonBits;
       let mut state = GamepadState::EMPTY;
       state.set_button(ButtonBits::Btn1, true);
       state.joy_x = 12_345;
       let seq = ns.keyring.next_seq();
       let frame = Frame::new(seq, state);
-      // 编码一次以校验（真实用法：notifier.send_frame(&frame) 内部即调用 signal）
-      let _wire = encode_frame(&frame);
-      ns.frame_sig.signal(frame);
+      notifier.send_frame(&frame);
     }
     // 状态帧接收端本 demo 未挂消费者，只需给 loop 一点时间把它 flush 出去
     for _ in 0..200 {
@@ -350,7 +292,7 @@ fn main() {
     // 汇总
     // ================================================================
     println!("──── 汇总 ────");
-    let snap = ns.peers.snapshot();
+    let snap = notifier.peers();
     println!("Notifier.peers.len()        = {}", snap.len());
     if let Some(peer) = snap.first() {
       println!("  peer[0].mac               = {:02X?}", peer.mac);
@@ -359,13 +301,18 @@ fn main() {
         core::str::from_utf8(peer.role_bytes()).unwrap_or("<non-utf8>"),
       );
     }
-    println!(
-      "Receiver.assigned_id        = {}",
-      rs.my_id.load(Ordering::Relaxed)
-    );
+    println!("Receiver.assigned_id        = {}", receiver.assigned_id());
     println!(
       "Handler invocations         = {}",
       HANDLER_INVOCATIONS.load(Ordering::Relaxed)
+    );
+    // 出站有界队列的丢弃可观测性（comm::metrics）——健康时应恒为 0
+    let drops = comm::metrics::snapshot();
+    println!(
+      "Dropped commands/responses  = {} / {}  (clean={})",
+      drops.commands,
+      drops.responses,
+      drops.is_clean(),
     );
     println!();
     println!("✅ 演示完成");

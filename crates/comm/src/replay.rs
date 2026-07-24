@@ -93,7 +93,7 @@ impl ReplayGuard {
   ///
   /// # 参数
   /// - `snapshot`：`KEY_SLOTS` 个 `AntiReplayWindow`，通常来自
-  ///   [`crate::hal::persist::PersistentConfig::replay_windows`]（手柄侧）
+  ///   手柄侧持久化配置的 `replay_windows`（应用 crate 提供）
   ///
   /// # 并发
   /// 在极短的 critical section 内完成一次赋值；不涉及 `.await`。

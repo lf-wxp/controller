@@ -1,7 +1,8 @@
 //! ESP-NOW 接收 / 广播（**基于 [`comm`] 门面**）
 //!
-//! 本模块承担 receiver 侧的空口全部工作，实现下沉给 [`comm::Receiver`] +
-//! [`comm::notifier::run_receive_loop`] + [`comm::notifier::run_broadcast_loop`]：
+//! 本模块承担 receiver 侧的空口全部工作，实现下沉给 [`comm::Receiver`] 门面：
+//! `start()` 里 `Receiver::builder()...build()` 组装一个 `&'static` 门面，两个
+//! 后台 task 分别调 [`Receiver::run_receive_loop`] / [`Receiver::run_broadcast_loop`]：
 //!
 //! - **Frame（`0xC71E`）**：comm 解码 + CRC + `dest_mask` 过滤后回调 [`on_frame`]，
 //!   更新 [`VM_WATCH`] 里的 [`ViewModel`]。
@@ -23,7 +24,7 @@
 //!  │ recv_loop_task           │   │ broadcast_loop_task        │
 //!  │  EspNowRecvLink          │   │  EspNowSendLink            │
 //!  │   ↓ recv_async           │   │   ↑ send_async             │
-//!  │  comm::run_receive_loop  │   │  comm::run_broadcast_loop  │
+//!  │  rx.run_receive_loop     │   │  rx.run_broadcast_loop     │
 //!  │   ↓ dispatch             │   │   ↓ select3                │
 //!  │  on_frame / on_command   │   │  FRAME_SIG / CMD / RESP    │
 //!  └──────────────────────────┘   └────────────────────────────┘
@@ -34,13 +35,13 @@
 
 use core::sync::atomic::AtomicU8;
 
-use comm::notifier::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
-use comm::receiver::{CommandHandler, FrameHandler, run_broadcast_loop, run_receive_loop};
-use comm::{Command, CommandOutcome, CommandSource, Frame, Keyring, ReplayGuard};
+use comm::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
+use comm::{Command, CommandOutcome, CommandSource, Frame, Keyring, Receiver, ReplayGuard};
 use defmt::info;
 use embassy_executor::Spawner;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
+use static_cell::StaticCell;
 
 use crate::display::ViewModel;
 use crate::link::{EspNowRecvLink, EspNowSendLink};
@@ -75,11 +76,11 @@ static MY_ID: AtomicU8 = AtomicU8::new(INITIAL_RECEIVER_ID);
 /// Frame 出站 Signal（本 receiver 不主动 send_frame，但 comm builder 强制填）。
 static FRAME_SIG: FrameSignal = FrameSignal::new();
 
-/// Command 出站 Signal（本 receiver 不主动发 Command）。
-static CMD_SIG: CommandOutSignal = CommandOutSignal::new();
+/// Command 出站有界队列（本 receiver 不主动发 Command）。
+static CMD_SIG: CommandOutChannel = CommandOutChannel::new();
 
-/// Response 出站 Signal（AnnounceReply / Ack 通过它推给 broadcast loop）。
-static RESP_SIG: ResponseSignal = ResponseSignal::new();
+/// Response 出站有界队列（AnnounceReply / Ack 通过它推给 broadcast loop）。
+static RESP_SIG: ResponseChannel = ResponseChannel::new();
 
 /// 状态视图广播：`Watch::new()` 是 `const fn`，可直接 `static`。
 ///
@@ -134,29 +135,21 @@ fn on_command(_src: CommandSource, _cmd: &Command) -> CommandOutcome {
 // 后台 task
 // ============================================================
 
-/// 接收 loop：从 [`EspNowRecvLink`] 一直 recv，comm 内部完成 dispatch。
+/// Receiver 门面单例：`start()` 里 `builder()...build()` 后 `init` 进来，
+/// 两个后台 task 各持一份 `&'static` 共享借用。
+static RECEIVER: StaticCell<Receiver> = StaticCell::new();
+
+/// 接收 loop：从 [`EspNowRecvLink`] 一直 recv，门面内部完成 dispatch。
 #[embassy_executor::task]
-async fn recv_loop_task(link: EspNowRecvLink, my_mac: [u8; 6]) -> ! {
-  run_receive_loop(
-    link,
-    &KEYRING,
-    &REPLAY,
-    &RESP_SIG,
-    ROLE_TAG,
-    my_mac,
-    &MY_ID,
-    on_command as CommandHandler,
-    CommandSource::EspNow,
-    Some(on_frame as FrameHandler),
-  )
-  .await
+async fn recv_loop_task(rx: &'static Receiver, link: EspNowRecvLink) -> ! {
+  rx.run_receive_loop(link).await
 }
 
 /// 广播 loop：three-way select FRAME/CMD/RESP，任一有信号即通过
 /// [`EspNowSendLink`] 广播出去。
 #[embassy_executor::task]
-async fn broadcast_loop_task(link: EspNowSendLink) -> ! {
-  run_broadcast_loop(link, &FRAME_SIG, &CMD_SIG, &RESP_SIG).await
+async fn broadcast_loop_task(rx: &'static Receiver, link: EspNowSendLink) -> ! {
+  rx.run_broadcast_loop(link).await
 }
 
 // ============================================================
@@ -190,9 +183,25 @@ pub fn start(
     "esp-now (comm-backed) starting, own_mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
     my_mac[0], my_mac[1], my_mac[2], my_mac[3], my_mac[4], my_mac[5]
   );
+  // 组装 Receiver 门面（link 无关）：keyring / replay / 三路 signal + handler 一次收拢。
+  // `src` 默认 EspNow；不设 selector（receiver 不做目标选择）。
+  let rx: &'static Receiver = RECEIVER.init(
+    Receiver::builder()
+      .keyring(&KEYRING)
+      .replay(&REPLAY)
+      .response_signal(&RESP_SIG)
+      .frame_signal(&FRAME_SIG)
+      .command_signal(&CMD_SIG)
+      .role_tag(ROLE_TAG)
+      .mac(my_mac)
+      .my_id(&MY_ID)
+      .command_handler(on_command)
+      .frame_handler(on_frame)
+      .build(),
+  );
   // embassy-executor 0.10: `Spawner::spawn` 返回 `()`；task 生成器本身返回
   // `Result<SpawnToken, SpawnError>`，因此 `?` 加在 task 调用上
-  spawner.spawn(recv_loop_task(recv_link, my_mac)?);
-  spawner.spawn(broadcast_loop_task(send_link)?);
+  spawner.spawn(recv_loop_task(rx, recv_link)?);
+  spawner.spawn(broadcast_loop_task(rx, send_link)?);
   Ok(&VM_WATCH)
 }

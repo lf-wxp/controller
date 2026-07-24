@@ -103,11 +103,4 @@ where
     let button = self.button.poll();
     JoystickReading { x, y, button }
   }
-
-  /// **仅用于诊断**：透传按下键的原始电平（未经 `active_high` 反转、未消抖）
-  ///
-  /// 用于验证接线极性与 `Button::new` 的 `active_high` 配置是否一致。
-  pub fn button_raw_is_high(&self) -> bool {
-    self.button.raw_is_high()
-  }
 }

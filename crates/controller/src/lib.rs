@@ -28,9 +28,9 @@ pub mod ui;
 /// 全局 Peer 目录 —— 手柄侧唯一的接收方注册表。
 ///
 /// 多个任务共享同一份 registry：
-/// - `transport::esp_now::esp_now_receive_task`：`AnnounceReply` 入库（写）
+/// - `transport::esp_now::esp_now_notifier_recv_task`：`AnnounceReply` 入库（写，经 comm 门面）
 /// - `ui::selector`：候选列表快照（读）
-/// - `bin/main`：启动自检 / 空态判断（读）
+/// - `bin/main`：启动自检 / 空态判断 / 进入选择器前 `prune`（读写）
 ///
 /// `PeerRegistry::new()` 是 `const fn`，可静态初始化（内部
 /// `Mutex<CriticalSectionRawMutex, RefCell<..>>` 提供关中断互斥）。

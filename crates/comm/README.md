@@ -52,7 +52,7 @@
 | 维度 | `Notifier`（**Coordinator**） | `Receiver`（**Endpoint**） |
 |---|---|---|
 | 拥有 `PeerRegistry` | ✅ 目录权威方 | ❌ 无目录 |
-| 拥有 `Selector` | ✅ 决定下发目标 | ❌ 无决策权 |
+| 可选持有 `Selector` | ✅ UI 侧目标位图助手（不自动作用于发送）| ❌ |
 | 主动 `discover()` | ✅ 发起会话 | ❌ 只能被动响应 |
 | 首次遇到新 peer 时回 `AssignId` | ✅ 自动 | ❌ 只接收 `AssignId` |
 | 主动 `send_frame` / `report` | ✅ | ✅ |
@@ -65,11 +65,11 @@
 为方便新代码选择更精确的命名，crate 提供两个 zero-cost 类型别名：
 
 ```rust
-pub type Coordinator<L> = Notifier<L>;
-pub type Endpoint<L> = Receiver<L>;
+pub type Coordinator = Notifier;
+pub type Endpoint = Receiver;
 ```
 
-新老写法完全互通。
+新老写法完全互通。门面**不含 link 泛型**——见下方"门面 = link 无关句柄"。
 
 ### 三种帧
 
@@ -90,42 +90,57 @@ pub type Endpoint<L> = Receiver<L>;
 comm = { version = "0.2", default-features = false }
 ```
 
+### 门面 = link 无关句柄
+
+门面（`Notifier` / `Receiver`）**不持有 link**：真实设备把一个 `CommLink` 拆成
+**send / recv 两个端**（各归一个 task），门面只收拢 `&'static` 共享状态。`build()`
+一次后 `&'static` 化，门面**既跑后台 loop 又当生产者句柄**：
+
+- 后台 loop：`facade.run_broadcast_loop(send_link)` / `facade.run_receive_loop(recv_link)`
+- 主循环生产：`notifier.discover()` / `send_command()` / `send_frame()`；`receiver.report()`
+
+（需要把 send / recv 拆到不同 task 又不想过门面的高级用户，仍可直接调
+`notifier::run_broadcast_loop` 等自由函数 + `NotifierRecvConfig` / `ReceiverRecvConfig`。）
+
 ### Coordinator 端（controller / notifier）
 
 ```rust,ignore
-use core::sync::atomic::AtomicU8;
 use comm::prelude::*;
-use comm::notifier::signals::{FrameSignal, CommandOutSignal, ResponseSignal};
+use comm::notifier::signals::{FrameSignal, CommandOutChannel, ResponseChannel};
 
 // 1. 用户 crate 里声明 static 状态
 static KEYRING: Keyring = Keyring::new();
 static PEERS: PeerRegistry = PeerRegistry::new();
 static REPLAY: ReplayGuard = ReplayGuard::new();
-static SELECTOR: Selector = Selector::new();
 static FRAME_SIG: FrameSignal = FrameSignal::new();
-static CMD_SIG: CommandOutSignal = CommandOutSignal::new();
-static RESP_SIG: ResponseSignal = ResponseSignal::new();
+static CMD_SIG: CommandOutChannel = CommandOutChannel::new();
+static RESP_SIG: ResponseChannel = ResponseChannel::new();
+static NOTIFIER: static_cell::StaticCell<Notifier> = static_cell::StaticCell::new();
 
-// 2. 用 builder 组装
-let notifier = Notifier::builder()
-    .link(my_link)                 // 必填：自定义 CommLink 实现
-    .keyring(&KEYRING)
-    .peers(&PEERS)
-    .replay(&REPLAY)
-    .selector(&SELECTOR)
-    .frame_signal(&FRAME_SIG)
-    .command_signal(&CMD_SIG)
-    .response_signal(&RESP_SIG)
-    .build();
+// 2. 用 builder 组装（不含 link），`&'static` 化
+//    selector 可选：它只是 UI 侧的目标位图容器，不会自动作用于发送，故此处省略。
+let notifier: &'static Notifier = NOTIFIER.init(
+    Notifier::builder()
+        .keyring(&KEYRING)
+        .peers(&PEERS)
+        .replay(&REPLAY)
+        .frame_signal(&FRAME_SIG)
+        .command_signal(&CMD_SIG)
+        .response_signal(&RESP_SIG)
+        .build(),
+);
 
-// 3. spawn 两个后台任务（broadcast + receive）
-// 具体 spawn 代码见 `notifier::run_broadcast_loop` / `notifier::run_receive_loop`
+// 3. 两条后台 loop 各喂一个 link 端（send / recv 分属两个 task）
+#[embassy_executor::task]
+async fn bcast(n: &'static Notifier, link: MySendLink) -> ! { n.run_broadcast_loop(link).await }
+#[embassy_executor::task]
+async fn recv(n: &'static Notifier, link: MyRecvLink) -> ! { n.run_receive_loop(link).await }
 
 // 4. 主循环 API
 notifier.discover();                    // 主动发起一次发现
 for peer in notifier.peers() { /* ... */ } // peers() 直接返回 PeerInfo 快照 Vec
-notifier.select_targets(0b0000_0011);   // 选择 receiver 0 + 1
-notifier.send_frame(&frame);            // 广播状态帧
+// 寻址取自帧自带的 dest_mask（选中 receiver 0 + 1）；单目标会透明升级为单播。
+notifier.send_frame(&Frame::with_dest(seq, state, 0b0000_0011));
 ```
 
 ### Endpoint 端（led / motor / srv…）
@@ -133,14 +148,15 @@ notifier.send_frame(&frame);            // 广播状态帧
 ```rust,ignore
 use core::sync::atomic::AtomicU8;
 use comm::prelude::*;
-use comm::notifier::signals::{FrameSignal, CommandOutSignal, ResponseSignal};
+use comm::notifier::signals::{FrameSignal, CommandOutChannel, ResponseChannel};
 
 static KEYRING: Keyring = Keyring::new();
 static REPLAY: ReplayGuard = ReplayGuard::new();
 static FRAME_SIG: FrameSignal = FrameSignal::new();
-static CMD_SIG: CommandOutSignal = CommandOutSignal::new();
-static RESP_SIG: ResponseSignal = ResponseSignal::new();
+static CMD_SIG: CommandOutChannel = CommandOutChannel::new();
+static RESP_SIG: ResponseChannel = ResponseChannel::new();
 static MY_ID: AtomicU8 = AtomicU8::new(u8::MAX); // UNASSIGNED_ID
+static RECEIVER: static_cell::StaticCell<Receiver> = static_cell::StaticCell::new();
 
 fn handle_command(_src: CommandSource, cmd: &Command) -> CommandOutcome {
     match cmd.kind {
@@ -152,20 +168,21 @@ fn handle_command(_src: CommandSource, cmd: &Command) -> CommandOutcome {
     }
 }
 
-let receiver = Receiver::builder()
-    .link(my_link)
-    .keyring(&KEYRING)
-    .replay(&REPLAY)
-    .response_signal(&RESP_SIG)
-    .frame_signal(&FRAME_SIG)
-    .command_signal(&CMD_SIG)
-    .role_tag(*b"led")
-    .mac(MY_MAC)
-    .my_id(&MY_ID)
-    .command_handler(handle_command)
-    .build();
+let receiver: &'static Receiver = RECEIVER.init(
+    Receiver::builder()
+        .keyring(&KEYRING)
+        .replay(&REPLAY)
+        .response_signal(&RESP_SIG)
+        .frame_signal(&FRAME_SIG)
+        .command_signal(&CMD_SIG)
+        .role_tag(*b"led")
+        .mac(MY_MAC)
+        .my_id(&MY_ID)
+        .command_handler(handle_command)
+        .build(),
+);
 
-// spawn `receiver::run_broadcast_loop` + `receiver::run_receive_loop`
+// 两条后台 loop：receiver.run_broadcast_loop(send) + receiver.run_receive_loop(recv)
 ```
 
 > AnnounceReply / Ack / HMAC / anti-replay 全部由 crate 自动完成，业务只关心 `handle_command`。
@@ -178,8 +195,8 @@ let receiver = Receiver::builder()
 
 | 类型 | 作用 |
 |---|---|
-| [`Notifier<L>`] / [`Coordinator<L>`] | 发送端门面，持有 `PeerRegistry` / `Selector` |
-| [`Receiver<L>`] / [`Endpoint<L>`] | 接收端门面，持有 `command_handler` |
+| [`Notifier`] / [`Coordinator`] | 发送端门面（link 无关句柄），持有 `PeerRegistry`，可选持有 `Selector` |
+| [`Receiver`] / [`Endpoint`] | 接收端门面（link 无关句柄），持有 `command_handler` |
 | [`CommLink`] | **唯一**硬件抽象 trait |
 
 ### Notifier 方法
@@ -190,8 +207,8 @@ let receiver = Receiver::builder()
 | 主动出站（**单播**） | `send_command_to(receiver_id, CommandBody)` / `send_command_to_mac(mac, CommandBody)` |
 | 发现 | `discover()` — 广播一次 `Announce` |
 | Peer 目录 | `peers()` — 返回 `PeerInfo` 只读快照 `Vec`（非借出 registry） |
-| 目标选择 | `select_targets(mask)` / `selector()` |
-| Getter | `response_signal()` / `keyring()` |
+| 目标选择（可选 `Selector` 容器；不自动作用于发送，寻址取自 `Frame::dest_mask`） | `select_targets(mask)` / `selector()` |
+| 会话 | `rotate_key(KeyId)` / `init_session(&mut entropy)` |
 
 > 广播与单播的语义差异、可靠性、以及使用注意，见下文 [命令寻址：广播 vs 单播](#命令寻址广播-vs-单播)。
 
@@ -201,17 +218,34 @@ let receiver = Receiver::builder()
 |---|---|
 | 主动出站 | `report(ResponseBody)` / `send_frame(&Frame)` / `send_command(_)` ⚠️ |
 | 状态 | `assigned_id()` — 已分配的 `receiver_id`（`u8::MAX` 表未分配） |
-| Getter | `response_signal()` / `keyring()` / `my_mac()` / `role_tag()` |
 
 ### 后台 loop
+
+推荐直接用门面方法 `notifier.run_broadcast_loop(link)` / `run_receive_loop(link)`
+（`Receiver` 同名）——它们只是下面自由函数的糖，自动从门面字段拼参数。自由函数
+仍公开，供不过门面的高级场景使用。
 
 | 函数 | 作用 |
 |---|---|
 | `notifier::run_broadcast_loop` | 三路 select（Frame + Command + Response） → `CommLink::send`；入参 `peers: Option<&PeerRegistry>`，`Some(&PEERS)` 时 **Frame 按 `dest_mask` 自动单播/广播**（见下文） |
-| `notifier::run_receive_loop` | `CommLink::recv` → 派发（Response upsert peers / 可选 Command 双身份） |
+| `notifier::run_receive_loop` | `CommLink::recv` → 派发（Response upsert peers / 可选 Command 双身份）；参数打包成 `NotifierRecvConfig` |
 | `receiver::run_broadcast_loop` | 复用 notifier 侧同名实现（一份代码两处用）；Endpoint 无目录，wrapper 恒传 `peers = None` → Frame 恒广播，签名保持 4 参不变 |
-| `receiver::run_receive_loop` | `CommLink::recv` → 派发（Announce 自动回 / AssignId 写 `my_id` / 业务 handler） |
-| `notifier::run_nonce_broadcast_loop` | 周期广播 session nonce（K3 密钥派生的组成部分） |
+| `receiver::run_receive_loop` | `CommLink::recv` → 派发（Announce 自动回 / AssignId 写 `my_id` / 业务 handler）；参数打包成 `ReceiverRecvConfig`（同时充当内部 `DispatchCtx`） |
+| `notifier::run_nonce_broadcast_loop` | 周期广播 session nonce（K3 密钥派生的组成部分）；门面糖为 `notifier.run_nonce_broadcast_loop(interval)`，直接复用门面持有的 `response_signal`，无需手抄 `&'static` 引用 |
+
+### 可观测性：出站队列丢弃计数（`comm::metrics`）
+
+Command / Response 走深度 `OUTBOUND_QUEUE_DEPTH` 的有界 FIFO，队列满时
+`try_send` **静默丢弃当前这条**。`comm::metrics` 用两枚进程级 `AtomicU32`
+把丢弃暴露出来，供健康巡检：
+
+| API | 作用 |
+|---|---|
+| `metrics::dropped_commands()` / `dropped_responses()` | 读累计丢弃计数 |
+| `metrics::snapshot() -> DropCounts` | 一次性取两枚计数（`DropCounts::is_clean()` 判无丢弃） |
+| `metrics::reset()` | 清零（巡检窗口切换 / 测试隔离） |
+
+只在真正丢弃时 `fetch_add(Relaxed)`，正常路径零开销。
 
 ### Prelude
 
@@ -231,7 +265,7 @@ use comm::prelude::*;
 | `defmt` | ❌ | 全类型 & dispatch 静默丢弃点接入 `defmt` 日志 | field debug / logic-analyzer 场景 |
 | `serde` | ❌ | 与 `protocol/serde` 联动，`PeerInfo` 等可 (de)serialize | Dashboard / gRPC bridge |
 | `loopback` | ❌ | 内置一个 `std::sync::mpsc` 版 `CommLink`（`LoopbackLink::pair`） | host 端集成测试 / 演示 |
-| `test-utils` | ❌ | 暴露 `DummyLink` + `test_receiver_from_parts` 等测试 fixture | 集成测试 / 依赖侧单元测试 |
+| `test-utils` | ❌ | 暴露 `DummyLink` 等测试 fixture | 集成测试 / 依赖侧单元测试 |
 | `endpoint-initiated-command` | ❌ | ⚠️ 开启 `Receiver::send_command` — Endpoint 主动发 Command | 特殊拓扑（多 Coordinator / 对等发现） |
 
 启用示例：
@@ -270,7 +304,7 @@ let notifier = Notifier::builder()
 
 ## 命令寻址：广播 vs 单播
 
-Coordinator 下发的 `Command` 可以选择**广播给全网**或**单播给某一台** receiver。寻址信息由 `CommandOutSignal` 的载荷 [`OutboundCommand`] 携带（`dest: CommandDest { Broadcast | Unicast([u8; 6]) }` + 已编码字节），由 `run_broadcast_loop` 在出站时解释。
+Coordinator 下发的 `Command` 可以选择**广播给全网**或**单播给某一台** receiver。寻址信息由 `CommandOutChannel` 的载荷 [`OutboundCommand`] 携带（`dest: CommandDest { Broadcast | Unicast([u8; 6]) }` + 已编码字节），由 `run_broadcast_loop` 在出站时解释。
 
 | 方法 | 目标 | 底层寻址 | 可靠性 |
 |---|---|---|---|
@@ -291,14 +325,14 @@ notifier.send_command_to_mac(peer.mac, CommandBody::ShowToast { len, bytes });
 
 **可靠性**：单播走 ESP-NOW 单播地址，能拿到 MAC 层 ACK；`run_broadcast_loop` 在 `send` 返回 `Err` 时再做 `MAX_UNICAST_SEND_RETRIES` 次有界补发。首次单播到某个未登记 MAC 时，链路侧（如 ESP-NOW）需惰性 `add_peer`——这属于 `CommLink` 实现细节，`comm` 只负责传目标地址。
 
-> **⚠️ 覆盖式信号，勿在紧凑循环里连发多台**
-> `CommandOutSignal` 是 embassy `Signal`（后写覆盖前写）。连续 `send_command_to(a)` → `send_command_to(b)` 若快过 `broadcast_loop` 消费，**只有最后一条能出站**。要"发给多台"请分帧节流（每帧一台），或等命令出站通道升级为有界队列后再支持真正的组播。
+> **有界队列，可组播，但一轮突发别超过队列深度**
+> `CommandOutChannel` 是深度 `OUTBOUND_QUEUE_DEPTH`（默认 4）的 embassy `Channel`（FIFO）。连续 `send_command_to(a)` → `send_command_to(b)` 会**逐条排队出站**，不再像旧版覆盖式 `Signal` 那样只剩最后一条。唯一约束是**单轮突发别超过队列深度**：超出的那几条 `try_send` 会被丢弃。要发给很多台请分帧节流，或在自己 crate 里声明更深的 `Channel` 静态实例。
 
 > **接收端配套**：单播只解决"送到哪台"。receiver 侧仍需在自己的 `command_handler` 里对相应 `CommandBody` 分支写执行逻辑——`comm` 只自动处理 `Announce` / `AssignId`，业务命令默认不执行（返回 `NoReply` 即被忽略）。
 
 ### Frame 寻址：由 `dest_mask` 自动派生的单播 / 广播
 
-`Command` 的寻址是**显式**的（`CommandDest`）；而高频状态流 `Frame` 的寻址是**自动**的——`send_frame(&frame)` 的调用方无需改动，`run_broadcast_loop`（Notifier 侧传入 `Some(&PEERS)`）会在每帧出站前依据其 `dest_mask` 决策：
+`Command` 的寻址是**显式**的（`CommandDest`）；而高频状态流 `Frame` 的寻址是**自动**的——寻址完全取自**帧自带的 `dest_mask`**，`run_broadcast_loop`（Notifier 侧传入 `Some(&PEERS)`）会在每帧出站前依据它决策（`select_targets` 只维护可选 `Selector` 容器的值，**不**会改写待发送的帧）：
 
 | `dest_mask` 情况 | 出站方式 | 理由 |
 |---|---|---|
@@ -307,17 +341,15 @@ notifier.send_command_to_mac(peer.mac, CommandBody::ShowToast { len, bytes });
 | 0 个 bit / ≥2 个 bit / 全选（`u32::MAX`） | 广播 | `Frame` 是高频流，**绝不** fan-out 成 N 条单播（会拖垮出站节拍） |
 
 ```rust,ignore
-// 单目标：只选中 receiver_id=2 → send_frame 透明升级为单播（若该 id 的 MAC 已知）
-notifier.select_targets(1 << 2);
-notifier.send_frame(&frame);
+// 单目标：帧的 dest_mask 只选中 receiver_id=2 → send_frame 透明升级为单播（若该 id 的 MAC 已知）
+notifier.send_frame(&Frame::with_dest(seq, state, 1 << 2));
 
 // 多目标 / 全选 → 保持广播
-notifier.select_targets(comm::selector::DEST_MASK_ALL);
-notifier.send_frame(&frame);
+notifier.send_frame(&Frame::with_dest(seq, state, comm::selector::DEST_MASK_ALL));
 ```
 
 **要点**：
-- 决策由 `dest_mask` 派生，**不是**新的显式 API，也不是全局开关——`bit-i ↔ receiver_id == i`，与 `Frame::is_addressed_to` / `Selector` 位映射一致。
+- 决策由**帧自带的** `dest_mask` 派生，**不是**新的显式 API，也不是全局开关——`bit-i ↔ receiver_id == i`，与 `Frame::is_addressed_to` / `Selector` 位映射一致。
 - 单播帧**仍携带原 `dest_mask`**，故接收端的 `dest_mask` 过滤（被选中的那台 bit 已置位）照常放行，收发行为不变。
 - Endpoint（Receiver）侧无 `PeerRegistry`，`receiver::run_broadcast_loop` 恒传 `peers = None`，Frame **一律广播**。
 
@@ -335,7 +367,7 @@ receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 **语义**：
 - `req_seq = 0`，表示"非请求触发"
 - `key_id` 使用 keyring 当前 active key
-- 覆盖式：若上一条上报还没被 `run_broadcast_loop` 消费，本次会覆盖它
+- 有界队列：上报进 `ResponseChannel`（深度 `OUTBOUND_QUEUE_DEPTH`）排队出站，不再互相覆盖；仅当队列满时才丢弃本次上报
 
 Notifier 侧通过 `NotifierBuilder::with_response_handler(...)` 订阅（详见 `notifier::builder` doc）。
 
@@ -397,18 +429,26 @@ let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
 // a_send + a_recv 组成 notifier 端；b_send + b_recv 组成 receiver 端
 ```
 
-需要**只测 Receiver `&self` API**（`report` / `send_frame` / …）而不消费真实 link 时，用 `test_receiver_from_parts`：
+需要**只测 Receiver `&self` API**（`report` / `send_frame` / …）时，门面已
+link 无关，直接用 `Receiver::builder()` 拼一个实体即可（无需持有物理 link）：
 
 ```rust,ignore
-let receiver: comm::Receiver<comm::link::DummyLink> =
-    comm::receiver::test_receiver_from_parts(
-        &KEYRING, &REPLAY, &RESP_SIG, &FRAME_SIG, &CMD_SIG,
-        *b"led", MAC_B, &MY_ID, handle_command,
-    );
+let receiver: comm::Receiver = comm::Receiver::builder()
+    .keyring(&KEYRING)
+    .replay(&REPLAY)
+    .response_signal(&RESP_SIG)
+    .frame_signal(&FRAME_SIG)
+    .command_signal(&CMD_SIG)
+    .role_tag(*b"led")
+    .mac(MAC_B)
+    .my_id(&MY_ID)
+    .command_handler(handle_command)
+    .src(comm::CommandSource::Local)
+    .build();
 receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 ```
 
-参考 `tests/integration.rs` 里的 8 个端到端场景。
+参考 `tests/integration.rs` 里的端到端场景。
 
 ---
 
@@ -446,7 +486,7 @@ receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 - **协议逻辑复用 `protocol`** — 本 crate 只负责编排
 - **零 heap 分配** — 所有集合走 `heapless::Vec<T, N>`
 - **编译期尺寸护栏** — `Frame` / `Command` / `CommandResponse` / `PeerInfo` 有 `size_of` 断言，防止意外膨胀
-- **实用主义 builder** — 8 个必填字段用 `Option` + `expect`，而非 typestate 展开 `2^8` impl
+- **实用主义 builder** — 必填字段用 `Option` + `expect`，而非 typestate 展开 `2^n` impl
 - **危险 API 加 feature 门控** — `endpoint-initiated-command` 是 opt-in 的显式选择
 
 ---
@@ -464,8 +504,8 @@ receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 MIT。详见 [`LICENSE`](../../LICENSE)。
 
 [`CommLink`]: https://docs.rs/comm/latest/comm/trait.CommLink.html
-[`Notifier<L>`]: https://docs.rs/comm/latest/comm/struct.Notifier.html
-[`Receiver<L>`]: https://docs.rs/comm/latest/comm/struct.Receiver.html
+[`Notifier`]: https://docs.rs/comm/latest/comm/struct.Notifier.html
+[`Receiver`]: https://docs.rs/comm/latest/comm/struct.Receiver.html
 [`OutboundCommand`]: https://docs.rs/comm/latest/comm/notifier/signals/struct.OutboundCommand.html
-[`Coordinator<L>`]: https://docs.rs/comm/latest/comm/type.Coordinator.html
-[`Endpoint<L>`]: https://docs.rs/comm/latest/comm/type.Endpoint.html
+[`Coordinator`]: https://docs.rs/comm/latest/comm/type.Coordinator.html
+[`Endpoint`]: https://docs.rs/comm/latest/comm/type.Endpoint.html

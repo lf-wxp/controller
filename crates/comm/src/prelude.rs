@@ -19,6 +19,9 @@ pub use crate::peer_registry::{PeerInfo, PeerRegistry};
 pub use crate::replay::ReplayGuard;
 pub use crate::selector::{DEST_MASK_ALL, DEST_MASK_NONE, DestMask, Selector};
 
+// 观测：丢弃计数快照（`comm::metrics::snapshot()` 的返回类型）
+pub use crate::metrics::DropCounts;
+
 // 协议类型
 pub use protocol::{
   Command, CommandBody, CommandResponse, ErrorCode, Frame, GamepadState, KeyId, ResponseBody,

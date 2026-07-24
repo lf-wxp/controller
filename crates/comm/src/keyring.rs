@@ -81,8 +81,8 @@ impl Keyring {
   ///
   /// # Fallback
   /// `active` 字段在 [`Self::rotate_to`] 侧已经过范围与 slot 使能校验；
-  /// 若原子字段被外部意外破坏，退回 [`FALLBACK_SLOT`] 对应的 `KeyId`（默认即
-  /// [`DEFAULT_KEY_ID`]），与 [`Self::next_seq`] 的 fallback 策略保持一致。
+  /// 若原子字段被外部意外破坏，退回 `FALLBACK_SLOT` 对应的 `KeyId`（默认即
+  /// `DEFAULT_KEY_ID`），与 [`Self::next_seq`] 的 fallback 策略保持一致。
   #[must_use]
   pub fn active(&self) -> KeyId {
     let raw = self.active.load(Ordering::Relaxed);
@@ -116,12 +116,12 @@ impl Keyring {
   /// 获取当前 active slot 的下一个 seq（原子 fetch_add）
   ///
   /// # 语义
-  /// - 返回值**恒 `>= 1`**；`0` 保留给"未初始化"哨兵，[`Self::bump_nonzero`]
+  /// - 返回值**恒 `>= 1`**；`0` 保留给"未初始化"哨兵，`bump_nonzero`
   ///   会在计数器绕回 `u32::MAX → 0` 时自动跳过它
   /// - `wrapping_add`：即使溢出也不 panic；`AntiReplayWindow` 已经能处理边界
   ///
   /// # Fallback
-  /// 若 `active` 字段意外越界，退回 [`FALLBACK_SLOT`] 的 tx_counter，与
+  /// 若 `active` 字段意外越界，退回 `FALLBACK_SLOT` 的 tx_counter，与
   /// [`Self::active`] 的 fallback 策略同源。
   #[must_use]
   pub fn next_seq(&self) -> u32 {

@@ -7,7 +7,7 @@
 //! ## 输入
 //! - 摇杆 X 轴：IO32（ADC1_CH4）
 //! - 摇杆 Y 轴：IO33（ADC1_CH5）
-//! - 摇杆按钮：IO12  ⚠️ strapping pin，需 Pull::Down
+//! - 摇杆按钮：IO12  ⚠️ strapping pin；按下拉低接法，需 Pull::Up + active_high=false
 //! - 按钮 1-4  ：IO27 / IO13 / IO25 / IO23，按下拉低，使用内部上拉
 //! - 彩灯输出  ：IO15  ⚠️ strapping pin；4 颗并联彩灯（阳极接 IO15、阴极接 GND）驱动脚，推挽输出置高点亮（详见 pins::COLOR_LED）
 //! - 旋钮 1    ：IO36（ADC1_CH0，SENSOR_VP）
@@ -118,6 +118,21 @@ pub mod tuning {
   pub const INPUT_SCAN_INTERVAL_MS: u64 = 10;
   /// 发送周期（毫秒，33ms ≈ 30Hz）
   pub const TRANSMIT_INTERVAL_MS: u64 = 33;
+
+  // ==== 接收方发现 ====
+  /// 目标选择器候选列表的 peer 陈旧阈值（毫秒）
+  ///
+  /// 进入 Selecting、广播 `Announce` **之前**，先淘汰 `last_seen` 早于此阈值的
+  /// 接收方（`REGISTRY.prune`），避免候选列表长期残留早已离线的设备。仍在线的
+  /// 接收方会在本轮 `AnnounceReply` 中立即重新入库，故设一个略宽于一次发现往返的
+  /// 值即可。
+  ///
+  /// # 为什么只在发现前 prune、而非后台周期 prune
+  /// 发现是**用户驱动的低频操作**，`last_seen` 只在发现时被 `AnnounceReply` 刷新。
+  /// 若改用后台周期 prune，会在两次发现之间把**仍在线**的 peer 也一并清空（它们
+  /// 那段时间根本没被 solicit、last_seen 自然变旧）。只有"发现前 prune + 紧随其后
+  /// 重新广播 Announce"这一顺序才语义正确。
+  pub const PEER_STALE_TTL_MS: u64 = 30_000;
 }
 
 /// OLED 显示屏配置

@@ -18,7 +18,7 @@
 //! 为避免长参数列表触发 `clippy::too_many_arguments`，把不可变的运行时上下文
 //! 打包成 [`DispatchCtx`]（`Copy`）传入。
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::Ordering;
 
 use protocol::{
   COMMAND_LEN, COMMAND_MAGIC, Command, CommandBody, CommandDecodeError, CommandResponse, FRAME_LEN,
@@ -26,33 +26,21 @@ use protocol::{
   init_session_nonce, peek_nonce_hello, session_nonce,
 };
 
-use crate::keyring::Keyring;
-use crate::notifier::signals::ResponseSignal;
-use crate::receiver::{CommandHandler, CommandOutcome, CommandSource, FrameHandler, UNASSIGNED_ID};
-use crate::replay::ReplayGuard;
+use crate::notifier::signals::enqueue_response;
+use crate::receiver::{CommandOutcome, UNASSIGNED_ID};
 
 /// 命令帧派发所需的静态上下文
 ///
-/// # 生命周期
-/// 全部字段都是 `&'static` 引用或 `Copy` 值；结构体自身 `Copy`，可以随意传递。
+/// 派发上下文与接收 loop 的公开配置**字段完全相同**（同为 `keyring / replay /
+/// response_signal / role_tag / my_mac / my_id / handler / src / frame_handler`），
+/// 因此二者合一：直接复用公开的 [`ReceiverRecvConfig`](crate::receiver::ReceiverRecvConfig)
+/// 作为内部派发上下文，避免维护两份镜像结构体 + 一次逐字段搬运。
 ///
-/// # `frame_handler`
-/// `Option<FrameHandler>`：为 `None` 时 [`dispatch_frame`] 静默丢弃 Frame（零成本）；
-/// 为 `Some` 时会做 `dest_mask` 过滤，仅当命中本机 `my_id` 或帧携带广播 mask
-/// 时才投递给业务闭包。
-#[derive(Clone, Copy)]
-pub(crate) struct DispatchCtx {
-  pub(crate) keyring: &'static Keyring,
-  pub(crate) replay: &'static ReplayGuard,
-  pub(crate) response_signal: &'static ResponseSignal,
-  pub(crate) role_tag: [u8; 3],
-  pub(crate) my_mac: [u8; 6],
-  pub(crate) my_id: &'static AtomicU8,
-  pub(crate) handler: CommandHandler,
-  pub(crate) src: CommandSource,
-  /// 可选的 Frame handler；`None` 表示本 endpoint 不消费入站 `Frame`
-  pub(crate) frame_handler: Option<FrameHandler>,
-}
+/// - `Receiver` 路径：`run_receive_loop` 把 `cfg` 原样传进来。
+/// - 双身份 `Notifier` 路径：从 `CommandHandlerConfig` + 共享 static 现拼一个。
+///
+/// 全部字段都是 `&'static` 引用或 `Copy` 值；`Copy`，可随意传递。
+pub(crate) use crate::receiver::ReceiverRecvConfig as DispatchCtx;
 
 /// 顶层派发入口：按 magic 分流到 Command / Frame / Response 处理路径
 ///
@@ -130,9 +118,17 @@ fn dispatch_response_frame(data: &[u8]) {
 /// - `data`：wire 字节；必须为 [`COMMAND_LEN`] 长度且以 [`COMMAND_MAGIC`] 开头
 /// - `ctx`：静态上下文，见 [`DispatchCtx`]
 ///
+/// # 派发顺序与抗重放的关系（**重要**）
+/// [`handle_builtin`]（`Announce` / `AssignId`）在 [`dispatch_business_command`]
+/// **之前**执行，而抗重放校验只在业务分支里。也就是说**内置命令有意绕过
+/// anti-replay**，理由见 [`handle_builtin`] 的"抗重放豁免"章节——这不是疏漏，
+/// 请勿把它"修正"成"内置命令也过 replay"，否则会破坏 Coordinator 重启后的
+/// 重新发现（见该函数文档）。
+///
 /// # 静默丢弃场景
 /// - 长度 / magic 不符
-/// - HMAC / 版本 / 其它解码错误
+/// - HMAC / 版本 / 其它解码错误（含 `AssignId` 的 `receiver_id >= 32`——由
+///   [`decode_command`] 直接判 `InvalidPayload`，故越界 id 到不了 [`handle_builtin`]）
 /// - 业务命令抗重放校验失败
 /// - handler 返回 [`CommandOutcome::NoReply`]
 pub(crate) fn dispatch_command_frame(data: &[u8], ctx: DispatchCtx) {
@@ -212,14 +208,45 @@ pub(crate) fn dispatch_frame(data: &[u8], ctx: DispatchCtx) {
 /// # 返回
 /// - `true`：本次是内置命令，调用方无需再进业务派发
 /// - `false`：非内置命令，调用方应继续走 [`dispatch_business_command`]
+///
+/// # 抗重放豁免（**有意为之，勿改**）
+/// 本函数在业务派发**之前**执行，且**不**调用 [`ReplayGuard::check`]，因此
+/// `Announce` / `AssignId` 不受 anti-replay 约束。这是刻意的设计，原因是二者是
+/// **会话自举（bootstrap）通道**，必须在"Endpoint 窗口已推进、但 Coordinator
+/// seq 计数器刚被重置"时仍能工作：
+///
+/// - Endpoint 侧的 [`ReplayGuard`] 每收到一条可解码的**广播**命令就推进窗口
+///   （[`dispatch_business_command`] 先 `check` 再交 handler，即便 handler
+///   返回 `NoReply` 窗口也已前移）；Endpoint 通常**不持久化**该窗口。
+/// - Coordinator 的出站 seq 计数器（[`Keyring`]）**不持久化**，重启后从 1 重来。
+/// - 于是 Coordinator 重启后广播的 `Announce`（seq 很小）相对 Endpoint 那个已经
+///   推到 last_seq=N 的窗口就是 `TooOld`。若让内置命令也过 replay，Endpoint 会
+///   拒收 `Announce` → 永不再回 `AnnounceReply` → **重新发现彻底失效**。
+///
+/// # 残余风险与为何可接受
+/// 豁免意味着攻击者可以**抓包重放**一条曾经合法的 `AssignId`（HMAC 仍拦住
+/// **伪造**，只是拦不住**重放**）。但影响有限：
+/// - `AssignId` 对**稳定的** registry 是幂等的（同一 MAC → 同一 `receiver_id`）。
+/// - 最坏情况是把某台 Endpoint 的 `my_id` 冲回一个旧值，造成短暂的 `dest_mask`
+///   寻址错位；下一轮 discover 会用当前映射重发 `AssignId` **自愈**。
+///
+/// 需要"内置命令也抗重放"的部署（例如 Endpoint 持久化窗口 + Coordinator
+/// 持久化 seq 计数器）应在**应用层**另建会话/epoch 机制，而不是删掉这里的豁免。
+///
+/// # `receiver_id` 范围
+/// 无需在此再校验 `receiver_id < 32`：[`decode_command`] 解码 `AssignId` 时已把
+/// `receiver_id >= 32` 判为 `InvalidPayload` 并丢弃，越界 id 到不了这里；
+/// [`Frame::is_addressed_to`](protocol::Frame::is_addressed_to) 也对越界 id 恒返回
+/// `false`，构成第二道兜底。
 fn handle_builtin(cmd: &Command, ctx: &DispatchCtx) -> bool {
   match cmd.kind {
     CommandBody::Announce => {
       let resp = build_announce_reply(ctx.role_tag, ctx.my_mac, ctx.keyring.active());
-      ctx.response_signal.signal(resp);
+      enqueue_response(ctx.response_signal, resp);
       true
     }
     CommandBody::AssignId { mac, receiver_id } => {
+      // `receiver_id` 已由 `decode_command` 保证 < 32（否则解码即失败），此处直接写入。
       if mac == ctx.my_mac {
         ctx.my_id.store(receiver_id, Ordering::Relaxed);
       }
@@ -242,17 +269,19 @@ fn dispatch_business_command(cmd: &Command, ctx: &DispatchCtx) {
   }
   match (ctx.handler)(ctx.src, cmd) {
     CommandOutcome::Ok => {
-      ctx
-        .response_signal
-        .signal(CommandResponse::ack_with_key(cmd.seq, cmd.key_id));
+      enqueue_response(
+        ctx.response_signal,
+        CommandResponse::ack_with_key(cmd.seq, cmd.key_id),
+      );
     }
     CommandOutcome::Err(code) => {
-      ctx
-        .response_signal
-        .signal(CommandResponse::err_with_key(cmd.seq, cmd.key_id, code));
+      enqueue_response(
+        ctx.response_signal,
+        CommandResponse::err_with_key(cmd.seq, cmd.key_id, code),
+      );
     }
     CommandOutcome::Respond(resp) => {
-      ctx.response_signal.signal(resp);
+      enqueue_response(ctx.response_signal, resp);
     }
     CommandOutcome::NoReply => {}
   }

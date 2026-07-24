@@ -19,11 +19,14 @@
 use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use comm::loopback::{LoopbackRecvEnd, LoopbackSendEnd, pair};
-use comm::notifier::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
+use comm::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
 use comm::notifier::{
-  ResponseHandler, run_broadcast_loop, run_receive_loop as run_notifier_recv_loop,
+  NotifierRecvConfig, ResponseHandler, run_broadcast_loop,
+  run_receive_loop as run_notifier_recv_loop,
 };
-use comm::receiver::{FrameHandler, run_receive_loop as run_receiver_recv_loop};
+use comm::receiver::{
+  FrameHandler, ReceiverRecvConfig, run_receive_loop as run_receiver_recv_loop,
+};
 use comm::{
   CommandBody, CommandOutcome, CommandSource, ErrorCode, Frame, GamepadState, Keyring,
   PeerRegistry, ReplayGuard, Selector,
@@ -85,8 +88,8 @@ struct NotifierState {
   replay: &'static ReplayGuard,
   selector: &'static Selector,
   frame_sig: &'static FrameSignal,
-  cmd_sig: &'static CommandOutSignal,
-  resp_sig: &'static ResponseSignal,
+  cmd_sig: &'static CommandOutChannel,
+  resp_sig: &'static ResponseChannel,
 }
 
 impl NotifierState {
@@ -97,8 +100,8 @@ impl NotifierState {
       replay: Box::leak(Box::new(ReplayGuard::new())),
       selector: Box::leak(Box::new(Selector::broadcast_all())),
       frame_sig: Box::leak(Box::new(FrameSignal::new())),
-      cmd_sig: Box::leak(Box::new(CommandOutSignal::new())),
-      resp_sig: Box::leak(Box::new(ResponseSignal::new())),
+      cmd_sig: Box::leak(Box::new(CommandOutChannel::new())),
+      resp_sig: Box::leak(Box::new(ResponseChannel::new())),
     }
   }
 }
@@ -106,9 +109,9 @@ impl NotifierState {
 struct ReceiverState {
   keyring: &'static Keyring,
   replay: &'static ReplayGuard,
-  resp_sig: &'static ResponseSignal,
+  resp_sig: &'static ResponseChannel,
   frame_sig: &'static FrameSignal,
-  cmd_sig: &'static CommandOutSignal,
+  cmd_sig: &'static CommandOutChannel,
   my_id: &'static AtomicU8,
 }
 
@@ -117,9 +120,9 @@ impl ReceiverState {
     Self {
       keyring: Box::leak(Box::new(Keyring::new())),
       replay: Box::leak(Box::new(ReplayGuard::new())),
-      resp_sig: Box::leak(Box::new(ResponseSignal::new())),
+      resp_sig: Box::leak(Box::new(ResponseChannel::new())),
       frame_sig: Box::leak(Box::new(FrameSignal::new())),
-      cmd_sig: Box::leak(Box::new(CommandOutSignal::new())),
+      cmd_sig: Box::leak(Box::new(CommandOutChannel::new())),
       my_id: Box::leak(Box::new(AtomicU8::new(u8::MAX))),
     }
   }
@@ -166,13 +169,15 @@ fn spawn_all_loops(
     .spawn_local(async move {
       run_notifier_recv_loop(
         a_recv,
-        ns_peers,
-        ns_cmd,
-        ns_keyring,
-        ns_replay,
-        ns_resp,
-        None,
-        response_handler,
+        NotifierRecvConfig {
+          peers: ns_peers,
+          command_signal: ns_cmd,
+          keyring: ns_keyring,
+          replay: ns_replay,
+          response_signal: ns_resp,
+          handler_config: None,
+          response_handler,
+        },
       )
       .await;
     })
@@ -198,15 +203,17 @@ fn spawn_all_loops(
     .spawn_local(async move {
       run_receiver_recv_loop(
         b_recv,
-        rs_keyring,
-        rs_replay,
-        rs_resp,
-        *b"led",
-        MAC_B,
-        rs_my_id,
-        handler,
-        CommandSource::EspNow,
-        frame_handler,
+        ReceiverRecvConfig {
+          keyring: rs_keyring,
+          replay: rs_replay,
+          response_signal: rs_resp,
+          role_tag: *b"led",
+          my_mac: MAC_B,
+          my_id: rs_my_id,
+          handler,
+          src: CommandSource::EspNow,
+          frame_handler,
+        },
       )
       .await;
     })
@@ -248,8 +255,9 @@ fn discovery_and_assign_id_flow() {
       use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig
-        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+      let _ = ns
+        .cmd_sig
+        .try_send(comm::notifier::signals::OutboundCommand::broadcast(
           encode_command(&cmd),
         ));
     }
@@ -314,8 +322,9 @@ fn command_flow_triggers_handler_and_returns_ack() {
           period_ms: 100,
         },
       );
-      ns.cmd_sig
-        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+      let _ = ns
+        .cmd_sig
+        .try_send(comm::notifier::signals::OutboundCommand::broadcast(
           encode_command(&cmd),
         ));
     }
@@ -362,8 +371,9 @@ fn anti_replay_rejects_duplicate_seq() {
       },
     );
     let bytes = encode_command(&cmd);
-    ns.cmd_sig
-      .signal(comm::notifier::signals::OutboundCommand::broadcast(bytes));
+    let _ = ns
+      .cmd_sig
+      .try_send(comm::notifier::signals::OutboundCommand::broadcast(bytes));
     // 等第一条到达
     wait_for(
       || REPLAY_HANDLER_INVOCATIONS.load(Ordering::Relaxed) >= 1,
@@ -375,8 +385,9 @@ fn anti_replay_rejects_duplicate_seq() {
     for _ in 0..50 {
       embassy_futures::yield_now().await;
     }
-    ns.cmd_sig
-      .signal(comm::notifier::signals::OutboundCommand::broadcast(bytes));
+    let _ = ns
+      .cmd_sig
+      .try_send(comm::notifier::signals::OutboundCommand::broadcast(bytes));
     // 再多跑一些 tick，让第二条走完 wire；handler 不应被再次调用
     for _ in 0..2_000 {
       embassy_futures::yield_now().await;
@@ -411,8 +422,9 @@ fn selector_reflects_discovered_peer() {
     use protocol::{Command, CommandBody as CB, encode_command};
     let seq = ns.keyring.next_seq();
     let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-    ns.cmd_sig
-      .signal(comm::notifier::signals::OutboundCommand::broadcast(
+    let _ = ns
+      .cmd_sig
+      .try_send(comm::notifier::signals::OutboundCommand::broadcast(
         encode_command(&cmd),
       ));
     wait_for(|| !ns.peers.is_empty(), 10_000).await;
@@ -533,8 +545,9 @@ fn frame_dest_mask_filters_by_id() {
     // 先走一遍 discover，让 receiver 拿到 id=0
     let seq = ns.keyring.next_seq();
     let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-    ns.cmd_sig
-      .signal(comm::notifier::signals::OutboundCommand::broadcast(
+    let _ = ns
+      .cmd_sig
+      .try_send(comm::notifier::signals::OutboundCommand::broadcast(
         encode_command(&cmd),
       ));
     wait_for(|| rs.my_id.load(Ordering::Relaxed) != u8::MAX, 10_000).await;
@@ -619,8 +632,9 @@ fn receiver_report_reaches_notifier() {
       use protocol::{Command, CommandBody as CB, encode_command};
       let seq = ns.keyring.next_seq();
       let cmd = Command::with_key(seq, ns.keyring.active(), CB::Announce);
-      ns.cmd_sig
-        .signal(comm::notifier::signals::OutboundCommand::broadcast(
+      let _ = ns
+        .cmd_sig
+        .try_send(comm::notifier::signals::OutboundCommand::broadcast(
           encode_command(&cmd),
         ));
     }
@@ -631,19 +645,20 @@ fn receiver_report_reaches_notifier() {
     // # 消除测试盲区
     // 上一版直接 `rs.resp_sig.signal(...)` 绕过了 Receiver::report()，导致万一
     // report() 的 `req_seq=0` / `key_id=keyring.active()` 逻辑被改坏，测试仍会
-    // 绿。改造后：通过 `test_receiver_from_parts` 构造真实 Receiver 实体（同一
+    // 绿。改造后：通过 `Receiver::builder()` 构造真实 Receiver 实体（同一
     // 组 signals），调用 `.report()` 走完整 API 路径。
-    let receiver: comm::Receiver<comm::link::DummyLink> = comm::receiver::test_receiver_from_parts(
-      rs.keyring,
-      rs.replay,
-      rs.resp_sig,
-      rs.frame_sig,
-      rs.cmd_sig,
-      *b"led",
-      MAC_B,
-      rs.my_id,
-      cmd_handler,
-    );
+    let receiver: comm::Receiver = comm::Receiver::builder()
+      .keyring(rs.keyring)
+      .replay(rs.replay)
+      .response_signal(rs.resp_sig)
+      .frame_signal(rs.frame_sig)
+      .command_signal(rs.cmd_sig)
+      .role_tag(*b"led")
+      .mac(MAC_B)
+      .my_id(rs.my_id)
+      .command_handler(cmd_handler)
+      .src(comm::CommandSource::Local)
+      .build();
     receiver.report(ResponseBody::BatterySnapshot { percent: 85 });
 
     wait_for(
@@ -735,13 +750,15 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
       .spawn_local(async move {
         run_notifier_recv_loop(
           a_recv,
-          ns_peers,
-          ns_cmd,
-          ns_keyring,
-          ns_replay,
-          ns_resp,
-          Some(handler_config),
-          None,
+          NotifierRecvConfig {
+            peers: ns_peers,
+            command_signal: ns_cmd,
+            keyring: ns_keyring,
+            replay: ns_replay,
+            response_signal: ns_resp,
+            handler_config: Some(handler_config),
+            response_handler: None,
+          },
         )
         .await;
       })
@@ -768,15 +785,17 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
       .spawn_local(async move {
         run_receiver_recv_loop(
           b_recv,
-          rs_keyring,
-          rs_replay,
-          rs_resp,
-          *b"led",
-          MAC_B,
-          rs_my_id,
-          cmd_handler,
-          CommandSource::EspNow,
-          None,
+          ReceiverRecvConfig {
+            keyring: rs_keyring,
+            replay: rs_replay,
+            response_signal: rs_resp,
+            role_tag: *b"led",
+            my_mac: MAC_B,
+            my_id: rs_my_id,
+            handler: cmd_handler,
+            src: CommandSource::EspNow,
+            frame_handler: None,
+          },
         )
         .await;
       })
@@ -845,7 +864,7 @@ fn assign_id_resends_on_updated_and_self_heals() {
     use protocol::{Command, CommandBody as CB, encode_command};
     let seq = ns_keyring.next_seq();
     let cmd = Command::with_key(seq, ns_keyring.active(), CB::Announce);
-    ns_cmd.signal(comm::notifier::signals::OutboundCommand::broadcast(
+    let _ = ns_cmd.try_send(comm::notifier::signals::OutboundCommand::broadcast(
       encode_command(&cmd),
     ));
   };
@@ -919,7 +938,7 @@ fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
 
   pool.run_until(async move {
     // Notifier 侧广播一条 NonceHello（走 broadcast_loop → wire → receiver dispatch）
-    ns_resp.signal(CommandResponse::nonce_hello(BROADCAST_NONCE));
+    let _ = ns_resp.try_send(CommandResponse::nonce_hello(BROADCAST_NONCE));
     wait_for(|| session_nonce() == BROADCAST_NONCE, 10_000).await;
   });
 
@@ -1084,12 +1103,11 @@ fn multi_target_frame_broadcasts_and_delivers() {
 // 测试：Phase 2 —— 定向单播命令 send_command_to
 // ============================================================
 //
-// 不 spawn loop：send_command_to 只做 registry 反查 + 写覆盖式 CommandOutSignal，
-// 直接用 `try_take()` 观察写出的 OutboundCommand 即可验证寻址正确。用 DummyLink
-// 构造 Notifier（本方法不触碰 link），共享真实的 peers / keyring / cmd_sig。
+// 不 spawn loop：send_command_to 只做 registry 反查 + 入队 CommandOutChannel，
+// 直接用 `try_receive()` 观察写出的 OutboundCommand 即可验证寻址正确。门面 link 无关，
+// 直接 build（不含 link），共享真实的 peers / keyring / cmd_sig。
 #[test]
 fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
-  use comm::link::DummyLink;
   use comm::notifier::signals::CommandDest;
   use comm::notifier::{Notifier, NotifierError};
   use embassy_time::Instant;
@@ -1100,11 +1118,10 @@ fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
   let replay = Box::leak(Box::new(ReplayGuard::new()));
   let selector = Box::leak(Box::new(Selector::broadcast_all()));
   let frame_sig = Box::leak(Box::new(FrameSignal::new()));
-  let cmd_sig = Box::leak(Box::new(CommandOutSignal::new()));
-  let resp_sig = Box::leak(Box::new(ResponseSignal::new()));
+  let cmd_sig = Box::leak(Box::new(CommandOutChannel::new()));
+  let resp_sig = Box::leak(Box::new(ResponseChannel::new()));
 
-  let notifier: Notifier<DummyLink> = Notifier::builder()
-    .link(DummyLink)
+  let notifier: Notifier = Notifier::builder()
     .keyring(keyring)
     .peers(peers)
     .replay(replay)
@@ -1120,7 +1137,7 @@ fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
     Err(NotifierError::NoTarget)
   );
   assert!(
-    cmd_sig.try_take().is_none(),
+    cmd_sig.try_receive().is_err(),
     "NoTarget 不应向出站通道写入任何命令"
   );
 
@@ -1141,7 +1158,7 @@ fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
     .expect("已注册 peer 应是合法目标");
 
   let out = cmd_sig
-    .try_take()
+    .try_receive()
     .expect("send_command_to 应向出站通道写入一条命令");
   assert_eq!(
     out.dest,
@@ -1156,6 +1173,8 @@ fn send_command_to_unicasts_registered_peer_and_reports_no_target_otherwise() {
 
   // send_command_to_mac 直发路径同样产生 Unicast
   notifier.send_command_to_mac(mac, CommandBody::Nop);
-  let out2 = cmd_sig.try_take().expect("send_command_to_mac 应写入命令");
+  let out2 = cmd_sig
+    .try_receive()
+    .expect("send_command_to_mac 应写入命令");
   assert_eq!(out2.dest, CommandDest::Unicast(mac));
 }

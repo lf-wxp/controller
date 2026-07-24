@@ -357,9 +357,8 @@ static SNAP_REPLAY_WINDOWS: Mutex<RefCell<[AntiReplayWindow; KEY_SLOTS]>> =
 
 /// 标记"配置已变，等一次落盘"
 ///
-/// 由 [`crate::transport::control::handle_command`] 处理完 SetSensitivity /
-/// SetBatteryMode 后调用；后台任务 [`persist_worker_loop`] 会看到脏位后收集
-/// 快照并调用 `save`。
+/// 由 `control::execute_command` 处理完 SetSensitivity / SetBatteryMode 后调用；
+/// 后台任务 [`persist_worker_loop`] 会看到脏位后收集快照并调用 `save`。
 ///
 /// # 参数
 /// - `joy` / `knob` / `battery_simulated`：业务状态快照

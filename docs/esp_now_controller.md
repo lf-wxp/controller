@@ -4,6 +4,14 @@
 烧到控制端 ESP32 上即可给手柄下发 `LedBlink` / `SetSensitivity` /
 `ShowToast` / `SetBatteryMode` 等控制命令，并收到手柄的 Ack / Error 响应。
 
+> 🆕 **本样板已升级为使用 [`comm`](../crates/comm/) 门面**：不再手写
+> nonce 监听 / seq 计数 / 收发派发，而是复用与手柄同源的 `comm::Notifier`
+> 编排句柄——你只需实现一个 `comm::CommLink` 适配层（把 esp-radio 的
+> ESP-NOW 收发两半包一下），其余交给门面的两条后台 loop。这与仓库里手柄侧的
+> [`crates/controller/src/transport/esp_now/`](../crates/controller/src/transport/esp_now/)
+> 是**同一套**用法。若你想了解不借助 `comm`、直接操作 wire 字节的底层做法，
+> 见 [`crates/examples/controller-host-demo/`](../crates/examples/controller-host-demo/)。
+
 > 👉 如果你只想**订阅手柄状态**（读按键 / 摇杆 / 电量），请参考
 > [esp_now_receiver.md](./esp_now_receiver.md)。
 
@@ -22,6 +30,7 @@
   - [控制端 Cargo.toml 参考](#控制端-cargotoml-参考)
   - [.cargo/config.toml / rust-toolchain.toml](#cargoconfigtoml--rust-toolchaintoml)
   - [完整示例 main.rs](#完整示例-mainrs)
+  - [ESP-NOW → CommLink 适配层](#esp-now--commlink-适配层)
   - [关键实现细节](#关键实现细节)
     - [1. NonceHello 握手时机](#1-noncehello-握手时机)
     - [2. seq 严格递增（抗重放）](#2-seq-严格递增抗重放)
@@ -95,6 +104,12 @@ protocol = { path = "../controller/crates/protocol", default-features = false, f
 # 或：
 # protocol = { git = "https://github.com/lf-wxp/controller", tag = "protocol-v0.2.0", default-features = false, features = ["defmt"] }
 
+# 通信编排门面：Notifier / Receiver / CommLink / nonce 广播等（no_std，依赖 embassy）
+# 与手柄侧同源，保证收发 / 抗重放 / 密钥管理逻辑 100% 一致。
+comm = { path = "../controller/crates/comm", default-features = false, features = ["defmt"] }
+# 或：
+# comm = { git = "https://github.com/lf-wxp/controller", tag = "comm-v0.2.0", default-features = false, features = ["defmt"] }
+
 esp-hal = { version = "~1.1.0", features = ["defmt", "esp32", "unstable"] }
 esp-rtos = { version = "0.3.0", features = [
   "defmt", "embassy", "esp-alloc", "esp-radio", "esp32",
@@ -122,45 +137,83 @@ portable-atomic = { version = "1", features = ["require-cas"] }
 
 ## 完整示例 main.rs
 
+整个收发编排交给 `comm::Notifier` 门面：`builder()...build()` 一次拿到
+`&'static` 句柄后，两条后台 loop（`run_broadcast_loop` / `run_receive_loop`）
+各吃一个 ESP-NOW link 端，主循环用 `send_command` 下发命令。手柄的
+`NonceHello` 由门面的 Response 回调 `on_response` 采纳，Ack / Error 也在同一
+回调里观察——**无需再手写 seq 计数、nonce 监听、收发派发**。
+
+> host 只**发命令 + 观察 Response**，不作为可被发现的 receiver，因此**不**调用
+> `with_command_handler`（那是"双身份"设备才需要的）。`AnnounceReply` 会被
+> `comm` 内部消费（`upsert` + 回 `AssignId`），不会进 `on_response`。
+
 ```rust
 #![no_std]
 #![no_main]
 
-use defmt::{error, info, warn};
+use defmt::{info, warn};
 use embassy_executor::Spawner;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Timer};
 use esp_bootloader_esp_idf::esp_app_desc;
 use esp_hal::clock::CpuClock;
-use portable_atomic::{AtomicBool, AtomicU32, Ordering};
+use portable_atomic::{AtomicBool, Ordering};
+use static_cell::StaticCell;
 
-// 协议层：与手柄 100% 对齐（24 B Command / Response，25 B Frame）
-use protocol::{
-  auth::{init_session_nonce, KeyId},
-  command::{encode_command, Command, CommandBody, COMMAND_LEN},
-  frame::FRAME_LEN,
-  response::{decode_response, ResponseBody, ResponseDecodeError, RESPONSE_LEN},
-};
+// comm 门面 + 出站信号类型
+use comm::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
+use comm::{CommandBody, CommandResponse, Keyring, Notifier, PeerRegistry, ReplayGuard, ResponseBody};
+use protocol::auth::init_session_nonce;
+
+// ESP-NOW ↔ comm::CommLink 适配层（见下一节「ESP-NOW → CommLink 适配层」）
+mod link;
+use link::{EspNowRecvLink, EspNowSendLink};
 
 esp_app_desc!();
 
 // ============================================================
-// 全局共享状态
+// 全局共享状态（fn 指针 handler 无法捕获环境 → 用 static 承载）
 // ============================================================
 
-/// 是否已经收到过至少一次 NonceHello —— 未收到前不发命令
+/// 是否已采纳至少一次 NonceHello —— 未就绪前不发命令
 static NONCE_READY: AtomicBool = AtomicBool::new(false);
 
-/// 单调递增的 seq 计数器（每个 key_id 独立，本例只用 KeyId::DEFAULT）
-///
-/// 生产环境应把这个值持久化到 NVS，重启后从中恢复；否则重启后
-/// 首条命令可能被手柄侧的抗重放窗口拒绝。
-static NEXT_SEQ: AtomicU32 = AtomicU32::new(1);
+// comm 门面所需的运行时状态（均为 const fn，可直接 static 初始化）：
+static KEYRING: Keyring = Keyring::new(); // 出站 Command 的 key_id + seq 计数器
+static PEERS: PeerRegistry = PeerRegistry::new(); // host 一般不发现 receiver，但 builder 必填
+static REPLAY: ReplayGuard = ReplayGuard::new(); // host 不收业务命令，但 builder 必填
+static FRAME_SIG: FrameSignal = FrameSignal::new(); // 出站 Frame（host 不发帧，占位）
+static CMD_SIG: CommandOutChannel = CommandOutChannel::new(); // 出站 Command 有界队列
+static RESP_SIG: ResponseChannel = ResponseChannel::new(); // 出站 Response 有界队列（占位）
 
-/// 收到 Response 的通知（用于匹配请求 seq）
-static RESPONSE_SIGNAL: Signal<CriticalSectionRawMutex, protocol::response::CommandResponse> =
-  Signal::new();
+/// Notifier 门面单例（`build()` 后 `init` 进来，两条 loop + 主循环共享）
+static NOTIFIER: StaticCell<Notifier> = StaticCell::new();
+
+// ============================================================
+// Response 回调：门面收到非 AnnounceReply 的 Response 时调用
+// ============================================================
+
+/// 采纳手柄 nonce + 观察 Ack / Error / 电量。
+///
+/// 关键点：手柄是 `NonceHello` 的**发布方**，本 host 必须采纳同一个 nonce，
+/// 之后 `send_command` 才能签出手柄认可的 HMAC。`comm` 的 Coordinator 接收
+/// 路径**不会**自动采纳他人 nonce（避免 Coordinator 误采），因此这里在
+/// 回调里手动 `init_session_nonce`。
+fn on_response(resp: &CommandResponse) {
+  match resp.body {
+    ResponseBody::NonceHello { nonce } => {
+      init_session_nonce(nonce);
+      if !NONCE_READY.swap(true, Ordering::Relaxed) {
+        info!("nonce ready: 0x{:08x}", nonce);
+      }
+    }
+    ResponseBody::Ack => info!("✓ ACK for seq={}", resp.req_seq),
+    ResponseBody::Error(code) => warn!("✗ ERR seq={} code={:?}", resp.req_seq, code),
+    ResponseBody::BatterySnapshot { percent } => info!("battery: {}%", percent),
+    // AnnounceReply 已由 comm 内部消费（upsert + 回 AssignId），不会走到这里；
+    // 显式列出避免非穷举 warning。
+    ResponseBody::AnnounceReply { .. } => {}
+  }
+}
 
 // ============================================================
 // 主入口
@@ -170,153 +223,209 @@ static RESPONSE_SIGNAL: Signal<CriticalSectionRawMutex, protocol::response::Comm
 async fn main(spawner: Spawner) {
   let peripherals = esp_hal::init(esp_hal::Config::default().with_cpu_clock(CpuClock::max()));
   esp_alloc::heap_allocator!(size: 96 * 1024);
-
-  info!("controller-host starting");
+  info!("controller-host (comm-backed) starting");
 
   // 1. 初始化 Wi-Fi + ESP-NOW
   let timg0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
   esp_rtos::start(timg0.timer0);
-
   let wifi_ctrl = esp_radio::init().unwrap();
-  let (mut wifi, _) =
-    esp_radio::wifi::new(&wifi_ctrl, peripherals.WIFI).expect("wifi init failed");
+  let (mut wifi, _) = esp_radio::wifi::new(&wifi_ctrl, peripherals.WIFI).expect("wifi init failed");
   let _ = wifi.set_mode(esp_radio::wifi::WifiMode::Sta);
   let _ = wifi.start_async().await;
-
-  let esp_now = esp_radio::esp_now::EspNow::new(&wifi_ctrl, peripherals.WIFI)
-    .expect("esp-now init failed");
-  let (_manager, sender, receiver) = esp_now.split();
-
+  let esp_now =
+    esp_radio::esp_now::EspNow::new(&wifi_ctrl, peripherals.WIFI).expect("esp-now init failed");
+  let (manager, sender, receiver) = esp_now.split();
   info!("esp-now up, channel = 1 (default)");
 
-  // 2. 起三个 embassy task
-  spawner.must_spawn(nonce_listener_task(receiver));
-  spawner.must_spawn(command_sender_task(sender));
-  spawner.must_spawn(response_matcher_task());
+  // manager 需 'static：send-link 在单播时惰性 add_peer（host 一般只广播，但接口需要它）
+  static MANAGER: StaticCell<esp_radio::esp_now::EspNowManager<'static>> = StaticCell::new();
+  let manager: &'static _ = MANAGER.init(manager);
 
-  // 主 loop 空转（真实业务可以在这里做 UI / 传感器采集）
-  loop {
-    Timer::after(Duration::from_secs(60)).await;
-  }
-}
+  // 2. 把 esp-now 的收发两半包成 comm::CommLink（send / recv 分属两个 task）
+  let send_link = EspNowSendLink::new(sender, manager);
+  let recv_link = EspNowRecvLink::new(receiver);
 
-// ============================================================
-// Task 1：监听 NonceHello + Response 广播
-// ============================================================
+  // 3. 组装 Notifier 门面（link 无关）；host 只发命令 + 观察 Response，
+  //    故不设 with_command_handler（不作为可被发现的 receiver）。
+  let notifier: &'static Notifier = NOTIFIER.init(
+    Notifier::builder()
+      .keyring(&KEYRING)
+      .peers(&PEERS)
+      .replay(&REPLAY)
+      .frame_signal(&FRAME_SIG)
+      .command_signal(&CMD_SIG)
+      .response_signal(&RESP_SIG)
+      .with_response_handler(on_response)
+      .build(),
+  );
 
-#[embassy_executor::task]
-async fn nonce_listener_task(mut receiver: esp_radio::esp_now::EspNowReceiver<'static>) {
-  loop {
-    let data = receiver.receive_async().await;
-    let bytes = data.data();
+  // 4. 两条后台 loop：send / recv 端各喂一个 link
+  spawner.must_spawn(bcast_task(notifier, send_link));
+  spawner.must_spawn(recv_task(notifier, recv_link));
 
-    // Response 是 RESPONSE_LEN（24）字节；其它长度（Frame、干扰帧）静默忽略。
-    // 注意：以 `RESPONSE_LEN` 常量为准，不要硬编码具体数字。
-    if bytes.len() != RESPONSE_LEN {
-      // 顺便可以按 FRAME_LEN 分派手柄状态帧（若也想订阅）
-      let _ = FRAME_LEN;
-      continue;
-    }
-
-    match decode_response(bytes) {
-      Ok(resp) => match resp.body {
-        // 收到 NonceHello → 装进全局，之后 command_sender_task 才能签命令
-        ResponseBody::NonceHello { nonce } => {
-          init_session_nonce(nonce);
-          if !NONCE_READY.swap(true, Ordering::Relaxed) {
-            info!("nonce ready: 0x{:08x}", nonce);
-          }
-        }
-        // 观察空气里的 AnnounceReply（可选，用于诊断）
-        //
-        // 说明：本 host 是"发命令角色"而非手柄本体，通常不需要维护
-        // receiver 目录。若确实想 host 侧也管理 receiver 列表，可在此
-        // 则复用手柄的 PeerRegistry 逻辑（`crates/comm/src/peer_registry.rs`）。
-        ResponseBody::AnnounceReply {
-          mac,
-          rssi_dbm,
-          role_tag,
-        } => {
-          info!(
-            "observed AnnounceReply mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} \
-             rssi={}dBm role={:?}",
-            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], rssi_dbm, role_tag
-          );
-        }
-        // 其它响应类型转给 matcher 处理
-        _ => RESPONSE_SIGNAL.signal(resp),
-      },
-      Err(ResponseDecodeError::BadMagic | ResponseDecodeError::BadLength) => {
-        // 干扰帧或状态帧，静默忽略
-      }
-      Err(err) => {
-        warn!("bad response: {:?}", err);
-      }
-    }
-  }
-}
-
-// ============================================================
-// Task 2：每 3 秒发一条示例命令
-// ============================================================
-
-#[embassy_executor::task]
-async fn command_sender_task(mut sender: esp_radio::esp_now::EspNowSender<'static>) {
-  // 广播地址
-  const BROADCAST: [u8; 6] = [0xFF; 6];
-
-  // 等到收到至少一次 NonceHello 才开始发
+  // 5. 命令发送 loop：等 nonce 就绪后周期下发 LedBlink
   while !NONCE_READY.load(Ordering::Relaxed) {
     Timer::after(Duration::from_millis(200)).await;
   }
   info!("nonce ready → start sending commands");
-
   loop {
-    // 示例：让手柄 LED 0 闪 3 次，每次 100ms
-    let seq = NEXT_SEQ.fetch_add(1, Ordering::Relaxed);
-    let cmd = Command::with_key(
-      seq,
-      KeyId::DEFAULT,
-      CommandBody::LedBlink {
-        led_idx: 0,
-        count: 3,
-        period_ms: 100,
-      },
-    );
-
-    // wire 长度 = COMMAND_LEN = 24
-    let bytes: [u8; COMMAND_LEN] = encode_command(&cmd);
-    match sender.send_async(&BROADCAST, &bytes).await {
-      Ok(_) => info!("sent LedBlink seq={} ({} B)", seq, COMMAND_LEN),
-      Err(e) => error!("send failed: {:?}", e),
-    }
-
+    // send_command 自动分配 seq（keyring）+ 用当前 session nonce 签 HMAC + 入队
+    notifier.send_command(CommandBody::LedBlink {
+      led_idx: 0,
+      count: 3,
+      period_ms: 100,
+    });
+    info!("sent LedBlink (broadcast)");
     Timer::after(Duration::from_secs(3)).await;
   }
 }
 
-// ============================================================
-// Task 3：匹配 Ack / Error 响应
-// ============================================================
+// embassy #[task] 宏不能吃泛型 async fn，故各包一层具体签名。
+#[embassy_executor::task]
+async fn bcast_task(n: &'static Notifier, link: EspNowSendLink) -> ! {
+  n.run_broadcast_loop(link).await
+}
 
 #[embassy_executor::task]
-async fn response_matcher_task() {
-  loop {
-    let resp = RESPONSE_SIGNAL.wait().await;
-    match resp.body {
-      ResponseBody::Ack => {
-        info!("✓ ACK for seq={}", resp.req_seq);
-      }
-      ResponseBody::Error(code) => {
-        warn!("✗ ERR seq={} code={:?}", resp.req_seq, code);
-      }
-      ResponseBody::BatterySnapshot { percent } => {
-        info!("battery: {}%", percent);
-      }
-      // 下面两种由 listener_task 直接处理，此处不会走到；显式匹配
-      // 避免非穷举 warning。
-      ResponseBody::NonceHello { .. } | ResponseBody::AnnounceReply { .. } => {}
+async fn recv_task(n: &'static Notifier, link: EspNowRecvLink) -> ! {
+  n.run_receive_loop(link).await
+}
+```
+
+## ESP-NOW → CommLink 适配层
+
+`comm::CommLink` 是 `comm` 唯一的硬件抽象点。下面把 esp-radio 的 ESP-NOW
+收发两半各包成一个 link 端（`send` / `recv` 都要 `&mut self`，不能被两个 task
+同时借用，故拆两半）。这份适配层与仓库手柄侧的
+[`crates/controller/src/transport/esp_now/link.rs`](../crates/controller/src/transport/esp_now/link.rs)
+**同款**，可直接复制为本项目的 `src/link.rs`：
+
+```rust
+use comm::{CommLink, Packet};
+use esp_radio::esp_now::{
+  BROADCAST_ADDRESS, EspNowManager, EspNowReceiver, EspNowSender, EspNowWifiInterface, PeerInfo,
+};
+
+/// ESP-NOW MTU（250 B payload）；真实帧 ≤ 26 B，此上限只是硬边界保护。
+const ESP_NOW_MTU: usize = 250;
+
+/// send-only 端的发送错误
+#[derive(Debug, defmt::Format)]
+pub enum SendError {
+  /// 底层 esp-radio 发送失败
+  Radio,
+  /// 单播目标 add_peer 失败（ESP-NOW peer 表满，上限约 20）
+  PeerFull,
+}
+
+/// 被误用方向时的错误（send-only 端被 recv / recv-only 端被 send）
+#[derive(Debug, defmt::Format)]
+pub enum WrongDirection {
+  /// 该端不支持此方向
+  Unsupported,
+}
+
+// ---- send-only：EspNowSendLink（喂给 run_broadcast_loop）----
+
+pub struct EspNowSendLink {
+  sender: EspNowSender<'static>,
+  manager: &'static EspNowManager<'static>,
+}
+
+impl EspNowSendLink {
+  #[must_use]
+  pub const fn new(
+    sender: EspNowSender<'static>,
+    manager: &'static EspNowManager<'static>,
+  ) -> Self {
+    Self { sender, manager }
+  }
+
+  /// 确保单播目标已在 peer 表中（幂等）；广播地址由 esp-radio 自动登记。
+  fn ensure_peer(&self, dst: &[u8; 6]) -> Result<(), SendError> {
+    if *dst == BROADCAST_ADDRESS || self.manager.peer_exists(dst) {
+      return Ok(());
     }
+    self
+      .manager
+      .add_peer(PeerInfo {
+        interface: EspNowWifiInterface::Station,
+        peer_address: *dst,
+        lmk: None,
+        channel: None,
+        encrypt: false,
+      })
+      .map_err(|_| SendError::PeerFull)
+  }
+}
+
+impl CommLink for EspNowSendLink {
+  const MAX_FRAME_LEN: usize = ESP_NOW_MTU;
+  type SendError = SendError;
+  type RecvError = WrongDirection;
+  type Addr = [u8; 6];
+  const BROADCAST: Self::Addr = BROADCAST_ADDRESS;
+
+  async fn send(&mut self, dst: Self::Addr, bytes: &[u8]) -> Result<(), Self::SendError> {
+    self.ensure_peer(&dst)?;
+    self
+      .sender
+      .send_async(&dst, bytes)
+      .await
+      .map_err(|_| SendError::Radio)
+  }
+
+  async fn recv(&mut self) -> Result<Packet<'_, Self::Addr>, Self::RecvError> {
+    // send-only：broadcast_loop 不会调用；若被误调，loop 会忽略 Err 并 continue
+    Err(WrongDirection::Unsupported)
+  }
+}
+
+// ---- recv-only：EspNowRecvLink（喂给 run_receive_loop）----
+
+pub struct EspNowRecvLink {
+  receiver: EspNowReceiver<'static>,
+  scratch: [u8; ESP_NOW_MTU],
+  scratch_len: usize,
+  scratch_src: [u8; 6],
+}
+
+impl EspNowRecvLink {
+  #[must_use]
+  pub const fn new(receiver: EspNowReceiver<'static>) -> Self {
+    Self {
+      receiver,
+      scratch: [0; ESP_NOW_MTU],
+      scratch_len: 0,
+      scratch_src: [0; 6],
+    }
+  }
+}
+
+impl CommLink for EspNowRecvLink {
+  const MAX_FRAME_LEN: usize = ESP_NOW_MTU;
+  type SendError = WrongDirection;
+  type RecvError = WrongDirection;
+  type Addr = [u8; 6];
+  const BROADCAST: Self::Addr = BROADCAST_ADDRESS;
+
+  async fn send(&mut self, _dst: Self::Addr, _bytes: &[u8]) -> Result<(), Self::SendError> {
+    Err(WrongDirection::Unsupported)
+  }
+
+  async fn recv(&mut self) -> Result<Packet<'_, Self::Addr>, Self::RecvError> {
+    // ReceivedData::data() 的切片生命周期与 pkt 绑定；copy 到 self.scratch 后
+    // 让借用挂到 self 上，调用方（run_receive_loop）才能跨 .await 安全持有。
+    let pkt = self.receiver.receive_async().await;
+    let data = pkt.data();
+    let len = data.len().min(ESP_NOW_MTU);
+    self.scratch[..len].copy_from_slice(&data[..len]);
+    self.scratch_len = len;
+    self.scratch_src = pkt.info.src_address;
+    Ok(Packet {
+      src: self.scratch_src,
+      data: &self.scratch[..self.scratch_len],
+    })
   }
 }
 ```
@@ -326,8 +435,10 @@ async fn response_matcher_task() {
 ### 1. NonceHello 握手时机
 
 手柄每 5 秒广播一次 `NonceHello`（[esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)
-的 `nonce_broadcast_task`）。控制端上电后**最长等待约 5 秒**才能
-发出第一条合法命令 —— 本例用 `NONCE_READY` AtomicBool 兜底：
+的 `nonce_broadcast_task`）。控制端上电后**最长等待约 5 秒**才能发出第一条
+合法命令 —— 采纳动作发生在门面的 Response 回调 `on_response` 里
+（`ResponseBody::NonceHello { nonce } → init_session_nonce(nonce)`），主循环用
+`NONCE_READY` AtomicBool 兜底、就绪后才开始发命令：
 
 ```rust
 while !NONCE_READY.load(Ordering::Relaxed) {
@@ -335,24 +446,31 @@ while !NONCE_READY.load(Ordering::Relaxed) {
 }
 ```
 
+> ⚠️ `comm` 的 Coordinator（`Notifier`）接收路径**不会**自动采纳他人 nonce
+> （避免"nonce 发布方误采别人的 nonce"）。本 host 虽用 `Notifier` 门面，但角色
+> 是"采纳手柄 nonce 的命令方"，因此必须在 `on_response` 里**手动**采纳。
+
 ### 2. seq 严格递增（抗重放）
 
 手柄侧 [`AntiReplayWindow`](../crates/protocol/src/replay.rs) 对每个
-`key_id` 独立维护 64 位滑动窗口。控制端 seq 必须**严格单调递增**：
+`key_id` 独立维护 64 位滑动窗口。控制端 seq 必须**严格单调递增**。门面已把
+seq 管理收拢进 [`comm::Keyring`](../crates/comm/src/keyring.rs)：`send_command`
+内部 `keyring.next_seq()` 原子 `fetch_add`，恒返回 `>= 1` 且绕回时自动跳过保留的 0：
 
 - ✅ `1, 2, 3, 4, ...` 全部接受
 - ✅ `1, 2, 5, 3, 4`（乱序但落在窗口内）全部接受
 - ❌ 重启后从 1 重新发 → **老 seq 被拒绝**（AuthFailed 或 Replay）
 
-**生产环境**建议把 `NEXT_SEQ` 值定期持久化到 NVS。参考
-[hal/persist.rs](../crates/controller/src/hal/persist.rs) 的 `PersistentConfig` 里已经
-包含 `replay_windows` 字段 —— 控制端可以模仿此实现。
+**生产环境**建议把 `Keyring` 的 tx_counter 定期持久化到 NVS，重启后
+`peek_counter` / 自定义流程恢复。参考 [hal/persist.rs](../crates/controller/src/hal/persist.rs)
+的 `PersistentConfig`（含 `replay_windows` 字段）——控制端可模仿此实现。
 
 ### 3. Response 按 req_seq 匹配
 
-`CommandResponse.req_seq` 携带对应请求 Command 的 seq。控制端如果
-需要"请求-响应对齐"（例如超时重试），可以维护一个 `pending_seqs:
-HashMap<u32, Deadline>`，在 matcher 里匹配后移除。
+`CommandResponse.req_seq` 携带对应请求 Command 的 seq。门面把所有非
+`AnnounceReply` 的 Response 都交给 `on_response` 回调。若需要"请求-响应对齐"
+（例如超时重试），可在回调里维护一个 `pending_seqs` 表（`req_seq → Deadline`），
+匹配到 Ack / Error 后移除。
 
 本例简化处理：直接打印 Ack/Err，不做超时重试。
 
@@ -395,11 +513,13 @@ Command 的多播由**目标 MAC** + `CommandBody::AssignId.mac` 字段实现。
    ─── AssignId(mac_A, receiver_id=0) (bcast, receiver A 自匹配) ─► receiver A
 ```
 
-如果 host（本文档角色）也想充当"receiver 发现方"（不是典型场景），可以：
+如果 host（本文档角色）也想充当"receiver 发现方"（不是典型场景），**用门面几乎零成本**：
+`comm::Notifier` 已内置整套发现编排——
 
-1. 定期广播 `CommandBody::Announce`（等同手柄进入 Selecting 时的行为）
-2. 监听 `ResponseBody::AnnounceReply` 并维护本地目录
-3. 对新发现的 receiver 单播 `CommandBody::AssignId { mac, receiver_id }`
+1. `notifier.discover()` 广播一次 `Announce`
+2. 收到的 `AnnounceReply` 由门面**自动** `PEERS.upsert(...)` 并回单播 `AssignId`（无需你写）
+3. 用 `notifier.peers()` 拿 `PeerInfo` 快照渲染 / 选择，`notifier.send_command_to(id, ..)` 定向下发
+4. （可选）发现前 `PEERS.prune(now, ttl)` 淘汰长时间未上报的 receiver
 
 **典型 host 场景无需实现**：这个环节主要由手柄侧完成；host 侧只需
 发命令给手柄本体（MAC 固定，无 receiver_id 概念）。
@@ -500,10 +620,7 @@ let cmd = Command::with_key(seq, key_id, CommandBody::Nop);
 2. 烧好手柄，上电后每 5 秒会广播一次 `NonceHello`
 3. 控制端约 5 秒内应打印 `nonce ready: 0x...`
 4. 每 3 秒发一条 `LedBlink` → 手柄 LED 应闪烁 3 次
-5. 手柄侧返回 Ack → 控制端打印 `✓ ACK for seq=N`
-6. 🆕 若同一空气中有 receiver 在线，长按手柄 Switch 键会触发 Announce
-   广播 → controller-host 日志中会打印 `observed AnnounceReply mac=... rssi=...`
-   （诊断用）
+5. 手柄侧返回 Ack → 控制端打印 `✓ ACK for seq=N`（由 `on_response` 回调打印）
 
 ## FAQ
 
@@ -550,7 +667,9 @@ let cmd = Command::with_key(seq, key_id, CommandBody::Nop);
 - 协议 crate 源码 → [crates/protocol/](../crates/protocol/)
 - 协议 crate 使用指南 → [crates/protocol/USAGE.md](../crates/protocol/USAGE.md)
 - 手柄侧命令分发 → [crates/controller/src/transport/control.rs](../crates/controller/src/transport/control.rs)
-- 🆕 手柄侧 Peer 目录管理 → [crates/comm/src/peer_registry.rs](../crates/comm/src/peer_registry.rs)（全局单例在 [crates/controller/src/lib.rs](../crates/controller/src/lib.rs)）
-- 🆕 手柄侧 Announce 广播 → [crates/controller/src/transport/esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)（`broadcast_announce` / `esp_now_receive_task`）
+- 🆕 通信编排门面（`Notifier` / `Receiver` / `CommLink`）→ [crates/comm/](../crates/comm/)（用法总览见 [crates/comm/README.md](../crates/comm/README.md)）
+- 🆕 手柄侧 Peer 目录管理 → [crates/comm/src/peer_registry.rs](../crates/comm/src/peer_registry.rs)（全局单例在 [crates/controller/src/lib.rs](../crates/controller/src/lib.rs) 的 `REGISTRY`）
+- 🆕 手柄侧门面接线（`init_notifier` / `discover` / 两条 loop task）→ [crates/controller/src/transport/esp_now/mod.rs](../crates/controller/src/transport/esp_now/mod.rs)
+- 🆕 ESP-NOW → `CommLink` 适配层（本文档「适配层」章节同款）→ [crates/controller/src/transport/esp_now/link.rs](../crates/controller/src/transport/esp_now/link.rs)
 - Dashboard 参考实现（BLE 版）→ [crates/dashboard/src/bluetooth.rs](../crates/dashboard/src/bluetooth.rs)
-- **纯 host 侧协议交互 demo** → [crates/examples/controller-host-demo/](../crates/examples/controller-host-demo/)
+- **纯 host 侧协议交互 demo（不借助 comm，直接操作 wire 字节）** → [crates/examples/controller-host-demo/](../crates/examples/controller-host-demo/)

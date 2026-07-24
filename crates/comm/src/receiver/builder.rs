@@ -6,36 +6,36 @@
 use core::sync::atomic::AtomicU8;
 
 use crate::keyring::Keyring;
-use crate::link::CommLink;
-use crate::notifier::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
+use crate::notifier::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
 use crate::replay::ReplayGuard;
 
-use super::{CommandHandler, FrameHandler, Receiver};
+use super::{CommandHandler, CommandSource, FrameHandler, Receiver};
 
 /// receiver 端 builder
+///
+/// 不含 `link`：门面 link 无关，link 在跑 loop 时按 send / recv 端传入。
 #[must_use]
-pub struct ReceiverBuilder<L> {
-  link: Option<L>,
+pub struct ReceiverBuilder {
   keyring: Option<&'static Keyring>,
   replay: Option<&'static ReplayGuard>,
-  response_signal: Option<&'static ResponseSignal>,
+  response_signal: Option<&'static ResponseChannel>,
   frame_signal: Option<&'static FrameSignal>,
-  command_signal: Option<&'static CommandOutSignal>,
+  command_signal: Option<&'static CommandOutChannel>,
   role_tag: [u8; 3],
   my_mac: [u8; 6],
   my_id: Option<&'static AtomicU8>,
   handler: Option<CommandHandler>,
+  src: CommandSource,
   frame_handler: Option<FrameHandler>,
 }
 
-impl<L: CommLink> ReceiverBuilder<L> {
+impl ReceiverBuilder {
   /// 空 builder
   //
   // 无需 `#[must_use]`：返回类型 `ReceiverBuilder` 结构体本身已标 `#[must_use]`，
   // 函数级注解会触发 clippy::double_must_use（同一约束标两遍无意义）。
   pub const fn new() -> Self {
     Self {
-      link: None,
       keyring: None,
       replay: None,
       response_signal: None,
@@ -45,14 +45,9 @@ impl<L: CommLink> ReceiverBuilder<L> {
       my_mac: [0; 6],
       my_id: None,
       handler: None,
+      src: CommandSource::EspNow,
       frame_handler: None,
     }
-  }
-
-  /// 设置物理链路
-  pub fn link(mut self, link: L) -> Self {
-    self.link = Some(link);
-    self
   }
 
   /// 设置 keyring
@@ -68,7 +63,7 @@ impl<L: CommLink> ReceiverBuilder<L> {
   }
 
   /// 设置回执 Signal
-  pub fn response_signal(mut self, sig: &'static ResponseSignal) -> Self {
+  pub fn response_signal(mut self, sig: &'static ResponseChannel) -> Self {
     self.response_signal = Some(sig);
     self
   }
@@ -84,8 +79,9 @@ impl<L: CommLink> ReceiverBuilder<L> {
     self
   }
 
-  /// 设置 Command 出站 Signal（供 [`Receiver::send_command`](super::Receiver::send_command) 使用）
-  pub fn command_signal(mut self, sig: &'static CommandOutSignal) -> Self {
+  /// 设置 Command 出站有界队列（供 `Receiver::send_command` 使用，需
+  /// `endpoint-initiated-command` feature；未开启时该队列不被主动写入）
+  pub fn command_signal(mut self, sig: &'static CommandOutChannel) -> Self {
     self.command_signal = Some(sig);
     self
   }
@@ -127,6 +123,14 @@ impl<L: CommLink> ReceiverBuilder<L> {
     self
   }
 
+  /// 可选：设置入站命令来源标识（默认 [`CommandSource::EspNow`]）
+  ///
+  /// 透传给 command handler；receiver-only 设备通常保持默认 `EspNow` 即可。
+  pub fn src(mut self, src: CommandSource) -> Self {
+    self.src = src;
+    self
+  }
+
   /// 构造 Receiver
   ///
   /// # Panics
@@ -136,9 +140,8 @@ impl<L: CommLink> ReceiverBuilder<L> {
   /// 不主动写入 [`UNASSIGNED_ID`](super::UNASSIGNED_ID)：调用方应在传入的
   /// `static AtomicU8` 上按需初始化（未持久化时使用 `AtomicU8::new(UNASSIGNED_ID)`，
   /// 有持久化 id 时使用 `AtomicU8::new(persisted_id)`）。
-  pub fn build(self) -> Receiver<L> {
+  pub fn build(self) -> Receiver {
     Receiver {
-      link: self.link.expect("Receiver: `link` is required"),
       keyring: self.keyring.expect("Receiver: `keyring` is required"),
       replay: self.replay.expect("Receiver: `replay` is required"),
       response_signal: self
@@ -156,12 +159,13 @@ impl<L: CommLink> ReceiverBuilder<L> {
       handler: self
         .handler
         .expect("Receiver: `command_handler` is required"),
+      src: self.src,
       frame_handler: self.frame_handler,
     }
   }
 }
 
-impl<L: CommLink> Default for ReceiverBuilder<L> {
+impl Default for ReceiverBuilder {
   fn default() -> Self {
     Self::new()
   }

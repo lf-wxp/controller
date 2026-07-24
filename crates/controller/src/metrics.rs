@@ -1,14 +1,18 @@
-//! # 全局运行时观测计数器（M-3 / M-5 相关加固）
+//! # 全局运行时观测计数器（M-5 相关加固）
 //!
-//! 本模块集中所有**幂等、可观测**的原子计数器，供两条主链路（BLE / ESP-NOW）
-//! 与持久化子系统在运行时上报"发生但被容忍"的事件：
+//! 本模块集中 controller 侧**幂等、可观测**的原子计数器，供持久化子系统在运行时
+//! 上报"发生但被容忍"的事件：
 //!
-//! - [`response_overwrite_count`]：`esp_now::RESP_SIG` 覆盖丢 Ack 事件（M-3）
 //! - [`flash_write_count`]：NVS flash 实际发生的写入次数（M-5）
 //!
+//! ## Response 丢弃观测已下沉到 comm
+//! 两条主链路（BLE / ESP-NOW）的出站 Response 现在**同型**——都是 comm 的有界队列，
+//! 满队丢弃统一计入 [`comm::metrics::dropped_responses`]。因此 controller 不再维护
+//! 本地的"Response 覆盖计数"，避免同一次丢弃两处记账、也消除了口径分裂。
+//!
 //! ## 为什么集中？
-//! - **单一职责**：Ack 覆盖与 flash 磨损都是"不影响功能但需要长期观测"的指标
-//! - **零成本**：仅在 handler / worker 路径上一次 `fetch_add(1, Relaxed)`，
+//! - **单一职责**：flash 磨损是"不影响功能但需要长期观测"的指标
+//! - **零成本**：仅在 worker 路径上一次 `fetch_add(1, Relaxed)`，
 //!   无跨线程数据依赖 → 用 `Relaxed` 已足够
 //! - **可暴露给 dashboard**：Dashboard 端可通过一条特殊的 diagnostic Command
 //!   拉取这些计数器，实现无侵入的健康监测
@@ -22,37 +26,6 @@
 //!   无 memory barrier 开销
 
 use core::sync::atomic::{AtomicU32, Ordering};
-
-// ============================================================
-// M-3：Response 覆盖事件计数
-// ============================================================
-
-/// `esp_now::RESP_SIG` 覆盖丢 Ack 事件计数器
-///
-/// 每当 [`crate::transport::control::broadcast_response`] 检测到 `esp_now::RESP_SIG.signaled() == true`（意味
-/// 前一次 Ack 尚未被 tx task 取走就被本次覆盖）时递增。
-///
-/// # 何时值会显著上升？
-/// - Host 短时间内**批量发多条无 ack 依赖的命令**（例如 boot 时批量下发配置）
-/// - 手柄 tx 链路阻塞（BLE 断连 / ESP-NOW 频道错乱）导致 tx task 长时间不消费
-///
-/// # 阈值建议
-/// - **稳态 100 Hz 命令流**：每分钟 < 5 次覆盖属于正常
-/// - **每分钟 > 100 次**：应升级为 `Channel<N>`（见 code-review 报告 M-3）
-static RESPONSE_OVERWRITE_COUNT: AtomicU32 = AtomicU32::new(0);
-
-/// 记录一次 Response 覆盖事件（供 `broadcast_response` 内部调用）
-#[inline]
-pub fn record_response_overwrite() {
-  RESPONSE_OVERWRITE_COUNT.fetch_add(1, Ordering::Relaxed);
-}
-
-/// 读取当前 Response 覆盖累计次数
-#[inline]
-#[must_use]
-pub fn response_overwrite_count() -> u32 {
-  RESPONSE_OVERWRITE_COUNT.load(Ordering::Relaxed)
-}
 
 // ============================================================
 // M-5：NVS flash 写次数计数
@@ -91,14 +64,6 @@ pub fn flash_write_count() -> u32 {
 #[cfg(test)]
 mod tests {
   use super::*;
-
-  #[test]
-  fn response_overwrite_counter_is_monotonic() {
-    let before = response_overwrite_count();
-    record_response_overwrite();
-    record_response_overwrite();
-    assert_eq!(response_overwrite_count(), before + 2);
-  }
 
   #[test]
   fn flash_write_counter_is_monotonic() {

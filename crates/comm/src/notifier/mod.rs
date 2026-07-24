@@ -9,7 +9,7 @@
 //! | 维度 | Notifier（Coordinator） | Receiver（Endpoint） |
 //! |---|---|---|
 //! | 拥有 `PeerRegistry` | ✅ 目录权威方 | ❌ 无目录 |
-//! | 拥有 `Selector` | ✅ 决定下发目标 | ❌ 无决策权 |
+//! | 可选持有 `Selector` | ✅ UI 侧目标位图助手（不自动作用于发送，见下）| ❌ |
 //! | 主动 `discover()` | ✅ 发起会话 | ❌ 只能被动响应 |
 //! | 首次遇到新 peer 时回 AssignId | ✅ 自动 | ❌ 只接收 AssignId |
 //! | 主动 `send_frame` / 主动 `send_command` | ✅ | ✅（Endpoint 侧的 `send_command` 需 opt-in） |
@@ -24,7 +24,7 @@
 //! AnnounceReply → upsert peer）/ 密钥管理 / 抗重放"这套编排逻辑封装成一个
 //! 通用结构体，让使用者只需要：
 //!
-//! 1. 实现 [`CommLink`](crate::CommLink)（唯一硬件抽象）
+//! 1. 实现 [`CommLink`]（唯一硬件抽象）
 //! 2. 在自己 crate 里放几个 `static Signal / Keyring / PeerRegistry / ...`
 //! 3. 用 [`Notifier::builder()`] 组装，然后 spawn 两个后台任务
 //! 4. 主循环里调 `notifier.send_frame(&frame)`
@@ -61,7 +61,10 @@ pub use builder::{CommandHandlerConfig, NotifierBuilder};
 pub use nonce::{
   DEFAULT_NONCE_BROADCAST_INTERVAL, EntropySource, init_session, run_nonce_broadcast_loop,
 };
-pub use signals::{CommandDest, CommandOutSignal, FrameSignal, OutboundCommand, ResponseSignal};
+pub use signals::{
+  CommandDest, CommandOutChannel, FrameSignal, OUTBOUND_QUEUE_DEPTH, OutboundCommand,
+  ResponseChannel, enqueue_command, enqueue_response,
+};
 
 /// 上报 Response 处理闭包（供上层业务消费 Receiver 主动 report 的数据）
 ///
@@ -108,37 +111,45 @@ impl defmt::Format for NotifierError {
 
 /// 发送端门面
 ///
-/// # 生命周期
-/// 通常放进 `StaticCell` 使其成为 `'static`，然后把后台 task 需要的字段
-/// 单独 spawn 出去。参见 [`run_broadcast_loop`] / [`run_receive_loop`]。
+/// # 定位：**link 无关的编排句柄**
+/// 门面持有一套 `&'static` 共享状态（keyring / peers / selector / 三条出站通道 +
+/// 可选 handler 配置），**不持有物理 link**。原因：真实设备把一个 `CommLink` 拆成
+/// **send / recv 两个不同类型的端**（各归属独立 embassy task），门面用单一泛型 `L`
+/// 持有 link 反而与现实冲突——这正是旧版门面在生产里没人用的根因。
 ///
-/// # `dead_code` 说明
-/// `replay` / `response_signal` 字段供用户在外层 loop 中读取（他们把这些
-/// `&'static` 引用同时传给 `run_receive_loop` / `run_broadcast_loop`）。
-/// 本结构体自身没有 `.await` 循环，因此本地读不到它们，字段级 `#[allow(dead_code)]`
-/// 显式局部隔离，不影响其他字段与方法的 lint 保护。
-pub struct Notifier<L: CommLink> {
-  pub(crate) link: L,
+/// # 两类用法
+/// 1. **生产者 API**（`&self`，可在主循环随便调）：[`send_frame`](Self::send_frame) /
+///    [`discover`](Self::discover) / [`send_command`](Self::send_command) 等，把消息塞进出站通道。
+/// 2. **后台 loop**（各吃一个 link 端，在用户 `#[task]` 里 `.await`）：
+///    [`run_broadcast_loop`](Self::run_broadcast_loop) /
+///    [`run_receive_loop`](Self::run_receive_loop)——直接消费门面自己的字段，
+///    调用方只需再传对应的 link 端，不用把一堆 `&'static` 引用逐个手抄。
+///
+/// # 生命周期
+/// 通常 `StaticCell` 化成 `&'static Notifier`，两个后台 task 各持一份 `&'static`
+/// 共享借用即可（字段全是 `&'static` + `Copy`）。
+pub struct Notifier {
   pub(crate) keyring: &'static Keyring,
   pub(crate) peers: &'static PeerRegistry,
-  #[allow(dead_code)]
   pub(crate) replay: &'static ReplayGuard,
-  pub(crate) selector: &'static Selector,
+  /// 可选目标选择器；`None` 时 `select_targets` / `selector` 为 no-op / `None`
+  pub(crate) selector: Option<&'static Selector>,
   pub(crate) frame_signal: &'static FrameSignal,
-  pub(crate) command_signal: &'static CommandOutSignal,
-  pub(crate) response_signal: &'static ResponseSignal,
+  pub(crate) command_signal: &'static CommandOutChannel,
+  pub(crate) response_signal: &'static ResponseChannel,
   /// 可选 command handler —— 启用后 Notifier 变成"双身份"（既发又收命令）
-  #[allow(dead_code)]
   pub(crate) handler_config: Option<CommandHandlerConfig>,
+  /// 可选 Response 回调 —— 非 AnnounceReply 的 Response 交给它（`None` 则丢弃）
+  pub(crate) response_handler: Option<ResponseHandler>,
 }
 
-impl<L: CommLink> Notifier<L> {
+impl Notifier {
   /// 开始构造 Notifier
   //
   // 无需 `#[must_use]`：`NotifierBuilder` 结构体已在类型层面标了 `#[must_use]`，
   // 函数级注解会触发 `clippy::double_must_use`。
-  pub const fn builder() -> NotifierBuilder<L> {
-    NotifierBuilder::<L>::new()
+  pub const fn builder() -> NotifierBuilder {
+    NotifierBuilder::new()
   }
 
   // ---- 无 link 依赖的同步 API：`&self` 就够，可以在主循环里随便调 ----
@@ -155,8 +166,11 @@ impl<L: CommLink> Notifier<L> {
   ///   MAC 层 ACK + 有界重试，单点下发更可靠）
   /// - 其余（0 / 多目标 / 全选 / 单选但 MAC 未知）→ **广播**
   ///
-  /// 因此调用方只管 `select_targets(mask)` + `send_frame(&frame)`，单目标场景会
-  /// 透明升级为可靠单播，无需任何额外 API。
+  /// 因此调用方只需把目标位图填进 `frame.dest_mask`（例如
+  /// `Frame::with_dest(seq, state, mask)`）再 `send_frame(&frame)`，单目标场景会
+  /// 透明升级为可靠单播，无需任何额外 API。注意寻址完全取自**帧自带的**
+  /// `dest_mask`；[`select_targets`](Self::select_targets) 只维护可选 `Selector`
+  /// 容器的值，**不会**自动改写正在发送的帧。
   ///
   /// # 语义
   /// - 覆盖式：若上一帧还没被消费，本次会覆盖它 —— 高频状态流场景**只关心最新**
@@ -173,9 +187,12 @@ impl<L: CommLink> Notifier<L> {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), CommandBody::Announce);
     // Announce 必须广播：目标恰恰是"尚未发现的" receiver，无 MAC 可单播。
-    self
-      .command_signal
-      .signal(OutboundCommand::broadcast(encode_command(&cmd)));
+    // 有界队列：满时丢弃当前这条（下一轮 Announce/命令会补），不阻塞主循环；
+    // 丢弃会被 `enqueue_command` 记进 metrics。
+    enqueue_command(
+      self.command_signal,
+      OutboundCommand::broadcast(encode_command(&cmd)),
+    );
   }
 
   /// 发送任意 Command（比如 LedBlink / ShowToast）
@@ -190,14 +207,16 @@ impl<L: CommLink> Notifier<L> {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), body);
     // 广播式 send_command：发给全网所有 receiver（fire-and-forget，无 ACK）。
-    self
-      .command_signal
-      .signal(OutboundCommand::broadcast(encode_command(&cmd)));
+    // 有界队列：满时丢弃当前这条（下一轮 Announce/命令会补），不阻塞主循环
+    enqueue_command(
+      self.command_signal,
+      OutboundCommand::broadcast(encode_command(&cmd)),
+    );
   }
 
   /// 单播一条 Command 给指定 `receiver_id`（**Phase 2：定向命令**）
   ///
-  /// 从 [`PeerRegistry`](crate::PeerRegistry) 反查该 id 的 MAC，走
+  /// 从 [`PeerRegistry`] 反查该 id 的 MAC，走
   /// [`CommandDest::Unicast`]：ESP-NOW MAC 层 ACK + `run_broadcast_loop` 有界重试，
   /// 送达可靠性远高于广播。适合 LedBlink / ShowToast / SetSensitivity 等只想发给
   /// **某一台** receiver 的业务命令。
@@ -205,10 +224,12 @@ impl<L: CommLink> Notifier<L> {
   /// # Errors
   /// - [`NotifierError::NoTarget`]：`receiver_id` 尚未在 registry 里（未发现 / 已过期）
   ///
-  /// # ⚠️ 单目标限制（覆盖式信号）
-  /// [`CommandOutSignal`] 是**覆盖式** `Signal`（后写覆盖前写），因此**不要**在紧凑
-  /// 循环里对多个目标连发——除最后一条外都会在被 `broadcast_loop` 消费前被覆盖丢弃。
-  /// 需要"发给多台"请分帧节流，或等未来把命令出站通道换成有界队列后再支持组播。
+  /// # 组播（有界队列）
+  /// [`CommandOutChannel`] 是深度 [`OUTBOUND_QUEUE_DEPTH`] 的**有界 FIFO**，因此
+  /// 紧凑循环里对多台连发 `send_command_to` 会**逐条排队出站**（不再像旧版覆盖式
+  /// Signal 那样只剩最后一条）。唯一约束是**一轮突发不要超过队列深度**：超过深度的
+  /// 那几条会被 `try_send` 丢弃（返回被静默忽略）。要发给很多台请分帧节流，或在自己
+  /// crate 里声明更深的 `Channel` 静态实例。
   pub fn send_command_to(&self, receiver_id: u8, body: CommandBody) -> Result<(), NotifierError> {
     let mac = self
       .peers
@@ -221,13 +242,14 @@ impl<L: CommLink> Notifier<L> {
   /// 单播一条 Command 给指定 MAC（跳过 registry 反查）
   ///
   /// 当调用方**已经**持有目标 MAC（比如来自一次 AnnounceReply 快照）时用它，省一次
-  /// 反查。语义与 [`send_command_to`](Self::send_command_to) 相同，见其"单目标限制"。
+  /// 反查。语义与 [`send_command_to`](Self::send_command_to) 相同，见其"组播"说明。
   pub fn send_command_to_mac(&self, mac: [u8; 6], body: CommandBody) {
     let seq = self.keyring.next_seq();
     let cmd = Command::with_key(seq, self.keyring.active(), body);
-    self
-      .command_signal
-      .signal(OutboundCommand::unicast(mac, encode_command(&cmd)));
+    enqueue_command(
+      self.command_signal,
+      OutboundCommand::unicast(mac, encode_command(&cmd)),
+    );
   }
 
   /// 拿 peer 列表快照（用于 UI 渲染 / 选择器候选）
@@ -236,14 +258,29 @@ impl<L: CommLink> Notifier<L> {
     self.peers.snapshot()
   }
 
-  /// 直接设置 active dest_mask（跳过 pending 编辑）
+  /// 直接设置可选 [`Selector`] 容器的 active dest_mask（跳过 pending 编辑）
+  ///
+  /// # 这**不会**改变发送寻址
+  /// 本方法只更新 `Selector` 这个状态容器的值。发送寻址取自**帧自带的**
+  /// `dest_mask`（见 [`send_frame`](Self::send_frame)），comm 不会自动把
+  /// `selector.active()` 塞进出站帧。要让选择生效，调用方需读 `selector().active()`
+  /// 并填进待发送的 `Frame`。
+  ///
+  /// # 无 selector 时
+  /// selector 是**可选**的（见 [`NotifierBuilder::selector`]）。若门面构造时没提供
+  /// selector（例如 controller 自己在 UI 层算好 `dest_mask` 直接写进 `Frame`），
+  /// 本方法**静默 no-op**。
   pub fn select_targets(&self, mask: crate::selector::DestMask) {
-    self.selector.set_active(mask);
+    if let Some(selector) = self.selector {
+      selector.set_active(mask);
+    }
   }
 
   /// 借用 selector 做交互编辑（`toggle_pending` / `commit` / `cancel`）
+  ///
+  /// selector 可选：未提供时返回 `None`（见 [`Self::select_targets`]）。
   #[must_use]
-  pub fn selector(&self) -> &'static Selector {
+  pub fn selector(&self) -> Option<&'static Selector> {
     self.selector
   }
 
@@ -253,28 +290,6 @@ impl<L: CommLink> Notifier<L> {
   /// 见 [`KeyringError`](crate::KeyringError)
   pub fn rotate_key(&self, new_id: KeyId) -> Result<(), crate::keyring::KeyringError> {
     self.keyring.rotate_to(new_id)
-  }
-
-  /// 借用内部 [`ResponseSignal`]（供 [`run_nonce_broadcast_loop`] 复用）
-  ///
-  /// # 用途
-  /// nonce 广播任务需要 `&'static ResponseSignal` 才能塞 [`CommandResponse`]；
-  /// Notifier 建造时已经持有这份 static 引用，直接暴露出来避免用户再单独维护
-  /// 一份别名。
-  ///
-  /// # 使用示例
-  /// ```ignore
-  /// #[embassy_executor::task]
-  /// async fn nonce_task() -> ! {
-  ///     comm::notifier::run_nonce_broadcast_loop(
-  ///         NOTIFIER.response_signal(),
-  ///         comm::notifier::DEFAULT_NONCE_BROADCAST_INTERVAL,
-  ///     ).await
-  /// }
-  /// ```
-  #[must_use]
-  pub fn response_signal(&self) -> &'static ResponseSignal {
-    self.response_signal
   }
 
   /// 从 [`EntropySource`] 采样一次并写入 protocol 层的 `SESSION_NONCE`
@@ -291,13 +306,71 @@ impl<L: CommLink> Notifier<L> {
     init_session(entropy)
   }
 
-  /// 借用 link（供 [`spawn_broadcast_loop`] / [`spawn_receive_loop`] 拆用）
+  // ---- 后台 loop（门面自带；各吃一个 link 端）----
+
+  /// 运行**广播 loop**（送出 Frame / Command / Response，见 [`run_broadcast_loop`]）
   ///
-  /// # 谨慎使用
-  /// 只应该在后台 task 内部使用；主循环拿到 `&mut L` 会破坏"send/recv 分离在两个
-  /// task"的架构。
-  pub fn link_mut(&mut self) -> &mut L {
-    &mut self.link
+  /// 门面版：直接消费自身的 `peers` / 三条出站通道，调用方只需传 **send 端** link。
+  /// 在用户 `#[task]` 里：
+  /// ```ignore
+  /// #[embassy_executor::task]
+  /// async fn bcast(n: &'static comm::Notifier, link: MySendLink) -> ! {
+  ///     n.run_broadcast_loop(link).await
+  /// }
+  /// ```
+  pub async fn run_broadcast_loop<L: CommLink>(&self, link: L) -> !
+  where
+    L::Addr: From<[u8; 6]>,
+  {
+    run_broadcast_loop(
+      link,
+      Some(self.peers),
+      self.frame_signal,
+      self.command_signal,
+      self.response_signal,
+    )
+    .await
+  }
+
+  /// 运行**接收 loop**（解码 / 抗重放 / AnnounceReply 自愈 / 命令派发，见
+  /// [`run_receive_loop`]）
+  ///
+  /// 门面版：从自身字段拼出 [`NotifierRecvConfig`]，调用方只需传 **recv 端** link。
+  pub async fn run_receive_loop<L: CommLink>(&self, link: L) -> ! {
+    run_receive_loop(
+      link,
+      NotifierRecvConfig {
+        peers: self.peers,
+        command_signal: self.command_signal,
+        keyring: self.keyring,
+        replay: self.replay,
+        response_signal: self.response_signal,
+        handler_config: self.handler_config,
+        response_handler: self.response_handler,
+      },
+    )
+    .await
+  }
+
+  /// 运行 **nonce 广播 loop**（周期广播 `NonceHello`，见 [`run_nonce_broadcast_loop`]）
+  ///
+  /// 门面版：直接复用自身持有的 `response_signal`，调用方只需传广播周期
+  /// （日常用 [`DEFAULT_NONCE_BROADCAST_INTERVAL`]）。
+  ///
+  /// # 与 [`run_broadcast_loop`](Self::run_broadcast_loop) 的关系
+  /// 本 loop **不吃 link**——它只把 `NonceHello` 周期性塞进门面自己的出站
+  /// Response 队列，真正的射频发送仍由 `run_broadcast_loop` 完成。因此这三个
+  /// loop 通常同时 spawn：`run_broadcast_loop`（吃 send 端 link）/
+  /// `run_receive_loop`（吃 recv 端 link）/ `run_nonce_broadcast_loop`（无 link）。
+  ///
+  /// ```ignore
+  /// #[embassy_executor::task]
+  /// async fn nonce(n: &'static comm::Notifier) -> ! {
+  ///     n.run_nonce_broadcast_loop(comm::DEFAULT_NONCE_BROADCAST_INTERVAL).await
+  /// }
+  /// ```
+  pub async fn run_nonce_broadcast_loop(&self, interval: embassy_time::Duration) -> ! {
+    run_nonce_broadcast_loop(self.response_signal, interval).await
   }
 }
 
@@ -328,15 +401,15 @@ impl<L: CommLink> Notifier<L> {
 ///
 /// # `peers` 参数：Frame 的**自动单播/广播寻址**
 /// - `Some(&PEERS)`（Coordinator/Notifier 侧）：每帧出站前依据其 `dest_mask`
-///   经 [`frame_dest`] 决策——**恰好选中单个**目标且该 `receiver_id` 的 MAC 能从
+///   经 `frame_dest` 决策——**恰好选中单个**目标且该 `receiver_id` 的 MAC 能从
 ///   [`PeerRegistry`] 反查到时，**自动单播**到该 MAC（复用下文命令通路的有界重试）；
 ///   其余情况（0 位 / 多位 / 全选 / 单选但 MAC 未知）继续**广播**。
 /// - `None`（Endpoint/Receiver 侧无目录）：`Frame` **恒广播**，行为与历史一致。
 ///
 /// 之所以只在"恰好单目标"时单播：`Frame` 是高频状态流，若对多目标 fan-out 成 N 条
 /// 单播会拖垮出站节拍；单播只在确有唯一目标时才划算（ESP-NOW 单播带 MAC 层 ACK +
-/// 重传，对单点下发更可靠）。调用方无需改动——`send_frame(&frame)` + `select_targets(mask)`
-/// 会透明升级为可靠单播。
+/// 重传，对单点下发更可靠）。调用方无需改动——只要 `frame.dest_mask` 恰好单目标，
+/// `send_frame(&frame)` 就会透明升级为可靠单播（寻址取自帧自带的 `dest_mask`）。
 ///
 /// # 命令通路的寻址与可靠性（Phase 1）
 /// `CommandOut` 载荷为 [`OutboundCommand`]，可选广播或单播：
@@ -353,18 +426,19 @@ pub async fn run_broadcast_loop<L: CommLink>(
   mut link: L,
   peers: Option<&'static PeerRegistry>,
   frame_signal: &'static FrameSignal,
-  command_signal: &'static CommandOutSignal,
-  response_signal: &'static ResponseSignal,
+  command_signal: &'static CommandOutChannel,
+  response_signal: &'static ResponseChannel,
 ) -> !
 where
   L::Addr: From<[u8; 6]>,
 {
   use embassy_futures::select::{Either3, select3};
   loop {
+    // Frame 覆盖式（wait 取最新）；Command / Response 有界 FIFO（receive 逐条出队）
     match select3(
       frame_signal.wait(),
-      response_signal.wait(),
-      command_signal.wait(),
+      response_signal.receive(),
+      command_signal.receive(),
     )
     .await
     {
@@ -450,14 +524,41 @@ where
 /// 出站节拍拖垮。
 pub const MAX_UNICAST_SEND_RETRIES: u8 = 2;
 
+/// [`run_receive_loop`] 的静态接线配置
+///
+/// 把接收 loop 需要的**共享 static 状态**（`&'static` 引用）与两个可选处理器
+/// 打包成一个 `Copy` 结构体，替代原来的 7 个位置参数。好处：
+/// - 消掉 `#[allow(clippy::too_many_arguments)]`
+/// - 调用方用**具名字段**装配，避免同类型 `&'static` 引用被顺序写错（例如把
+///   `keyring` / `replay` 位置颠倒也能编译，却是灾难性 bug）
+///
+/// 用户在应用 crate 里的 `static` 声明方式不变，只是把它们塞进本结构体。
+#[derive(Clone, Copy)]
+pub struct NotifierRecvConfig {
+  /// peer 目录（AnnounceReply → upsert → 回 AssignId）
+  pub peers: &'static PeerRegistry,
+  /// 出站命令队列（AssignId 自愈单播由此发出）
+  pub command_signal: &'static CommandOutChannel,
+  /// 共享 keyring（seq / active key）
+  pub keyring: &'static Keyring,
+  /// 抗重放窗口
+  pub replay: &'static ReplayGuard,
+  /// 出站响应队列（自动 Ack / AnnounceReply）
+  pub response_signal: &'static ResponseChannel,
+  /// 可选：开启"双身份"后处理入站 Command / Frame 的配置（`None` = 纯 notifier）
+  pub handler_config: Option<CommandHandlerConfig>,
+  /// 可选：业务 Response 回调（`None` 时非 AnnounceReply 的 Response 静默丢弃）
+  pub response_handler: Option<ResponseHandler>,
+}
+
 /// **接收 loop** —— 从 link 里连续 recv，解析并派发
 ///
-/// # 基本行为（纯 notifier 场景，`handler_config = None`）
+/// # 基本行为（纯 notifier 场景，`cfg.handler_config = None`）
 /// - `RESPONSE_LEN` 帧 → AnnounceReply → `peers.upsert(...)` → 回 AssignId（每次
-///   AnnounceReply 都重发，以自愈覆盖式信号被覆盖 / 射频丢包造成的 AssignId 丢失）
+///   AnnounceReply 都重发，以自愈队列满 / 射频丢包造成的 AssignId 丢失）
 /// - `COMMAND_LEN` 帧 → 静默忽略（自发命令广播回环，无消费者）
 ///
-/// # 启用 "双身份" 后的行为（`handler_config = Some(...)`）
+/// # 启用 "双身份" 后的行为（`cfg.handler_config = Some(...)`）
 /// - `RESPONSE_LEN` 帧：同上
 /// - `COMMAND_LEN` 帧：
 ///   * `Announce` → 内置回 AnnounceReply（role_tag + my_mac 自配置取）
@@ -469,22 +570,20 @@ pub const MAX_UNICAST_SEND_RETRIES: u8 = 2;
 /// #[embassy_executor::task]
 /// async fn my_recv_task(link: MyLink) -> ! {
 ///     comm::notifier::run_receive_loop(
-///         link, &PEERS, &CMD_SIG, &KEYRING, &REPLAY, &RESP_SIG,
-///         Some(comm::notifier::CommandHandlerConfig { .. }),
+///         link,
+///         comm::notifier::NotifierRecvConfig {
+///             peers: &PEERS,
+///             command_signal: &CMD_SIG,
+///             keyring: &KEYRING,
+///             replay: &REPLAY,
+///             response_signal: &RESP_SIG,
+///             handler_config: Some(comm::notifier::CommandHandlerConfig { .. }),
+///             response_handler: None,
+///         },
 ///     ).await
 /// }
 /// ```
-#[allow(clippy::too_many_arguments)]
-pub async fn run_receive_loop<L: CommLink>(
-  mut link: L,
-  peers: &'static PeerRegistry,
-  command_signal: &'static CommandOutSignal,
-  keyring: &'static Keyring,
-  replay: &'static ReplayGuard,
-  response_signal: &'static ResponseSignal,
-  handler_config: Option<CommandHandlerConfig>,
-  response_handler: Option<ResponseHandler>,
-) -> ! {
+pub async fn run_receive_loop<L: CommLink>(mut link: L, cfg: NotifierRecvConfig) -> ! {
   loop {
     let Ok(packet) = link.recv().await else {
       // 接收错误：继续下一轮；一直失败会自然节流
@@ -497,23 +596,29 @@ pub async fn run_receive_loop<L: CommLink>(
     match magic {
       RESPONSE_MAGIC if packet.data.len() == RESPONSE_LEN => {
         if let Ok(resp) = decode_response(packet.data) {
-          handle_incoming_response(&resp, peers, command_signal, keyring, response_handler);
+          handle_incoming_response(
+            &resp,
+            cfg.peers,
+            cfg.command_signal,
+            cfg.keyring,
+            cfg.response_handler,
+          );
         }
       }
       COMMAND_MAGIC if packet.data.len() == COMMAND_LEN => {
-        if let Some(cfg) = handler_config.as_ref() {
+        if let Some(hc) = cfg.handler_config.as_ref() {
           dispatch_command_frame(
             packet.data,
             DispatchCtx {
-              keyring,
-              replay,
-              response_signal,
-              role_tag: cfg.role_tag,
-              my_mac: cfg.my_mac,
-              my_id: cfg.my_id,
-              handler: cfg.handler,
-              src: cfg.src,
-              frame_handler: cfg.frame_handler,
+              keyring: cfg.keyring,
+              replay: cfg.replay,
+              response_signal: cfg.response_signal,
+              role_tag: hc.role_tag,
+              my_mac: hc.my_mac,
+              my_id: hc.my_id,
+              handler: hc.handler,
+              src: hc.src,
+              frame_handler: hc.frame_handler,
             },
           );
         }
@@ -523,19 +628,19 @@ pub async fn run_receive_loop<L: CommLink>(
         // 双身份场景：手柄同时也订阅了 Frame（少见，但调试 / host 监听时需要）。
         // `dispatch_frame` 内部会在 `frame_handler.is_none()` 时 short-circuit，
         // 因此这里无需再嵌套判断——即使 cfg 未启用 frame_handler 也是零成本的。
-        if let Some(cfg) = handler_config.as_ref() {
+        if let Some(hc) = cfg.handler_config.as_ref() {
           dispatch_frame(
             packet.data,
             DispatchCtx {
-              keyring,
-              replay,
-              response_signal,
-              role_tag: cfg.role_tag,
-              my_mac: cfg.my_mac,
-              my_id: cfg.my_id,
-              handler: cfg.handler,
-              src: cfg.src,
-              frame_handler: cfg.frame_handler,
+              keyring: cfg.keyring,
+              replay: cfg.replay,
+              response_signal: cfg.response_signal,
+              role_tag: hc.role_tag,
+              my_mac: hc.my_mac,
+              my_id: hc.my_id,
+              handler: hc.handler,
+              src: hc.src,
+              frame_handler: hc.frame_handler,
             },
           );
         }
@@ -558,7 +663,7 @@ pub async fn run_receive_loop<L: CommLink>(
 fn handle_incoming_response(
   resp: &CommandResponse,
   peers: &'static PeerRegistry,
-  command_signal: &'static CommandOutSignal,
+  command_signal: &'static CommandOutChannel,
   keyring: &'static Keyring,
   response_handler: Option<ResponseHandler>,
 ) {
@@ -577,14 +682,29 @@ fn handle_incoming_response(
       // - 目标 MAC 现成（就是本次 AnnounceReply 的 `mac`），无需反查。
       //
       // # 为什么仍在每次 AnnounceReply（含 `Updated`）都重发？
-      // 保留这份**幂等自愈**作为兜底：单播仍可能因 (1) 覆盖式 `CommandOutSignal`
-      // 在被 `broadcast_loop` 消费前被后续命令覆盖、(2) peer 离线导致重试耗尽而失败。
+      // 保留这份**幂等自愈**作为兜底：单播仍可能因 (1) [`CommandOutChannel`] 队列在
+      // 突发下满、`try_send` 丢弃了这条 AssignId、(2) peer 离线导致重试耗尽而失败。
+      // （改成有界队列后 (1) 已从"必然覆盖上一条"降级为"仅队列满才丢"，但非零。）
       // 若只在 `Inserted` 时发一次，一旦丢失，该 peer 会**永久**停留在
       // [`crate::receiver::UNASSIGNED_ID`]。每次重发是幂等的：同一 MAC 的
       // `receiver_id` 由 registry 稳定保序分配、不会变化。发现流量极低频
       // （仅在 controller 广播 Announce 后出现），成本可忽略。
       let assigned = match peers.upsert(mac, role_tag, rssi_dbm, embassy_time::Instant::now()) {
         UpsertOutcome::Inserted { receiver_id } | UpsertOutcome::Updated { receiver_id } => {
+          Some(receiver_id)
+        }
+        UpsertOutcome::Evicted {
+          receiver_id,
+          evicted_id: _evicted_id,
+        } => {
+          // registry 满员，淘汰了最旧 peer 腾位；新 peer 照常单播 AssignId。
+          // 被淘汰者若仍在线，会在下一轮 Announce 中作为新条目重新入库。
+          #[cfg(feature = "defmt")]
+          defmt::info!(
+            "peer registry full: evicted receiver_id={=u8}, reassigned to new peer as id={=u8}",
+            _evicted_id,
+            receiver_id
+          );
           Some(receiver_id)
         }
         UpsertOutcome::Full => None,
@@ -596,7 +716,10 @@ fn handle_incoming_response(
           keyring.active(),
           CommandBody::AssignId { mac, receiver_id },
         );
-        command_signal.signal(OutboundCommand::unicast(mac, encode_command(&cmd)));
+        enqueue_command(
+          command_signal,
+          OutboundCommand::unicast(mac, encode_command(&cmd)),
+        );
       }
     }
     _ => {

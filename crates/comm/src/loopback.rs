@@ -17,7 +17,7 @@
 //!
 //! 每一"端"再被拆成 **一对 send/recv endpoint**，因为 [`CommLink`] 的
 //! `send` 与 `recv` 都要 `&mut self`，无法在两个 task 之间共享一个 endpoint。
-//! [`LoopbackLink::pair`] 返回 4 个 endpoint：
+//! [`pair`] 返回 4 个 endpoint：
 //! `(a_send, a_recv, b_send, b_recv)`。
 //!
 //! ## 只在 host 编译

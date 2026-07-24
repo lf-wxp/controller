@@ -32,7 +32,9 @@ use ssd1306::{I2CDisplayInterface, Ssd1306};
 use static_cell::StaticCell;
 
 use controller::config::display::{I2C_FREQ_HZ, OLED_ROTATION};
-use controller::config::tuning::{INPUT_SCAN_INTERVAL_MS, JOYSTICK_DEADZONE, TRANSMIT_INTERVAL_MS};
+use controller::config::tuning::{
+  INPUT_SCAN_INTERVAL_MS, JOYSTICK_DEADZONE, PEER_STALE_TTL_MS, TRANSMIT_INTERVAL_MS,
+};
 use controller::hal::led_effects::led_effects_task;
 use controller::hal::persist::{
   InMemoryStorage, NvsStorage, load_or_default, persist_worker_in_memory_task,
@@ -106,30 +108,6 @@ async fn main(spawner: Spawner) -> ! {
   // ============================================================
   controller::self_test::run();
 
-  // ------------------------------------------------------------
-  // [TEMP-DEBUG] 打印共享密钥前 4 字节，用于收发两端 .env 一致性核对。
-  //
-  // 泄漏 4 / 32 字节对高熵密钥无密码学威胁（剩余搜索空间 2^224），
-  // 但仍属敏感信息 —— **两端 fingerprint 比对完成后立即删除本段代码**。
-  //
-  // 期望日志：
-  //   [SECRET-DEBUG] v1[0..4]=xx:xx:xx:xx | v2[0..4]=xx:xx:xx:xx (remove after key sync check)
-  // ------------------------------------------------------------
-  {
-    use controller::config::keyring::{SECRET_V1, SECRET_V2};
-    info!(
-      "[SECRET-DEBUG] v1[0..4]={:02x}:{:02x}:{:02x}:{:02x} | v2[0..4]={:02x}:{:02x}:{:02x}:{:02x} (remove after key sync check)",
-      SECRET_V1[0],
-      SECRET_V1[1],
-      SECRET_V1[2],
-      SECRET_V1[3],
-      SECRET_V2[0],
-      SECRET_V2[1],
-      SECRET_V2[2],
-      SECRET_V2[3],
-    );
-  }
-
   // ============================================================
   // Wi-Fi / BLE / ESP-NOW 初始化
   //   - Wi-Fi 控制器构造后必须长期保留（driver 生命周期与其绑定）
@@ -149,8 +127,10 @@ async fn main(spawner: Spawner) -> ! {
     ..
   } = interfaces;
 
-  // 本机 MAC-48：用于 `comm::CommandHandlerConfig::my_mac`（AssignId 分派匹配），
-  // 语义上 Notifier 不会收到给自己的 AssignId，此值仅作占位；日志里也顺便打印。
+  // 本机 MAC-48：两处用途 ——
+  //   1. `comm::CommandHandlerConfig::my_mac`（AssignId 分派匹配；Notifier 通常收不到
+  //      给自己的 AssignId，主要作 AnnounceReply 的 my_mac 来源）
+  //   2. `EspNowRecvLink` 自帧回环过滤（丢弃 src == own_mac 的帧）
   let own_mac = station.mac_address();
   info!(
     "[ESP-NOW] station MAC: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
@@ -175,18 +155,24 @@ async fn main(spawner: Spawner) -> ! {
   // 交给 comm::Notifier 门面的两个 loop 驱动。Frame/Command/Response 三路 signal
   // 已在 esp_now/mod.rs 以 static 形式定义，无需 StaticCell。
   let send_link = EspNowSendLink::new(esp_now_sender, esp_now_manager_static);
-  let recv_link = EspNowRecvLink::new(esp_now_receiver);
+  // own_mac 传入 recv link：过滤自帧回环（self-echo），避免双身份 Notifier 自发现
+  let recv_link = EspNowRecvLink::new(esp_now_receiver, own_mac);
+
+  // 组装双身份 Notifier 门面（link 无关；收拢 keyring / registry / replay / 三路
+  // signal + command handler）。拿到 `&'static` 后既喂两条后台 loop，主循环也用它
+  // `discover()`。
+  let notifier = controller::transport::esp_now::init_notifier(own_mac);
 
   // Spawn Notifier broadcast loop（对应旧 esp_now_broadcast_task）
   spawner.spawn(
-    esp_now_notifier_broadcast_task(send_link)
+    esp_now_notifier_broadcast_task(notifier, send_link)
       .expect("Failed to build ESP-NOW notifier broadcast task token"),
   );
 
   // Spawn Notifier recv loop（对应旧 esp_now_receive_task；含 AnnounceReply
   // upsert / 自动 AssignId / Command 派发到 control::dispatch_command_from_esp_now）
   spawner.spawn(
-    esp_now_notifier_recv_task(recv_link, own_mac)
+    esp_now_notifier_recv_task(notifier, recv_link)
       .expect("Failed to build ESP-NOW notifier recv task token"),
   );
 
@@ -200,14 +186,15 @@ async fn main(spawner: Spawner) -> ! {
   // 能力已下沉到 `comm`：
   //   - `SimpleEntropy` 实现 `EntropySource`（硬件 RNG ⊕ 时钟抖动）
   //   - `comm::init_session` 一行完成 seed 采样 + 写入 SESSION_NONCE
-  //   - `nonce_broadcast_task` 使用 comm 提供的通用 loop，无需手写
+  //   - `nonce_broadcast_task` 直接调门面的 `run_nonce_broadcast_loop`，无需手写
   // ============================================================
   {
     let mut entropy = controller::hal::rng::SimpleEntropy;
     let nonce = comm::init_session(&mut entropy);
     info!("[SEC] Session nonce initialized (hw RNG): 0x{:08x}", nonce);
   }
-  spawner.spawn(nonce_broadcast_task().expect("Failed to build nonce_broadcast_task token"));
+  spawner
+    .spawn(nonce_broadcast_task(notifier).expect("Failed to build nonce_broadcast_task token"));
 
   // BLE 侧响应中继：向 dashboard 补发 NonceHello + 转发 REGISTRY 接收方目录
   spawner.spawn(ble_response_relay_task().expect("Failed to build ble_response_relay_task token"));
@@ -470,7 +457,7 @@ async fn main(spawner: Spawner) -> ! {
   // 嵌套 CompositeTransport：三路组合
   let mut transport = CompositeTransport::new(
     BleHidTransport::new(signal),
-    CompositeTransport::new(EspNowTransport::new(), UiTransport::new(ui_signal)),
+    CompositeTransport::new(EspNowTransport::new(notifier), UiTransport::new(ui_signal)),
   );
 
   info!("Hardware ready. Entering main loop.");
@@ -491,20 +478,6 @@ async fn main(spawner: Spawner) -> ! {
     // ---- 采样 + 本地反馈（LED 位图写入 AtomicU8，effect task 应用到硬件）----
     let mut sample = sampler.poll(&mut adc);
     update_button_led_state(&sample);
-
-    // ---- 硬件极性诊断：每 1s（100 tick）打一次 JoyBtn(IO12) 的原始电平 ----
-    //
-    // 用于验证 IO12 的 `Pull` + `active_high` 配置是否与实际接线一致：若按下时
-    // raw 电平**没有变化**，说明该 pin 没被接通到预期电压；若 raw 变化了但
-    // state=false，说明极性配置反了。排查完成后请删除此块。
-    // （IO15 已改为彩灯输出，不再读输入，故不在此诊断。）
-    if tick.is_multiple_of(100) {
-      info!(
-        "[DIAG] joy_btn raw_high={} down={}",
-        sampler.joy_btn_raw_is_high(),
-        sample.joy_button.is_down(),
-      );
-    }
 
     // ---- 应用灵敏度缩放（可能被 Host 命令动态修改）----
     apply_sensitivity(&mut sample.state);
@@ -532,19 +505,19 @@ async fn main(spawner: Spawner) -> ! {
 
     // ---- 首次进入 Selecting：广播 Announce，让所有 receiver 上报 AnnounceReply ----
     //
-    // 直接用 SESSION_KEYRING 分配 seq 并 encode；推入 CMD_OUT_SIG 后由 broadcast_loop 出站。
-    // 这就是 `comm::Notifier::discover()` 的内联展开 —— controller 未构造 Notifier 实例，直接用 comm 组件。
+    // 门面一行搞定：分配 seq + encode + 入队 CMD_OUT_SIG（满时丢弃并计 metrics）。
     if selector_outcome.just_entered {
-      let seq = controller::SESSION_KEYRING.next_seq();
-      let cmd = controller::protocol::Command::with_key(
-        seq,
-        controller::SESSION_KEYRING.active(),
-        controller::protocol::CommandBody::Announce,
-      );
-      controller::transport::esp_now::CMD_OUT_SIG.signal(
-        comm::notifier::signals::OutboundCommand::broadcast(controller::protocol::encode_command(
-          &cmd,
-        )),
+      // 发现前先淘汰长时间未再上报的接收方，让候选列表反映当前在线情况；仍在线者
+      // 会在本轮 AnnounceReply 中立即重新入库（见 `PEER_STALE_TTL_MS` 文档）。
+      controller::REGISTRY.prune(Instant::now(), Duration::from_millis(PEER_STALE_TTL_MS));
+      notifier.discover();
+    }
+
+    // ---- 退出 Selecting：目标位图已在选择器内提交，恢复正常发帧 ----
+    if selector_outcome.just_exited {
+      info!(
+        "[UI] exited target selector, dest_mask=0x{:08x}",
+        controller::ui::active_dest_mask()
       );
     }
 
@@ -577,17 +550,14 @@ async fn main(spawner: Spawner) -> ! {
 // K3: Nonce 广播 task 本地包装
 // ============================================================
 //
-// `comm::run_nonce_broadcast_loop` 是泛型 async fn（严格来说
-// 参数并非泛型，但 `#[embassy_executor::task]` 需要具体的 async fn 签名，
-// 而不是"调用其它 async fn 再返回 future"的透明包装），因此需要在此
-// 用 `#[embassy_executor::task]` 包一层。
+// `Notifier::run_nonce_broadcast_loop` 是 async 方法（`#[embassy_executor::task]`
+// 需要具体的 async fn 签名，不能直接标注方法），因此在此用 task 包一层。
+// 门面自己持有 `RESP_SIG`，无需再手抄那份 `&'static` 引用。
 #[embassy_executor::task]
-async fn nonce_broadcast_task() -> ! {
-  comm::run_nonce_broadcast_loop(
-    &controller::transport::esp_now::RESP_SIG,
-    comm::DEFAULT_NONCE_BROADCAST_INTERVAL,
-  )
-  .await
+async fn nonce_broadcast_task(notifier: &'static comm::Notifier) -> ! {
+  notifier
+    .run_nonce_broadcast_loop(comm::DEFAULT_NONCE_BROADCAST_INTERVAL)
+    .await
 }
 
 // ============================================================
@@ -602,39 +572,81 @@ async fn nonce_broadcast_task() -> ! {
 //
 // 本任务在 BLE 已连接时周期性：先补一条 NonceHello（让 dashboard 免鉴权
 // bootstrap nonce），再把 REGISTRY 快照逐条以 AnnounceReply 推给 dashboard。
-// RESPONSE_SIGNAL 是覆盖式，故每条之间留 gap 让 BLE tx 任务先取走再发下一条。
+//
+// # 背压式入队（替代旧的"固定 gap + 撞运气 try_send"）
+// RESPONSE_SIGNAL 是深度 [`OUTBOUND_QUEUE_DEPTH`](comm::notifier::signals::OUTBOUND_QUEUE_DEPTH)=4
+// 的有界队列，且**与命令 Ack 共用**（`broadcast_response` 也写它）。旧实现每条之间
+// 固定 sleep 80ms 后 `try_send`，有两个隐患：
+//   1. peer 数多 / BLE 卡顿时靠后的 AnnounceReply 会被静默丢弃；
+//   2. `(1+N)*80ms` 在 N≥24 时超过周期，导致 relay 周期重叠、负载叠加。
+// 现改为 [`relay_send`] 的**背压式入队**：只在队列留有富余空位（保留 ≥1 格给延迟
+// 敏感的命令 Ack）时才入队，否则轮询等 BLE tx 任务先取走。永不溢出、不挤丢 Ack、
+// peer 数多只是本轮耗时更长（单任务顺序执行，周期 Timer 在循环之后，天然无重叠）。
 const BLE_RELAY_PERIOD_MS: u64 = 2000;
-const BLE_RELAY_GAP_MS: u64 = 80;
+/// relay 入队前要求的最小空闲槽位：给命令 Ack（`broadcast_response`）至少留 1 格，
+/// 顺带兜住"检查空位与 try_send 之间被并发 Ack 抢走 1 格"的竞态（留 2 即使被抢 1 仍成）。
+const BLE_RELAY_MIN_FREE_SLOTS: usize = 2;
+/// 队列暂无富余空位时的轮询间隔
+const BLE_RELAY_POLL_MS: u64 = 20;
+/// 单条 relay 消息等待队列空位的上限：正常连接时消费者毫秒级取走；超时说明 BLE
+/// 卡死/断开，放弃本轮剩余、等下个周期（届时重新快照 REGISTRY）。
+const BLE_RELAY_SEND_TIMEOUT_MS: u64 = 500;
 
 #[embassy_executor::task]
 async fn ble_response_relay_task() -> ! {
   use comm::{CommandResponse, KeyId, RSSI_UNKNOWN, session_nonce};
-  use controller::transport::ble_hid::signal_response;
+  use controller::transport::ble_hid::{RESPONSE_SIGNAL, signal_response};
   use controller::ui::BLE_CONNECTED;
+
+  // 背压式入队：见任务上方文档。返回 false = 超时（BLE 卡死/断开），调用方应放弃本轮。
+  async fn relay_send(resp: CommandResponse) -> bool {
+    let mut waited_ms = 0_u64;
+    loop {
+      if RESPONSE_SIGNAL.free_capacity() >= BLE_RELAY_MIN_FREE_SLOTS {
+        // 有富余空位：signal_response 内部 try_send，此处几乎必成（保留余量兜住竞态）
+        signal_response(resp);
+        return true;
+      }
+      if waited_ms >= BLE_RELAY_SEND_TIMEOUT_MS {
+        return false;
+      }
+      Timer::after(Duration::from_millis(BLE_RELAY_POLL_MS)).await;
+      waited_ms += BLE_RELAY_POLL_MS;
+    }
+  }
 
   loop {
     if BLE_CONNECTED.load(Ordering::Relaxed) {
       // 1) NonceHello —— dashboard 借此免鉴权 bootstrap session nonce
-      signal_response(CommandResponse::nonce_hello(session_nonce()));
-      Timer::after(Duration::from_millis(BLE_RELAY_GAP_MS)).await;
-
-      // 2) REGISTRY 快照 → 逐条 AnnounceReply（携带 controller 侧 role / rssi）
-      for peer in controller::REGISTRY.snapshot().iter() {
-        // comm 的未知 RSSI 哨兵是 i8::MIN(-128)，协议约定的未知值是 -127；
-        // 映射后 dashboard 才会显示 "--" 而非 -128dBm
-        let rssi = if peer.rssi_dbm == RSSI_UNKNOWN {
-          -127
-        } else {
-          peer.rssi_dbm
-        };
-        signal_response(CommandResponse::announce_reply(
-          0,
-          KeyId::DEFAULT,
-          peer.mac,
-          rssi,
-          peer.role,
-        ));
-        Timer::after(Duration::from_millis(BLE_RELAY_GAP_MS)).await;
+      if relay_send(CommandResponse::nonce_hello(session_nonce())).await {
+        // 2) 逐 receiver_id 遍历 REGISTRY → 每台一条 AnnounceReply。
+        //    刻意用 `peer_by_id` 单点取而非 `snapshot()`：后者会把最多 MAX_PEERS 个
+        //    PeerInfo 的 Vec 搬上栈并跨 await 常驻，触发 large_stack_frames；单点版
+        //    每次只持有一个小 PeerInfo。
+        for id in 0..(comm::MAX_PEERS as u8) {
+          let Some(peer) = controller::REGISTRY.peer_by_id(id) else {
+            continue;
+          };
+          // comm 的未知 RSSI 哨兵是 i8::MIN(-128)，协议约定的未知值是 -127；
+          // 映射后 dashboard 才会显示 "--" 而非 -128dBm
+          let rssi = if peer.rssi_dbm == RSSI_UNKNOWN {
+            -127
+          } else {
+            peer.rssi_dbm
+          };
+          let sent = relay_send(CommandResponse::announce_reply(
+            0,
+            KeyId::DEFAULT,
+            peer.mac,
+            rssi,
+            peer.role,
+          ))
+          .await;
+          if !sent {
+            // 超时：BLE 卡死/断开，放弃本轮剩余 peer，等下个周期重试
+            break;
+          }
+        }
       }
     }
     Timer::after(Duration::from_millis(BLE_RELAY_PERIOD_MS)).await;

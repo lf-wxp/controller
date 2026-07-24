@@ -1,8 +1,9 @@
 //! LCD 显示模块：1.3 寸 240x240 ST7789 SPI 屏幕
 //!
-//! 提供两个能力：
-//! 1. [`init_display`]：完成 SPI + DC/RST/BL 的初始化，返回 `Display` 句柄
-//! 2. [`ViewModel`] + [`render`]：把 `GamepadState` + 元数据画到屏上
+//! 只负责**绘制**（SPI + DC/RST/BL 的硬件初始化在 `bin/main.rs` 里完成）：
+//! - [`ViewModel`] + [`render`]：把 `GamepadState` + 元数据增量画到屏上
+//! - [`SelfTestReport`] + [`render_self_test`]：开机自检（POST）结果页
+//! - [`stabilize_knob`]：旋钮显示滞回，吸收 ADC 抖动
 //!
 //! 布局（240x240）：
 //! ```text
@@ -14,7 +15,7 @@
 //!   │ Joy ( +12000, -50 )      │  摇杆 + 十字准星
 //!   │                          │
 //!   │ Knob1 32768  Knob2 16384 │  两个旋钮进度条
-//!   │ id=0.  filt=0  rep=0     │  底部 peer 状态行
+//!   │ id= 3 *assigned          │  底部 peer 状态行
 //!   └──────────────────────────┘
 //! ```
 
@@ -55,15 +56,11 @@ pub struct ViewModel {
   pub gap_count: u32,
   /// 累计成功解码帧数
   pub ok_count: u32,
-  /// 累计被 `dest_mask` 过滤掉（收到但不是发给本机）的帧数
-  pub filtered_count: u32,
   /// 本机当前 `receiver_id`（由手柄的 `AssignId` 命令下发；未分配时为
   /// [`crate::peer::INITIAL_RECEIVER_ID`] = `UNASSIGNED_ID` / `u8::MAX`）
   pub receiver_id: u8,
   /// 是否已被手柄通过 `AssignId` 分配过 ID
   pub assigned: bool,
-  /// 累计发出的 `AnnounceReply` 次数
-  pub reply_count: u32,
   /// 最近一帧的手柄状态
   pub state: GamepadState,
 }
@@ -75,10 +72,8 @@ impl ViewModel {
       last_seq: 0,
       gap_count: 0,
       ok_count: 0,
-      filtered_count: 0,
       receiver_id: crate::peer::INITIAL_RECEIVER_ID,
       assigned: false,
-      reply_count: 0,
       state: GamepadState::EMPTY,
     }
   }
@@ -452,37 +447,19 @@ where
 
   // —— 底部 peer 状态行（y=228~239）——
   //
-  // 显示：本机 receiver_id、是否被手柄分配过、被 dest_mask 过滤的帧数、发出的 AnnounceReply 数
-  // 格式（示例）：`id= 3*  filt=12    rep=2`；`*` 表示已被 AssignId 分配过（未分配显示 `.`）。
+  // 显示：本机 receiver_id + 是否被手柄 `AssignId` 分配过。
+  // 格式（示例）：`id= 3 *assigned`；`*` 表示已被分配（未分配显示 `.unassigned`）。
   // 未分配时 receiver_id 是 UNASSIGNED_ID（`u8::MAX`）哨兵，显示 `-` 而非裸 255。
-  if full
-    || prev.is_some_and(|p| {
-      p.receiver_id != vm.receiver_id
-        || p.assigned != vm.assigned
-        || p.filtered_count != vm.filtered_count
-        || p.reply_count != vm.reply_count
-    })
-  {
+  if full || prev.is_some_and(|p| p.receiver_id != vm.receiver_id || p.assigned != vm.assigned) {
     let mut peer = heapless_str::<48>();
-    let mark = if vm.assigned { '*' } else { '.' };
-    // filt / rep 单调递增，固定宽度 `{:<6}` 的尾随空格足以抹除历史残留；
-    // id 右对齐到 2 列，未分配时占位 "-"，两种情况列宽一致。
+    // id 右对齐到 2 列，未分配时占位 "-"，两种情况列宽一致。尾随空格抹除历史残留。
     let _ = if vm.assigned {
       core::fmt::write(
         &mut peer,
-        format_args!(
-          "id={:>2}{}  filt={:<6}  rep={:<6}",
-          vm.receiver_id, mark, vm.filtered_count, vm.reply_count
-        ),
+        format_args!("id={:>2} *assigned    ", vm.receiver_id),
       )
     } else {
-      core::fmt::write(
-        &mut peer,
-        format_args!(
-          "id={:>2}{}  filt={:<6}  rep={:<6}",
-          "-", mark, vm.filtered_count, vm.reply_count
-        ),
-      )
+      core::fmt::write(&mut peer, format_args!("id={:>2} .unassigned  ", "-"))
     };
     draw_text(
       display,

@@ -28,11 +28,6 @@ pub const BROADCAST: [u8; 6] = [0xFF; 6];
 ///   天然表达"尚未被寻址"，并与 [`comm::Receiver`] 的判定保持一致。
 pub const INITIAL_RECEIVER_ID: u8 = comm::receiver::UNASSIGNED_ID;
 
-/// receiver_id 上限（0..=31，对应 `dest_mask: u32` 的 32 个位）。
-///
-/// comm 内部不再检查此上限（`AssignId` 是内部动作），仅由 UI 层用于渲染断言。
-pub const RECEIVER_ID_MAX: u8 = 31;
-
 /// AnnounceReply 里的 `role_tag`：3 字节 ASCII，标识本 receiver 的角色。
 ///
 /// 本项目是 "LCD Display Sink"，用 `lcd` 表示；不足右侧补 0。

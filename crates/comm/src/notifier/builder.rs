@@ -7,22 +7,25 @@
 //! 方案 —— 生产 crate 中 `notifier::builder()...build()` 会在启动最早期就
 //! 触发 panic，配合明确的错误消息 & 单元测试完全能替代编译期强制。
 //!
-//! 这是 rust-skills [`api-builder-pattern`] 明确接受的实用主义妥协。
+//! 这是 rust-skills `api-builder-pattern` 明确接受的实用主义妥协。
 //!
 //! ## 使用示例
 //! ```ignore
 //! Notifier::builder()
-//!   .link(link)                   // 必填
 //!   .keyring(&KEYRING)             // 必填
 //!   .peers(&PEERS)                 // 必填
 //!   .replay(&REPLAY)               // 必填
-//!   .selector(&SELECTOR)           // 必填
+//!   .selector(&SELECTOR)           // 可选：仅 select_targets / selector 用
 //!   .frame_signal(&SIG_FRAME)      // 必填
 //!   .command_signal(&SIG_CMD)      // 必填
 //!   .response_signal(&SIG_RESP)    // 必填
 //!   .with_command_handler(...)     // 可选：双身份场景
+//!   .with_response_handler(...)    // 可选：业务 Response 回调
 //!   .build();
 //! ```
+//!
+//! 注意：门面**不含 link**——link 在 `run_broadcast_loop` / `run_receive_loop` 时
+//! 按 send / recv 端分别传入。
 //!
 //! ## 为什么用 `&'static` 引用而不是内置 `Signal`？
 //! embassy 的 `Signal` 是 `Sync + !Unpin`；放进 `Notifier` 里再 spawn 到 task 会遇到
@@ -32,30 +35,31 @@
 use core::sync::atomic::AtomicU8;
 
 use crate::keyring::Keyring;
-use crate::link::CommLink;
 use crate::peer_registry::PeerRegistry;
 use crate::receiver::{CommandHandler, CommandSource, FrameHandler};
 use crate::replay::ReplayGuard;
 use crate::selector::Selector;
 
-use super::Notifier;
-use super::signals::{CommandOutSignal, FrameSignal, ResponseSignal};
+use super::signals::{CommandOutChannel, FrameSignal, ResponseChannel};
+use super::{Notifier, ResponseHandler};
 
 /// Notifier 的简化 builder
 ///
 /// 所有必填字段以 `Option` 形式存储，`build()` 内 `expect` 校验。
+/// 不含 `link`：门面是 link 无关的编排句柄，link 在跑 loop 时按端传入。
 #[must_use]
-pub struct NotifierBuilder<L> {
-  pub(super) link: Option<L>,
+pub struct NotifierBuilder {
   pub(super) keyring: Option<&'static Keyring>,
   pub(super) peers: Option<&'static PeerRegistry>,
   pub(super) replay: Option<&'static ReplayGuard>,
   pub(super) selector: Option<&'static Selector>,
   pub(super) frame_signal: Option<&'static FrameSignal>,
-  pub(super) command_signal: Option<&'static CommandOutSignal>,
-  pub(super) response_signal: Option<&'static ResponseSignal>,
+  pub(super) command_signal: Option<&'static CommandOutChannel>,
+  pub(super) response_signal: Option<&'static ResponseChannel>,
   /// 可选：开启"双身份"能力后，Notifier 会在 run_receive_loop 里同时处理 Command 帧
   pub(super) handler_config: Option<CommandHandlerConfig>,
+  /// 可选：业务 Response 回调
+  pub(super) response_handler: Option<ResponseHandler>,
 }
 
 /// "双身份" Notifier 启用 command handler 时需要的参数集
@@ -83,17 +87,16 @@ pub struct CommandHandlerConfig {
   pub frame_handler: Option<FrameHandler>,
 }
 
-impl<L> Default for NotifierBuilder<L> {
+impl Default for NotifierBuilder {
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl<L> NotifierBuilder<L> {
+impl NotifierBuilder {
   /// 创建一个"什么都没设置"的初始 builder
   pub const fn new() -> Self {
     Self {
-      link: None,
       keyring: None,
       peers: None,
       replay: None,
@@ -102,15 +105,8 @@ impl<L> NotifierBuilder<L> {
       command_signal: None,
       response_signal: None,
       handler_config: None,
+      response_handler: None,
     }
-  }
-}
-
-impl<L: CommLink> NotifierBuilder<L> {
-  /// 设置物理链路（必填）
-  pub fn link(mut self, link: L) -> Self {
-    self.link = Some(link);
-    self
   }
 
   /// 设置 keyring（必填）
@@ -131,7 +127,12 @@ impl<L: CommLink> NotifierBuilder<L> {
     self
   }
 
-  /// 设置 receiver 选择器（必填）
+  /// 设置 receiver 选择器（**可选**）
+  ///
+  /// 仅 [`Notifier::select_targets`](super::Notifier::select_targets) /
+  /// [`Notifier::selector`](super::Notifier::selector) 用它。若你在自己的 UI 层
+  /// 算好 `dest_mask` 直接写进 `Frame`（如 controller），可不设置——门面的两条
+  /// loop 与其它生产者方法都不依赖 selector。
   pub fn selector(mut self, selector: &'static Selector) -> Self {
     self.selector = Some(selector);
     self
@@ -144,13 +145,13 @@ impl<L: CommLink> NotifierBuilder<L> {
   }
 
   /// 设置 command 出站 Signal（必填）
-  pub fn command_signal(mut self, sig: &'static CommandOutSignal) -> Self {
+  pub fn command_signal(mut self, sig: &'static CommandOutChannel) -> Self {
     self.command_signal = Some(sig);
     self
   }
 
   /// 设置 response 入站 Signal（必填）
-  pub fn response_signal(mut self, sig: &'static ResponseSignal) -> Self {
+  pub fn response_signal(mut self, sig: &'static ResponseChannel) -> Self {
     self.response_signal = Some(sig);
     self
   }
@@ -163,7 +164,7 @@ impl<L: CommLink> NotifierBuilder<L> {
   /// 用户业务命令——派发给你提供的 handler。
   ///
   /// # ⚠️ 自帧回环约定
-  /// 双身份 `Notifier` 会**同时收发** Command / Announce。若底层 [`CommLink`] 存在
+  /// 双身份 `Notifier` 会**同时收发** Command / Announce。若底层 [`CommLink`](crate::CommLink) 存在
   /// 自回环（`recv` 会交回本机 `send` 出去的帧），会触发自发现 / 自执行问题。
   /// 详见 [`CommLink`](crate::CommLink) 文档的"自帧回环"章节——实现方需保证
   /// 不回环本机帧（ESP-NOW 默认满足）。
@@ -214,19 +215,28 @@ impl<L: CommLink> NotifierBuilder<L> {
     self
   }
 
+  /// **可选**：订阅业务 Response 回调
+  ///
+  /// 接收 loop 收到**非 `AnnounceReply`** 的 Response（`Ack` / `Error` /
+  /// `BatterySnapshot` / `ReceiverList` 等）时调用它；`AnnounceReply` 仍由 comm
+  /// 内部消费（upsert + 回 AssignId）。不设置则这些 Response 被静默丢弃。
+  pub fn with_response_handler(mut self, handler: ResponseHandler) -> Self {
+    self.response_handler = Some(handler);
+    self
+  }
+
   /// 构造 [`Notifier`]
   ///
   /// # Panics
   /// 任一必填字段未设置时 panic —— 因为这属于**程序员错误**（typo / 忘配置），
   /// 生产环境不允许发生。请在开发阶段就跑一遍 `notifier::builder()...build()`
   /// 触发 panic 补齐字段。
-  pub fn build(self) -> Notifier<L> {
+  pub fn build(self) -> Notifier {
     Notifier {
-      link: self.link.expect("Notifier: `link` is required"),
       keyring: self.keyring.expect("Notifier: `keyring` is required"),
       peers: self.peers.expect("Notifier: `peers` is required"),
       replay: self.replay.expect("Notifier: `replay` is required"),
-      selector: self.selector.expect("Notifier: `selector` is required"),
+      selector: self.selector,
       frame_signal: self
         .frame_signal
         .expect("Notifier: `frame_signal` is required"),
@@ -237,6 +247,7 @@ impl<L: CommLink> NotifierBuilder<L> {
         .response_signal
         .expect("Notifier: `response_signal` is required"),
       handler_config: self.handler_config,
+      response_handler: self.response_handler,
     }
   }
 }

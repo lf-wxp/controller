@@ -14,6 +14,11 @@
 //! ## 与 c6 的差异
 //! - `Packet::src` **填入 `pkt.info.src_address`**（controller 保留了旧 `handle_incoming_response`
 //!   曾用过的 src_mac 语义，虽然 comm 内部实际不消费，但语义完整对未来 debug 有价值）
+//! - **自帧回环过滤**：[`EspNowRecvLink`] 持有本机 MAC，`recv` 内部丢弃
+//!   `src == own_mac` 的帧。这是 [`comm::CommLink`] 文档约定的"self-echo 必须由 link
+//!   实现方过滤"的落地点：手柄是**双身份 Notifier**，若底层链路回环了自己广播的
+//!   `Announce`，comm 会回 `AnnounceReply` 并把**自己**登记成 peer（自发现回环）。
+//!   ESP-NOW 硬件默认不回环，此过滤是低成本的兜底防御。
 //! - 错误名保持 controller-local，避免与 c6 端冲突（虽然两个 crate 各自命名空间隔离）
 
 use comm::{CommLink, Packet};
@@ -140,17 +145,22 @@ pub struct EspNowRecvLink {
   scratch: [u8; ESP_NOW_MTU],
   scratch_len: usize,
   scratch_src: [u8; 6],
+  /// 本机 MAC —— 用于丢弃自帧回环（见模块文档 & [`comm::CommLink`] self-echo 约定）
+  own_mac: [u8; 6],
 }
 
 impl EspNowRecvLink {
-  /// 用 `esp_now.split()` 拆出的 receiver 构造
+  /// 用 `esp_now.split()` 拆出的 receiver + 本机 MAC 构造
+  ///
+  /// `own_mac` 用于在 `recv` 内部过滤掉链路回环的自帧（`src == own_mac`）。
   #[must_use]
-  pub const fn new(receiver: EspNowReceiver<'static>) -> Self {
+  pub const fn new(receiver: EspNowReceiver<'static>, own_mac: [u8; 6]) -> Self {
     Self {
       receiver,
       scratch: [0; ESP_NOW_MTU],
       scratch_len: 0,
       scratch_src: [0; 6],
+      own_mac,
     }
   }
 }
@@ -167,16 +177,24 @@ impl CommLink for EspNowRecvLink {
   }
 
   async fn recv(&mut self) -> Result<Packet<'_, Self::Addr>, Self::RecvError> {
-    let pkt = self.receiver.receive_async().await;
-    let data = pkt.data();
-    let len = data.len().min(ESP_NOW_MTU);
-    self.scratch[..len].copy_from_slice(&data[..len]);
-    self.scratch_len = len;
-    // 保留 src_mac，虽然 comm 内部当前不消费，但语义完整
-    self.scratch_src = pkt.info.src_address;
-    Ok(Packet {
-      src: self.scratch_src,
-      data: &self.scratch[..self.scratch_len],
-    })
+    // 循环直到收到一条**非自帧**：丢弃 src == own_mac 的回环，绝不把它交回给
+    // comm（否则双身份 Notifier 会自发现 / 自执行，见模块文档）。ESP-NOW 默认不
+    // 回环，此循环在正常部署下永远一次命中。
+    loop {
+      let pkt = self.receiver.receive_async().await;
+      let src = pkt.info.src_address;
+      if src == self.own_mac {
+        continue;
+      }
+      let data = pkt.data();
+      let len = data.len().min(ESP_NOW_MTU);
+      self.scratch[..len].copy_from_slice(&data[..len]);
+      self.scratch_len = len;
+      self.scratch_src = src;
+      return Ok(Packet {
+        src: self.scratch_src,
+        data: &self.scratch[..self.scratch_len],
+      });
+    }
   }
 }

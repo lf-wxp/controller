@@ -193,6 +193,6 @@ fn set_target(led1: &mut Led<'static>, led2: &mut Led<'static>, led_idx: u8, on:
   match led_idx {
     0 => led1.set(on),
     1 => led2.set(on),
-    _ => {} // 参数校验在 handle_command 内已做，理论不会到这里
+    _ => {} // 参数校验在 control::execute_command 内已做，理论不会到这里
   }
 }

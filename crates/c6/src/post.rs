@@ -40,7 +40,7 @@ pub async fn step<D>(
   Timer::after(STEP_DELAY).await;
 }
 
-/// 只重画自检页并 sleep，不改动报告（用于首屏"全部 pending"）。
+/// 只重画自检页，不改动报告、不 sleep（用于首屏"全部 pending"）。
 pub async fn refresh<D>(display: &mut D, report: &SelfTestReport)
 where
   D: DrawTarget<Color = Rgb565>,

@@ -121,12 +121,12 @@
 │     K1 ▓▓▓▓▓▓░░░░  32768      │  ← 双旋钮进度条
 │     K2 ▓▓▓░░░░░░░  16384      │
 │                               │
-│ id=3*  filt=12  rep=2          │  ← 底部 peer 状态行
+│ id= 3 *assigned               │  ← 底部 peer 状态行
 └───────────────────────────────┘
 ```
 
-> **底部状态行说明**：`id=N` 为当前 receiver_id，`*` 表示已被手柄 AssignId 分配（`.` 为初始占位），
-> `filt` 为被 dest_mask 过滤的帧数，`rep` 为已发出的 AnnounceReply 次数。
+> **底部状态行说明**：`id=N` 为当前 receiver_id，`*assigned` 表示已被手柄 AssignId 分配
+> （未分配显示 `id=- .unassigned`）。
 
 ---
 
@@ -172,17 +172,19 @@ flowchart LR
 
     subgraph Tasks["⚙️ Embassy Tasks"]
         direction TB
-        Recv["🎧 recv_task<br/>Frame + Command 双路分派"]
-        Main["🎨 main loop<br/>select + render"]
+        Recv["🎧 recv_loop_task<br/>comm::Receiver::run_receive_loop"]
+        Bcast["📢 broadcast_loop_task<br/>comm::Receiver::run_broadcast_loop"]
+        Main["🎨 main loop<br/>Watch.changed() + render"]
     end
 
-    Peer[["🆔 PeerCtx<br/>receiver_id + replay"]]
+    Comm[["📦 comm::Receiver<br/>decode / CRC / HMAC / 抗重放<br/>+ MY_ID / AnnounceReply / AssignId"]]
     Watch[["📬 Watch&lt;ViewModel&gt;"]]
 
     WIFI ==>|25B Frame / 24B Command| Recv
-    Recv -.->|查询/更新| Peer
-    Recv ==>|发布| Watch
-    Recv ==>|AnnounceReply| WIFI
+    Recv -.->|dispatch| Comm
+    Comm ==>|on_frame → 发布| Watch
+    Comm ==>|AnnounceReply / Ack 入队| Bcast
+    Bcast ==>|广播| WIFI
     Watch ==>|订阅| Main
     Main ==>|绘制| LCD
 
@@ -191,24 +193,29 @@ flowchart LR
     classDef pipe fill:#fff8d9,stroke:#c9a227,stroke-width:2px,color:#000
     classDef peer fill:#e8f5e9,stroke:#388e3c,stroke-width:2px,color:#000
     class WIFI,LCD hw
-    class Recv,Main task
+    class Recv,Bcast,Main task
     class Watch pipe
-    class Peer peer
+    class Comm peer
 ```
 
 ### 🔄 数据流
 
-1. **`recv_task`** — 常驻协程（双路分派）
-   - **Frame 通路**（25B `0xC71E`）：`decode_frame` → `dest_mask` 过滤 → seq gap 检测 → 更新 `ViewModel` → `Watch::send`
-   - **Command 通路**（24B `0xCB01`）：`decode_command` → 抗重放窗口 → `Announce`（广播 `AnnounceReply`）/ `AssignId`（更新 `PeerCtx.receiver_id`）
-2. **主循环** — 单源触发 + 增量重绘
+1. **`recv_loop_task`** — 常驻协程，转交 `comm::Receiver::run_receive_loop`
+   解码 / CRC / HMAC / `dest_mask` 过滤 / 抗重放 / `Announce`→`AnnounceReply` / `AssignId`→写 `MY_ID`
+   **全部在 comm 内部完成**；c6 只提供两个回调：
+   - **`on_frame`**（`src/radio.rs`）：comm 过滤后**确实发给本机**的 Frame → seq gap 检测 → 更新 `ViewModel` → `Watch::send`
+   - **`on_command`**：业务命令（`LedBlink` / `ShowToast` / …）落地点；当前一律 `CommandOutcome::NoReply`
+2. **`broadcast_loop_task`** — 转交 `comm::Receiver::run_broadcast_loop`，把 comm 入队的
+   `AnnounceReply` / `Ack` 经 `EspNowSendLink` 广播出去
+3. **主循环** — 单源触发 + 增量重绘
    `Watch.changed()` → `render(vm, Some(prev))`：逐字段与上一帧比较，**只重画变化的部件**
    （文本带背景色原地覆盖，方块/进度条/摇杆自清除矩形）。首帧 `prev=None` 时整屏清一次并全量绘制。
    避免了早期"每帧 `fill_screen` 全屏刷黑再重绘"导致的持续闪烁。
-3. **中间通道** — 零拷贝广播
+4. **中间通道** — 零拷贝广播
    `embassy_sync::watch::Watch<CriticalSectionRawMutex, ViewModel, 1>`
-4. **PeerCtx** — 控制面上下文
-   存放 `receiver_id`（动态分配）+ `AntiReplayWindow`（64 位滑动窗），纯内存态、重启自愈
+5. **控制面状态** — 已下沉给 comm
+   `receiver_id`（`static AtomicU8 MY_ID`，comm 收到匹配 mac 的 `AssignId` 时写入）+
+   `AntiReplayWindow`（`comm::ReplayGuard`，64 位滑动窗），纯内存态、重启自愈。旧的手写 `PeerCtx` 已删除。
 
 > **📥 业务命令当前被静默忽略（如需下发，看这里）**
 >
@@ -241,37 +248,37 @@ flowchart LR
 sequenceDiagram
     autonumber
     participant Radio as 📡 ESP-NOW HW
-    participant Recv as 🎧 recv_task
-    participant Peer as 🆔 PeerCtx
+    participant Comm as 📦 comm::Receiver
+    participant CB as 🎧 c6 回调<br/>(on_frame/on_command)
     participant W as 📬 Watch
     participant Main as 🎨 main loop
     participant LCD as 🖥 LCD
 
-    loop 常驻监听
-        Radio->>Recv: raw packet
+    loop 常驻监听（run_receive_loop）
+        Radio->>Comm: raw packet
         alt magic=0xC71E, len=25B (Frame)
-            Recv->>Recv: decode_frame + CRC check
-            Recv->>Peer: is_addressed_to(receiver_id)?
-            alt dest_mask 命中
-                Recv->>Recv: seq gap 检测
-                Recv->>W: send(ViewModel)
+            Comm->>Comm: decode_frame + CRC + dest_mask 过滤
+            alt 发给本机（命中 / 未分配 grace）
+                Comm->>CB: on_frame(&frame)
+                CB->>CB: seq gap 检测
+                CB->>W: send(ViewModel)
                 W-->>Main: changed()
                 Main->>LCD: render(vm, Some(prev)) 增量重绘
-            else dest_mask 未命中
-                Recv-->>Recv: filtered_count++
+            else 不是发给本机
+                Comm-->>Comm: 静默丢弃
             end
         else magic=0xCB01, len=24B (Command)
-            Recv->>Recv: decode_command + HMAC 校验
-            Recv->>Peer: check_replay(seq)
+            Comm->>Comm: decode_command + HMAC 校验
             alt Announce
-                Recv->>Radio: 广播 AnnounceReply
+                Comm->>Radio: 广播 AnnounceReply
             else AssignId (mac==own)
-                Recv->>Peer: assign(receiver_id)
-            else 其它
-                Recv-->>Recv: 静默忽略
+                Comm->>Comm: 写 MY_ID
+            else 业务命令
+                Comm->>Comm: 抗重放 check
+                Comm->>CB: on_command(&cmd) → NoReply
             end
         else 其它 magic/长度
-            Recv-->>Recv: 静默丢弃
+            Comm-->>Comm: 静默丢弃
         end
     end
 
@@ -289,7 +296,7 @@ sequenceDiagram
 | 1️⃣ | 🧠 `HEAP` | `Vec::with_capacity(512)` 分配是否成功 | `alloc<512B` |
 | 2️⃣ | 🖥 `LCD` | 走到 render 阶段即认为 OK | — |
 | 3️⃣ | 💽 `SDCARD` ⚠ | `SdCard::num_bytes` + FAT `open_volume` | `no card` / `no FAT` |
-| 4️⃣ | 🔐 `CODEC` | `encode_frame → decode_frame` 环回<br/>（间接验证 CRC / HMAC / 密钥） | `decode err` |
+| 4️⃣ | 🔐 `CODEC` | `encode_frame → decode_frame` 环回<br/>（**仅** Frame CRC/编解码对称；HMAC/密钥不在此项） | `decode err` |
 | 5️⃣ | 📡 `WIFI` | `esp_radio::wifi::new` 返回值 | `init err` |
 | 6️⃣ | 📻 `ESPNOW` | `interfaces.esp_now.split()` | — |
 | 7️⃣ | 📬 `WATCH` | `Watch::receiver()` 能拿到订阅槽位 | `no slot` |

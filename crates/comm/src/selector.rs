@@ -1,11 +1,27 @@
-//! # Selector —— 目标 receiver 双状态选择器
+//! # Selector —— 目标 receiver 双状态选择器（**UI 侧状态助手**）
 //!
 //! ## 双状态设计
-//! - `pending`：**用户正在编辑**的选择（UI 层可能一直在改，不影响真实发送）
-//! - `active`：**当前真正生效**的选择（`Notifier::send` 会用这个 mask）
+//! - `pending`：**用户正在编辑**的选择（UI 层可能一直在改，不影响 `active`）
+//! - `active`：**已提交生效**的选择（`dest_mask` 位图的当前值）
 //!
-//! 用户按下"确认"时 [`commit`](Self::commit) 把 `pending` 拷贝到 `active`；
-//! 按下"取消" [`cancel`](Self::cancel) 把 `pending` 恢复成 `active`。
+//! 用户按下"确认"时 `commit` 把 `pending` 拷贝到 `active`；
+//! 按下"取消" `cancel` 把 `pending` 恢复成 `active`。
+//!
+//! ## 它与发送路径的关系（**重要：不是自动耦合**）
+//! `Selector` 只是一个**位图状态容器**——comm 的发送路径
+//! （[`Notifier::send_frame`](crate::Notifier::send_frame) → `run_broadcast_loop`）
+//! 读取的是**每条 `Frame` 自带的 `dest_mask`**，**不会**自动去读
+//! `Selector::active()`。换言之：
+//!
+//! - 调用方负责把 `selector.active()` 读出来、填进要发送的
+//!   [`Frame`](protocol::Frame)（例如 `Frame::with_dest(seq, state, selector.active())`）。
+//! - [`Notifier::select_targets`](crate::Notifier::select_targets) 只是
+//!   `selector.set_active(mask)` 的转发；它改的是这个容器的值，不改变任何正在
+//!   飞行的帧。
+//!
+//! 因此本类型是**可选的便利件**：应用若已有自己的目标选择状态机（如 controller 的
+//! `ui::selector`），完全可以不挂 comm 的 `Selector`，直接算好 `dest_mask` 写进
+//! `Frame` 即可。
 //!
 //! ## 与 [`PeerRegistry`](crate::PeerRegistry) 的关系
 //! - `PeerRegistry` 决定 "**能选的**"（发现到的 peer 列表）
@@ -30,10 +46,10 @@ pub const DEST_MASK_NONE: DestMask = 0;
 /// 双状态目标选择器
 ///
 /// # 语义
-/// | 状态       | 语义                                               |
-/// |------------|----------------------------------------------------|
-/// | `active`   | Frame 发送时使用的 mask                             |
-/// | `pending`  | UI 层正在编辑的 mask；`commit()` 前不影响 `active`   |
+/// | 状态       | 语义                                                         |
+/// |------------|--------------------------------------------------------------|
+/// | `active`   | 已提交的 mask；调用方据此填入 `Frame::dest_mask`（非自动）    |
+/// | `pending`  | UI 层正在编辑的 mask；`commit()` 前不影响 `active`            |
 pub struct Selector {
   pending: AtomicU32,
   active: AtomicU32,
@@ -86,7 +102,7 @@ impl Selector {
 
   // ---- active 操作 ----
 
-  /// 读取 active mask（Notifier 发送时用这个）
+  /// 读取 active mask（调用方据此填入待发送 `Frame` 的 `dest_mask`）
   #[must_use]
   pub fn active(&self) -> DestMask {
     self.active.load(Ordering::Relaxed)

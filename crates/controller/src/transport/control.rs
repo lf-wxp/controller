@@ -8,7 +8,7 @@
 //!      在完成 decode + 抗重放 + AnnounceReply 分派后回调
 //! 3. **命令执行核心** [`execute_command`]：两条通路共用；根据 [`CommandBody`] 分派到
 //!    对应副作用（LED / Toast / 灵敏度 / 电池模式 / Nop），返回 `Result<(), ErrorCode>`
-//! 4. **BLE 侧 Ack 广播** [`broadcast_response`]：把 Ack 写入 BLE + ESP-NOW 双 Signal
+//! 4. **BLE 侧 Ack 广播** [`broadcast_response`]：把 Ack 写入 BLE + ESP-NOW 两条有界队列
 //!
 //! ## 两条通路的分工
 //! ```text
@@ -21,6 +21,7 @@
 //!
 //!  ESP-NOW ─► [comm 内部完成 decode / replay / AnnounceReply upsert]
 //!             └─► dispatch_command_from_esp_now(src, &cmd)
+//!                  ├─ maybe_persist_replay
 //!                  ├─ execute_command
 //!                  ├─ AUTO_ACK ? ble_hid::signal_response(BLE 补一发 Ack)
 //!                  └─ 返回 CommandOutcome → comm 自动发 ESP-NOW Ack
@@ -66,8 +67,9 @@ pub const SENSITIVITY_MAX: u16 = 1000;
 
 /// **U 选项**：抗重放窗口落盘触发间隔
 ///
-/// [`dispatch_command_from_ble`] 每 N 条命令 anti-replay 通过后触发一次
-/// [`crate::hal::persist::mark_replay_dirty`]，避免高频命令磨损 flash。
+/// 两条命令通路（[`dispatch_command_from_ble`] / [`dispatch_command_from_esp_now`]）
+/// 每 N 条命令 anti-replay 通过后触发一次 [`crate::hal::persist::mark_replay_dirty`]，
+/// 避免高频命令磨损 flash。
 pub const REPLAY_PERSIST_INTERVAL: u32 = 100;
 
 /// 抗重放滑动窗口（K2 + O 选项：per-key-id）
@@ -186,15 +188,23 @@ pub fn dispatch_command_from_ble(raw: &[u8]) {
 /// - `Announce` / `AssignId` 在 comm 上游已被拦截并自动处理，不会到达此函数
 ///
 /// # 与 BLE 侧的差异
-/// - **不做 decode / replay**：comm 已完成
-/// - **不做 flash 落盘**：只有 BLE 通道触发 `maybe_persist_replay`；
-///   ESP-NOW 通道的 replay 推进会在下一次 BLE 命令到达时随之落盘
+/// - **不做 decode / replay 校验**：comm 已完成（`REPLAY.check` 在调用本 handler 前）
+/// - **flash 落盘**：与 BLE 通道一样调用 `maybe_persist_replay`（节流），确保 ESP-NOW
+///   为主的部署重启后也能从掉电点继续拒绝重放，不依赖"下一条 BLE 命令"才落盘
 /// - **Ack 分工**：BLE Ack 由本函数手写 `ble_hid::signal_response(...)`；
 ///   ESP-NOW Ack 由本函数返回 [`CommOutcome`] 让 comm 自动广播
 ///
 /// [`CommOutcome`]: comm::CommandOutcome
 pub fn dispatch_command_from_esp_now(src: CommandSource, cmd: &Command) -> comm::CommandOutcome {
   touch_host_heartbeat();
+
+  // 抗重放窗口已由 comm 的 run_receive_loop 在调用本 handler 之前推进（REPLAY.check
+  // 通过才会到这里），但落盘此前只有 BLE 通路会触发。若部署以 ESP-NOW 为主（甚至无
+  // BLE），重启后窗口会回退到上一次 BLE 命令的快照点，给了攻击者重放旧命令的窗口。
+  // 这里补一次与 BLE 同款的**节流**落盘：REPLAY_PERSIST_INTERVAL + CAS 双重保证不会
+  // 每条命令都写 flash，磨损可控。
+  maybe_persist_replay(cmd.key_id);
+
   let result = execute_command(src, cmd);
 
   if !AUTO_ACK.load(Ordering::Relaxed) {
@@ -383,20 +393,20 @@ fn mark_persist_dirty() {
 
 /// 双链路广播一条 [`CommandResponse`]（N 选项）
 ///
-/// 同时写入 ESP-NOW 与 BLE 两个 Signal —— 两边链路彼此解耦，任一链路断开时
-/// 另一链路仍能正常送达。
+/// 同时写入 ESP-NOW 与 BLE 两条**有界 Response 队列** —— 两边链路彼此解耦，
+/// 任一链路断开时另一链路仍能正常送达。
 ///
 /// # 使用者
 /// - [`dispatch_command_from_ble`]：BLE 侧 AUTO_ACK 通路
 /// - 未来需要"主动通知 Host"的场景（如电池低电告警）也应走此入口
 ///
-/// # 覆盖观测
-/// 直接写 [`esp_now::RESP_SIG`] 前先检查 `signaled()` 判断是否发生覆盖，
-/// 递增 [`crate::metrics::record_response_overwrite`]。
+/// # 丢弃观测（两条链路统一计数，单一口径）
+/// 两条链路的出站 Response 现在**同型**——都是 comm 的有界队列，均走 comm 统一入队
+/// 助手 [`comm::notifier::signals::enqueue_response`]，满队丢弃统一计入
+/// [`comm::metrics::dropped_responses`]：
+/// - **ESP-NOW**：直接入 [`esp_now::RESP_SIG`]。
+/// - **BLE**：经 [`ble_hid::signal_response`] 入 BLE 侧队列（内部同样走 comm 入队助手）。
 pub fn broadcast_response(resp: CommandResponse) {
-  if esp_now::RESP_SIG.signaled() {
-    crate::metrics::record_response_overwrite();
-  }
-  esp_now::RESP_SIG.signal(resp);
+  comm::notifier::signals::enqueue_response(&esp_now::RESP_SIG, resp);
   ble_hid::signal_response(resp);
 }

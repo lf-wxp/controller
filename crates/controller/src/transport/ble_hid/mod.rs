@@ -36,6 +36,8 @@ use embassy_sync::signal::Signal;
 use esp_radio::ble::controller::BleConnector;
 use trouble_host::prelude::*;
 
+use comm::notifier::signals::{ResponseChannel, enqueue_response};
+
 use self::report::encode_report;
 use self::service::{CONNECTIONS_MAX, L2CAP_CHANNELS_MAX, Server};
 use crate::protocol::{CommandResponse, Frame, encode_frame, encode_response};
@@ -69,39 +71,33 @@ pub type EspBleController<'d> = ExternalController<BleConnector<'d>, ESP_RADIO_B
 /// esp-hal + esp-rtos 已提供 `critical-section` 实现。
 pub type FrameSignal = Signal<CriticalSectionRawMutex, Frame>;
 
-/// 命令响应共享通道（N 选项）
+/// 全局 Response 出站队列（handler → BLE broadcast task）
 ///
-/// 当 [`crate::transport::control::handle_command`] 产生 Ack / Error /
-/// NonceHello 等 [`CommandResponse`] 时，会同时写入本 Signal 与
-/// [`crate::transport::esp_now::RESP_SIG`]，实现两链路对等的反馈。
-///
-/// # 为什么采用覆盖式？
-/// - 高频命令场景下若 Response 堆积会造成流量放大
-/// - 覆盖式保证每次最多 notify 一条最新 Response —— 心跳/连接性场景足够
-pub type ResponseSignal = Signal<CriticalSectionRawMutex, CommandResponse>;
-
-/// 全局 Response 通道（handler → BLE broadcast task）
-///
-/// 与 [`crate::transport::esp_now::RESP_SIG`] 平行存在：
-/// - Command handler 同时写入两个 signal（[`crate::transport::control::broadcast_response`]）
-/// - BLE task 仅订阅本 signal；ESP-NOW task 仅订阅自己那一个
+/// 与 [`crate::transport::esp_now::RESP_SIG`] 平行存在，且**同型**（均为 comm 的
+/// 有界 [`ResponseChannel`]）：
+/// - Command handler 同时写入两条队列（[`crate::transport::control::broadcast_response`]）
+/// - BLE task 仅消费本队列；ESP-NOW task 仅消费自己那一条
 /// - 互不影响，双链路各自可靠发送
-pub static RESPONSE_SIGNAL: ResponseSignal = Signal::new();
+///
+/// # 为什么从覆盖式 `Signal` 升级为有界队列
+/// 与 comm 侧 Command / Response 通道升级同源：`Ack` / `AnnounceReply` /
+/// `NonceHello` **每条都重要**，覆盖式会让 tx task 忙于 GATT 事件的瞬间把上一条
+/// 挤掉。改为深度 [`OUTBOUND_QUEUE_DEPTH`](comm::notifier::signals::OUTBOUND_QUEUE_DEPTH)
+/// 的有界 FIFO 后，逐条排队出站；仅当队列真的满（tx 长时间不消费）才丢弃，且丢弃
+/// 统一计入 [`comm::metrics::dropped_responses`]（与 ESP-NOW 侧同一枚计数器）。
+pub static RESPONSE_SIGNAL: ResponseChannel = ResponseChannel::new();
 
 /// 便捷入口：把 [`CommandResponse`] 交给 BLE 后台任务出站
 ///
 /// # 内存与开销
-/// [`CommandResponse`] 实现了 `Copy`，写入 Signal 时是纯值语义，无堆分配。
+/// [`CommandResponse`] 实现了 `Copy`，入队是纯值语义，无堆分配。
 ///
-/// # M-3 观测（Ack 覆盖）
-/// 若 [`RESPONSE_SIGNAL`] 已有一份等待被 tx task 取走的 Response，本次
-/// `signal()` 会**静默覆盖**它 —— 我们通过 [`crate::metrics::record_response_overwrite`]
-/// 埋点计数，便于 dashboard 观察实际发生频率。
+/// # 丢弃观测
+/// 走 comm 统一入队助手 [`enqueue_response`]：队列满时丢弃当前这条并计入
+/// [`comm::metrics::dropped_responses`]，与 ESP-NOW 侧共用同一枚全局计数器
+/// （不再需要 controller 本地的覆盖计数器）。
 pub fn signal_response(resp: CommandResponse) {
-  if RESPONSE_SIGNAL.signaled() {
-    crate::metrics::record_response_overwrite();
-  }
-  RESPONSE_SIGNAL.signal(resp);
+  enqueue_response(&RESPONSE_SIGNAL, resp);
 }
 
 // ============================================================
@@ -288,14 +284,14 @@ async fn advertise_and_serve(
     // 每次新连接重置 last-notified → 首帧强制 notify 一次电量
     LAST_NOTIFIED_BATTERY.store(u8::MAX, Ordering::Relaxed);
 
-    // 每次新连接清一次 signal，避免把旧状态"追发"给新 Host
+    // 每次新连接清一次 frame signal，避免把旧状态"追发"给新 Host
     signal.reset();
-    // Response signal 同样重置：避免把先前会话遗留的 Ack / NonceHello 发给新 Host
-    RESPONSE_SIGNAL.reset();
+    // Response 队列同样清空：避免把先前会话遗留的 Ack / NonceHello 发给新 Host
+    RESPONSE_SIGNAL.clear();
 
     // ---- 已连接：交替处理 GATT 事件 + 主动推送 report + 主动推送 response ----
     loop {
-      match select3(conn.next(), signal.wait(), RESPONSE_SIGNAL.wait()).await {
+      match select3(conn.next(), signal.wait(), RESPONSE_SIGNAL.receive()).await {
         Either3::First(event) => {
           if !handle_gatt_event(server, event).await {
             // false = 断开

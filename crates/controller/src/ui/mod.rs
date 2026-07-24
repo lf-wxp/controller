@@ -94,7 +94,7 @@ pub const TOAST_DURATION_MS: u64 = 3000;
 
 /// 便捷入口：将一段 ASCII 字节推送到屏幕底部显示一下子
 ///
-/// 主要给 [`crate::transport::control::handle_command`] 调用。
+/// 主要给 `control::execute_command` 的 `ShowToast` 分支调用。
 pub fn signal_toast(bytes: &[u8]) {
   TOAST_SIGNAL.signal(Toast::from_slice(bytes));
 }
@@ -134,14 +134,10 @@ pub fn set_battery_level(level: u8) {
   BATTERY_LEVEL.store(level.min(100), Ordering::Relaxed);
 }
 
-/// 便捷 setter：Host 心跳存活标志
-pub fn set_host_heartbeat_alive(alive: bool) {
-  HOST_HEARTBEAT_ALIVE.store(alive, Ordering::Relaxed);
-}
-
 /// 发现可用心跳时调用：拍一下时间戳，并设置 alive = true
 ///
-/// 由 [`crate::transport::control::handle_command`] 在每次成功处理命令后调用。
+/// 由 `control::dispatch_command_from_ble` / `control::dispatch_command_from_esp_now`
+/// 两条命令通路在收到命令后调用。
 pub fn touch_host_heartbeat() {
   let now_ms = embassy_time::Instant::now().as_millis() as u32;
   LAST_HEARTBEAT_TICK_MS.store(now_ms, Ordering::Relaxed);
