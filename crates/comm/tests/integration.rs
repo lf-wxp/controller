@@ -35,6 +35,47 @@ const MAC_A: [u8; 6] = [0xAA; 6];
 const MAC_B: [u8; 6] = [0xBB; 6];
 
 // ============================================================
+// 进程级测试锁：隔离"改写全局 SESSION_NONCE 的测试"与"依赖 HMAC 的测试"
+// ============================================================
+//
+// # 背景（既有测试基建的并发缺陷）
+// `protocol::SESSION_NONCE` 是**进程级全局**（`static AtomicU32`），HMAC 的
+// 计算与校验都会读它（`compute_hmac_tag` 把 nonce 作为前缀混入）。host 集成
+// 测试里 notifier 与 receiver 跑在同一进程、共享这枚全局 nonce。
+//
+// 默认多线程 harness 下，`receiver_adopts_nonce_from_nonce_hello_broadcast`
+// 会在运行中途改写 SESSION_NONCE；若此刻另一测试正处于"编码命令（用旧 nonce
+// 算 HMAC）"与"接收侧校验（用被改写后的新 nonce 重算 HMAC）"之间，两侧 nonce
+// 不一致 → HMAC 校验失败 → 命令被丢弃 → 该测试超时/断言失败 → 偶发 flaky。
+// （单线程 `--test-threads=1` 不会触发，因为测试串行执行。）
+//
+// # 修复：读写锁把"改写者"与"HMAC 依赖者"互斥
+// - 改写 nonce 的测试取**写锁**（独占，运行期间不允许任何 HMAC 测试并发）。
+// - 依赖 HMAC 校验（Announce/AssignId 握手、命令、Response 上报）的测试取
+//   **读锁**：彼此之间仍可并行（互不改写 nonce，只要 nonce 在单个测试内保持
+//   稳定，HMAC 两侧就一致），但与改写者互斥。
+// - 纯 Frame 测试（只有 CRC、无 HMAC，见测试 5/8/11/12）不读 nonce，无需上锁，
+//   保持完全并行。
+static SESSION_NONCE_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// 依赖 HMAC 校验的测试在函数开头调用，取读锁并持有到函数结束。
+///
+/// 用 `unwrap_or_else(PoisonError::into_inner)` 忽略锁中毒：某个测试 panic
+/// 只是让整轮 `cargo test` 失败，不应让后续测试因锁中毒而 panic 掩盖真实断言。
+fn hmac_test_guard() -> std::sync::RwLockReadGuard<'static, ()> {
+  SESSION_NONCE_LOCK
+    .read()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 改写全局 nonce 的测试在函数开头调用，取写锁（独占）并持有到函数结束。
+fn nonce_mutator_guard() -> std::sync::RwLockWriteGuard<'static, ()> {
+  SESSION_NONCE_LOCK
+    .write()
+    .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// ============================================================
 // fixture：所有 `'static` 状态一次性 leak 出来
 // ============================================================
 
@@ -111,13 +152,14 @@ fn spawn_all_loops(
   let ns_frame = ns.frame_sig;
   let ns_cmd = ns.cmd_sig;
   let ns_resp = ns.resp_sig;
+  let ns_peers = ns.peers;
   spawner
     .spawn_local(async move {
-      run_broadcast_loop(a_send, ns_frame, ns_cmd, ns_resp).await;
+      // Notifier 侧传 Some(&PEERS)：单目标 Frame 自动单播
+      run_broadcast_loop(a_send, Some(ns_peers), ns_frame, ns_cmd, ns_resp).await;
     })
     .expect("spawn notifier broadcast_loop");
 
-  let ns_peers = ns.peers;
   let ns_keyring = ns.keyring;
   let ns_replay = ns.replay;
   spawner
@@ -143,8 +185,9 @@ fn spawn_all_loops(
   spawner
     .spawn_local(async move {
       // 复用与 Notifier 相同的 run_broadcast_loop：三路 select（Frame/Response/Command）
-      // 已涵盖 receiver 主动 report / send_frame / send_command 的出站需求
-      run_broadcast_loop(b_send, rs_frame, rs_cmd, rs_resp).await;
+      // 已涵盖 receiver 主动 report / send_frame / send_command 的出站需求。
+      // Receiver 无 PeerRegistry → 传 None → Frame 恒广播。
+      run_broadcast_loop(b_send, None, rs_frame, rs_cmd, rs_resp).await;
     })
     .expect("spawn receiver broadcast_loop");
 
@@ -187,6 +230,7 @@ async fn wait_for(mut cond: impl FnMut() -> bool, max_iters: usize) {
 
 #[test]
 fn discovery_and_assign_id_flow() {
+  let _nonce_guard = hmac_test_guard();
   let ns = NotifierState::leak();
   let rs = ReceiverState::leak();
   let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
@@ -235,6 +279,7 @@ static HANDLER_LAST_COUNT: AtomicU32 = AtomicU32::new(0);
 
 #[test]
 fn command_flow_triggers_handler_and_returns_ack() {
+  let _nonce_guard = hmac_test_guard();
   HANDLER_INVOCATIONS.store(0, Ordering::Relaxed);
   HANDLER_LAST_COUNT.store(0, Ordering::Relaxed);
 
@@ -289,6 +334,7 @@ static REPLAY_HANDLER_INVOCATIONS: AtomicU32 = AtomicU32::new(0);
 
 #[test]
 fn anti_replay_rejects_duplicate_seq() {
+  let _nonce_guard = hmac_test_guard();
   REPLAY_HANDLER_INVOCATIONS.store(0, Ordering::Relaxed);
 
   let ns = NotifierState::leak();
@@ -350,6 +396,7 @@ fn anti_replay_rejects_duplicate_seq() {
 
 #[test]
 fn selector_reflects_discovered_peer() {
+  let _nonce_guard = hmac_test_guard();
   let ns = NotifierState::leak();
   let rs = ReceiverState::leak();
   let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
@@ -453,6 +500,8 @@ static FRAME_FILTER_INVOCATIONS: AtomicU32 = AtomicU32::new(0);
 
 #[test]
 fn frame_dest_mask_filters_by_id() {
+  // 本测试先走 Announce/AssignId（HMAC）握手拿 id=0，故需读锁隔离 nonce 改写者。
+  let _nonce_guard = hmac_test_guard();
   FRAME_FILTER_INVOCATIONS.store(0, Ordering::Relaxed);
 
   let ns = NotifierState::leak();
@@ -525,6 +574,8 @@ static REPORT_SAW_ANNOUNCE_REPLY: AtomicBool = AtomicBool::new(false);
 
 #[test]
 fn receiver_report_reaches_notifier() {
+  // 走 discover 握手 + Response 上报，两条路径都依赖 HMAC → 读锁隔离。
+  let _nonce_guard = hmac_test_guard();
   REPORT_HANDLER_INVOCATIONS.store(0, Ordering::Relaxed);
   REPORT_LAST_PERCENT.store(0, Ordering::Relaxed);
   REPORT_SAW_ANNOUNCE_REPLY.store(false, Ordering::Relaxed);
@@ -656,9 +707,10 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
     let ns_frame = ns.frame_sig;
     let ns_cmd = ns.cmd_sig;
     let ns_resp = ns.resp_sig;
+    let ns_peers = ns.peers;
     spawner
       .spawn_local(async move {
-        run_broadcast_loop(a_send, ns_frame, ns_cmd, ns_resp).await;
+        run_broadcast_loop(a_send, Some(ns_peers), ns_frame, ns_cmd, ns_resp).await;
       })
       .expect("spawn notifier broadcast_loop");
   }
@@ -703,7 +755,7 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
     let rs_resp = rs.resp_sig;
     spawner
       .spawn_local(async move {
-        run_broadcast_loop(b_send, rs_frame, rs_cmd, rs_resp).await;
+        run_broadcast_loop(b_send, None, rs_frame, rs_cmd, rs_resp).await;
       })
       .expect("spawn receiver broadcast_loop");
   }
@@ -772,6 +824,7 @@ fn receiver_send_frame_reaches_notifier_dual_role() {
 
 #[test]
 fn assign_id_resends_on_updated_and_self_heals() {
+  let _nonce_guard = hmac_test_guard();
   let ns = NotifierState::leak();
   let rs = ReceiverState::leak();
   let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
@@ -844,6 +897,10 @@ fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
   const START_NONCE: u32 = 0x1111_1111;
   const BROADCAST_NONCE: u32 = 0x2222_2222;
 
+  // 本测试改写进程级全局 SESSION_NONCE，取写锁独占，避免与依赖 HMAC 的测试并发
+  // （否则会在它们"编码"与"校验"之间篡改 nonce，导致偶发 HMAC 校验失败）。
+  let _nonce_guard = nonce_mutator_guard();
+
   // 先把全局 nonce 置成一个与广播值不同的初值。
   init_session_nonce(START_NONCE);
   assert_eq!(session_nonce(), START_NONCE);
@@ -870,6 +927,156 @@ fn receiver_adopts_nonce_from_nonce_hello_broadcast() {
     session_nonce(),
     BROADCAST_NONCE,
     "receiver 的 dispatch 应免鉴权采纳 NonceHello 里的 nonce"
+  );
+}
+
+// ============================================================
+// 测试 11：单目标 Frame → 自动单播仍送达（dest_mask 随帧携带，receiver 过滤通过）
+// ============================================================
+//
+// 覆盖新增的"Frame 自动寻址"：notifier.peers 记录了目标 MAC 后，dest_mask
+// 恰好选中单个 receiver 的 Frame 会被 run_broadcast_loop 升级为单播。
+//
+// # 为什么不走 discover 握手
+// Frame 只有 CRC、**无 HMAC**，因此本测试直接把 peer 塞进 registry、把 receiver
+// 的 my_id 写死，绕开 Announce/AssignId（那条通路依赖进程级全局 SESSION_NONCE，
+// 与 test 10 并行时会互相踩踏——那是既有测试基建的独立问题，见文末报告）。
+// 这样本测试对并行顺序不敏感、可确定性通过。
+//
+// # loopback 无法区分单播 vs 广播的说明
+// LoopbackSendEnd::send 忽略 `dst`，无论广播地址还是单播 MAC 都投递给配对端；
+// 因此本集成测试**无法**在路由层面断言"确实走了单播地址"。这里断言的是
+// **行为正确性**：单播路径下帧仍携带原 dest_mask，故 receiver 的 dest_mask
+// 过滤（本机 id=0，bit0 置位）依然放行、payload 完整送达。单播 vs 广播的
+// **决策逻辑**由 `notifier::tests::*`（frame_dest 纯函数单测）直接覆盖。
+
+static AUTO_UNICAST_FRAME_INVOCATIONS: AtomicU32 = AtomicU32::new(0);
+static AUTO_UNICAST_FRAME_BUTTONS: AtomicU32 = AtomicU32::new(0);
+
+#[test]
+fn single_target_frame_auto_unicasts_and_delivers() {
+  use embassy_time::Instant;
+
+  AUTO_UNICAST_FRAME_INVOCATIONS.store(0, Ordering::Relaxed);
+  AUTO_UNICAST_FRAME_BUTTONS.store(0, Ordering::Relaxed);
+
+  let ns = NotifierState::leak();
+  let rs = ReceiverState::leak();
+  let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
+
+  // 直接登记 peer（MAC_B → receiver_id=0）作为单播反查前提，并把 receiver 的 my_id
+  // 写成 0，跳过 HMAC 依赖的 discover 握手。
+  let _ = ns.peers.upsert(MAC_B, *b"led", -20, Instant::from_ticks(0));
+  rs.my_id.store(0, Ordering::Relaxed);
+
+  let mut pool = LocalPool::new();
+  let cmd_handler: fn(CommandSource, &comm::Command) -> CommandOutcome =
+    |_src, _cmd| CommandOutcome::Ok;
+  let frame_handler: FrameHandler = |_src, frame| {
+    AUTO_UNICAST_FRAME_BUTTONS.store(u32::from(frame.payload.buttons), Ordering::Relaxed);
+    AUTO_UNICAST_FRAME_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+  };
+  spawn_all_loops(
+    &pool,
+    &ns,
+    &rs,
+    a_send,
+    a_recv,
+    b_send,
+    b_recv,
+    cmd_handler,
+    Some(frame_handler),
+    None,
+  );
+
+  pool.run_until(async move {
+    // dest_mask 恰好选中 receiver_id=0 → run_broadcast_loop 自动单播到 MAC_B
+    let mut state = GamepadState::EMPTY;
+    state.buttons = 0x1234;
+    let frame = Frame::with_dest(1, state, 1u32 << 0);
+    ns.frame_sig.signal(frame);
+
+    wait_for(
+      || AUTO_UNICAST_FRAME_INVOCATIONS.load(Ordering::Relaxed) >= 1,
+      10_000,
+    )
+    .await;
+  });
+
+  assert_eq!(
+    AUTO_UNICAST_FRAME_INVOCATIONS.load(Ordering::Relaxed),
+    1,
+    "单目标 Frame 经自动单播后仍应送达目标 peer"
+  );
+  assert_eq!(
+    AUTO_UNICAST_FRAME_BUTTONS.load(Ordering::Relaxed),
+    0x1234,
+    "单播帧应携带完整 payload，且 dest_mask 使 receiver 过滤放行"
+  );
+}
+
+// ============================================================
+// 测试 12：多目标 Frame → 广播路径仍送达
+// ============================================================
+//
+// dest_mask 同时选中 bit0 + bit1（≥2 目标）时，run_broadcast_loop 不做 fan-out，
+// 保持广播；本机 id=0 被寻址 → frame_handler 仍应触发。
+
+static MULTI_TARGET_FRAME_INVOCATIONS: AtomicU32 = AtomicU32::new(0);
+
+#[test]
+fn multi_target_frame_broadcasts_and_delivers() {
+  use embassy_time::Instant;
+
+  MULTI_TARGET_FRAME_INVOCATIONS.store(0, Ordering::Relaxed);
+
+  let ns = NotifierState::leak();
+  let rs = ReceiverState::leak();
+  let (a_send, a_recv, b_send, b_recv) = pair(MAC_A, MAC_B);
+
+  // 两个 peer 都已知（MAC_B→0，另一个虚构 MAC→1），但多目标仍应广播、不 fan-out。
+  // 同样跳过 discover 握手（见 single_target 测试注释），确保并行确定性。
+  let _ = ns.peers.upsert(MAC_B, *b"led", -20, Instant::from_ticks(0));
+  let _ = ns
+    .peers
+    .upsert([0xCC; 6], *b"srv", -30, Instant::from_ticks(0));
+  rs.my_id.store(0, Ordering::Relaxed);
+
+  let mut pool = LocalPool::new();
+  let cmd_handler: fn(CommandSource, &comm::Command) -> CommandOutcome =
+    |_src, _cmd| CommandOutcome::Ok;
+  let frame_handler: FrameHandler = |_src, _frame| {
+    MULTI_TARGET_FRAME_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
+  };
+  spawn_all_loops(
+    &pool,
+    &ns,
+    &rs,
+    a_send,
+    a_recv,
+    b_send,
+    b_recv,
+    cmd_handler,
+    Some(frame_handler),
+    None,
+  );
+
+  pool.run_until(async move {
+    // 多目标（bit0 + bit1，两者 MAC 均已知）→ 仍广播；本机 id=0 命中
+    let frame = Frame::with_dest(1, GamepadState::EMPTY, (1u32 << 0) | (1u32 << 1));
+    ns.frame_sig.signal(frame);
+
+    wait_for(
+      || MULTI_TARGET_FRAME_INVOCATIONS.load(Ordering::Relaxed) >= 1,
+      10_000,
+    )
+    .await;
+  });
+
+  assert_eq!(
+    MULTI_TARGET_FRAME_INVOCATIONS.load(Ordering::Relaxed),
+    1,
+    "多目标 Frame 应走广播且送达被寻址的本机"
   );
 }
 

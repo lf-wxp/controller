@@ -93,7 +93,16 @@ impl Transport for EspNowTransport {
 pub async fn esp_now_notifier_broadcast_task(link: EspNowSendLink) -> ! {
   info!("[ESP-NOW] Notifier broadcast task started (target = FF:FF:FF:FF:FF:FF)");
   set_esp_now_ready(true);
-  comm::notifier::run_broadcast_loop(link, &FRAME_SIG, &CMD_OUT_SIG, &RESP_SIG).await
+  // 传入 `Some(&REGISTRY)` 启用 Frame 自动寻址：单目标帧（dest_mask 恰好选中一台
+  // 且其 MAC 已知）会自动升级为单播，其余仍广播。
+  comm::notifier::run_broadcast_loop(
+    link,
+    Some(&crate::REGISTRY),
+    &FRAME_SIG,
+    &CMD_OUT_SIG,
+    &RESP_SIG,
+  )
+  .await
 }
 
 /// 接收 loop —— 解码 / 抗重放 / AnnounceReply 自动 upsert / 自动 AssignId /

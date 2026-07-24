@@ -146,9 +146,11 @@ fn spawn_all_loops(
   let ns_frame = ns.frame_sig;
   let ns_cmd = ns.cmd_sig;
   let ns_resp = ns.resp_sig;
+  let ns_peers = ns.peers;
   spawner
     .spawn_local(async move {
-      run_broadcast_loop(a_send, ns_frame, ns_cmd, ns_resp).await;
+      // Notifier 侧传 Some(&PEERS)：Frame 单目标时自动单播
+      run_broadcast_loop(a_send, Some(ns_peers), ns_frame, ns_cmd, ns_resp).await;
     })
     .expect("spawn notifier broadcast_loop");
 
@@ -170,7 +172,8 @@ fn spawn_all_loops(
   let rs_resp = rs.resp_sig;
   spawner
     .spawn_local(async move {
-      run_broadcast_loop(b_send, rs_frame, rs_cmd, rs_resp).await;
+      // Receiver 端无 PeerRegistry → 传 None → Frame 恒广播
+      run_broadcast_loop(b_send, None, rs_frame, rs_cmd, rs_resp).await;
     })
     .expect("spawn receiver broadcast_loop");
 

@@ -143,10 +143,20 @@ impl<L: CommLink> Notifier<L> {
 
   // ---- 无 link 依赖的同步 API：`&self` 就够，可以在主循环里随便调 ----
 
-  /// 广播状态帧（**主循环入口 #1**）
+  /// 下发状态帧（**主循环入口 #1**）
   ///
   /// 内部把 Frame 塞进 [`FrameSignal`]；`broadcast_loop` 后台任务会取出编码后
   /// 通过 [`CommLink::send`] 发出去。
+  ///
+  /// # 自动单播 / 广播（由 `dest_mask` 派生）
+  /// 出站寻址**不是**本方法决定的，而是 `broadcast_loop`（Notifier 侧传入
+  /// `Some(&PEERS)`）根据帧的 `dest_mask` 自动决策，见 [`run_broadcast_loop`]：
+  /// - `dest_mask` **恰好选中单个** receiver 且其 MAC 已知 → 自动**单播**（ESP-NOW
+  ///   MAC 层 ACK + 有界重试，单点下发更可靠）
+  /// - 其余（0 / 多目标 / 全选 / 单选但 MAC 未知）→ **广播**
+  ///
+  /// 因此调用方只管 `select_targets(mask)` + `send_frame(&frame)`，单目标场景会
+  /// 透明升级为可靠单播，无需任何额外 API。
   ///
   /// # 语义
   /// - 覆盖式：若上一帧还没被消费，本次会覆盖它 —— 高频状态流场景**只关心最新**
@@ -303,18 +313,30 @@ impl<L: CommLink> Notifier<L> {
 /// ```ignore
 /// #[embassy_executor::task]
 /// async fn my_broadcast_task(link: MyLink) -> ! {
-///     comm::notifier::run_broadcast_loop(link, &SIG_FRAME, &SIG_CMD, &SIG_RESP).await
+///     comm::notifier::run_broadcast_loop(link, Some(&PEERS), &SIG_FRAME, &SIG_CMD, &SIG_RESP).await
 /// }
 /// ```
 ///
 /// # 三路 select 语义
 /// 与手柄原 `esp_now_broadcast_task` 保持一致：
-/// 1. `Frame`（高频广播状态）
+/// 1. `Frame`（高频状态流）
 /// 2. `Response`（低频回执，从命令 handler 侧塞入）
 /// 3. `CommandOut`（Announce / 自发 Command）
 ///
 /// 任何一路就绪即取出编码后发出；失败时静默日志（不 panic，避免链路故障
 /// 导致整机 crash）。
+///
+/// # `peers` 参数：Frame 的**自动单播/广播寻址**
+/// - `Some(&PEERS)`（Coordinator/Notifier 侧）：每帧出站前依据其 `dest_mask`
+///   经 [`frame_dest`] 决策——**恰好选中单个**目标且该 `receiver_id` 的 MAC 能从
+///   [`PeerRegistry`] 反查到时，**自动单播**到该 MAC（复用下文命令通路的有界重试）；
+///   其余情况（0 位 / 多位 / 全选 / 单选但 MAC 未知）继续**广播**。
+/// - `None`（Endpoint/Receiver 侧无目录）：`Frame` **恒广播**，行为与历史一致。
+///
+/// 之所以只在"恰好单目标"时单播：`Frame` 是高频状态流，若对多目标 fan-out 成 N 条
+/// 单播会拖垮出站节拍；单播只在确有唯一目标时才划算（ESP-NOW 单播带 MAC 层 ACK +
+/// 重传，对单点下发更可靠）。调用方无需改动——`send_frame(&frame)` + `select_targets(mask)`
+/// 会透明升级为可靠单播。
 ///
 /// # 命令通路的寻址与可靠性（Phase 1）
 /// `CommandOut` 载荷为 [`OutboundCommand`]，可选广播或单播：
@@ -329,6 +351,7 @@ impl<L: CommLink> Notifier<L> {
 /// `Addr = ()` 的 `DummyLink` 不会进本 loop，故不受影响。
 pub async fn run_broadcast_loop<L: CommLink>(
   mut link: L,
+  peers: Option<&'static PeerRegistry>,
   frame_signal: &'static FrameSignal,
   command_signal: &'static CommandOutSignal,
   response_signal: &'static ResponseSignal,
@@ -347,8 +370,16 @@ where
     {
       Either3::First(frame) => {
         let bytes = encode_frame(&frame);
-        // 忽略 send 错误 —— 链路可能暂时不可用；下一帧再试
-        let _ = link.send(L::BROADCAST, &bytes).await;
+        // dest_mask 派生寻址：恰好单目标且 MAC 已知 → 单播；否则广播
+        match frame_dest(frame.dest_mask, peers) {
+          CommandDest::Broadcast => {
+            // 忽略 send 错误 —— 链路可能暂时不可用；下一帧再试
+            let _ = link.send(L::BROADCAST, &bytes).await;
+          }
+          CommandDest::Unicast(mac) => {
+            send_unicast_bounded(&mut link, mac, &bytes).await;
+          }
+        }
       }
       Either3::Second(resp) => {
         let bytes = protocol::encode_response(&resp);
@@ -359,17 +390,55 @@ where
           let _ = link.send(L::BROADCAST, &out.bytes).await;
         }
         CommandDest::Unicast(mac) => {
-          let dst = L::Addr::from(mac);
-          let mut attempt = 0_u8;
-          loop {
-            match link.send(dst, &out.bytes).await {
-              Ok(()) => break,
-              Err(_) if attempt < MAX_UNICAST_SEND_RETRIES => attempt += 1,
-              Err(_) => break, // 放弃：下一轮 AnnounceReply 仍会幂等补发（见 handle_incoming_response）
-            }
-          }
+          send_unicast_bounded(&mut link, mac, &out.bytes).await;
         }
       },
+    }
+  }
+}
+
+/// 依据 `Frame` 的 `dest_mask` 推导出应走广播还是单播（**Frame 自动寻址决策**）。
+///
+/// 抽成纯函数是为了可单测：入参只有 `dest_mask` 与可选的 [`PeerRegistry`]，
+/// 无副作用、无 `.await`。
+///
+/// # 决策规则
+/// | 条件 | 结果 |
+/// |---|---|
+/// | `peers == None`（Endpoint 无目录） | [`CommandDest::Broadcast`] |
+/// | `dest_mask` 恰好 1 个 bit 且该 id 的 MAC 已知 | [`CommandDest::Unicast`]（该 MAC） |
+/// | `dest_mask` 恰好 1 个 bit 但 MAC 未知 | [`CommandDest::Broadcast`] |
+/// | 0 个 bit / ≥2 个 bit / 全选（`u32::MAX`） | [`CommandDest::Broadcast`] |
+///
+/// bit-i ↔ `receiver_id == i`（与 [`Frame::is_addressed_to`](protocol::Frame::is_addressed_to)
+/// 及 [`crate::selector`] 的位映射一致）。
+fn frame_dest(dest_mask: crate::selector::DestMask, peers: Option<&PeerRegistry>) -> CommandDest {
+  // 只有"恰好单目标"才考虑单播；`count_ones()` 排除 0 位 / 多位 / 全选（32 位）。
+  if let Some(peers) = peers
+    && dest_mask.count_ones() == 1
+    && let Some(mac) = peers.lookup_mac_for_id(dest_mask.trailing_zeros() as u8)
+  {
+    return CommandDest::Unicast(mac);
+  }
+  CommandDest::Broadcast
+}
+
+/// 单播发送 + 有界补发：`send` 返回 `Err` 时最多补发 [`MAX_UNICAST_SEND_RETRIES`] 次。
+///
+/// Frame（自动单播）与 Command（[`CommandDest::Unicast`]）两条出站路径共享同一套
+/// 重试逻辑，避免维护双份。放弃后不再阻塞本 loop——高频 Frame / 下一轮 AnnounceReply
+/// 会自然补偿。
+async fn send_unicast_bounded<L: CommLink>(link: &mut L, mac: [u8; 6], bytes: &[u8])
+where
+  L::Addr: From<[u8; 6]>,
+{
+  let dst = L::Addr::from(mac);
+  let mut attempt = 0_u8;
+  loop {
+    match link.send(dst, bytes).await {
+      Ok(()) => break,
+      Err(_) if attempt < MAX_UNICAST_SEND_RETRIES => attempt += 1,
+      Err(_) => break, // 放弃：下一轮 AnnounceReply / 下一帧仍会补发
     }
   }
 }
@@ -536,5 +605,74 @@ fn handle_incoming_response(
         handler(resp);
       }
     }
+  }
+}
+
+// ============================================================
+// 单元测试：Frame 自动寻址决策 helper
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::selector::{DEST_MASK_ALL, DEST_MASK_NONE};
+  use embassy_time::Instant;
+
+  const MAC0: [u8; 6] = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
+  const MAC1: [u8; 6] = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+
+  fn registry_with_two_peers() -> PeerRegistry {
+    let reg = PeerRegistry::new();
+    // 首个入库 → receiver_id 0；次个 → receiver_id 1
+    let _ = reg.upsert(MAC0, *b"led", -20, Instant::from_ticks(0));
+    let _ = reg.upsert(MAC1, *b"srv", -30, Instant::from_ticks(0));
+    reg
+  }
+
+  #[test]
+  fn zero_bits_broadcasts() {
+    let reg = registry_with_two_peers();
+    assert_eq!(
+      frame_dest(DEST_MASK_NONE, Some(&reg)),
+      CommandDest::Broadcast
+    );
+  }
+
+  #[test]
+  fn single_bit_known_mac_unicasts() {
+    let reg = registry_with_two_peers();
+    assert_eq!(frame_dest(1 << 0, Some(&reg)), CommandDest::Unicast(MAC0));
+    assert_eq!(frame_dest(1 << 1, Some(&reg)), CommandDest::Unicast(MAC1));
+  }
+
+  #[test]
+  fn single_bit_unknown_mac_broadcasts() {
+    let reg = registry_with_two_peers();
+    // receiver_id 5 未登记 → 无 MAC → 退回广播
+    assert_eq!(frame_dest(1 << 5, Some(&reg)), CommandDest::Broadcast);
+  }
+
+  #[test]
+  fn multiple_bits_broadcasts() {
+    let reg = registry_with_two_peers();
+    // 两个都已知，但多目标不 fan-out → 广播
+    assert_eq!(frame_dest(0b11, Some(&reg)), CommandDest::Broadcast);
+  }
+
+  #[test]
+  fn all_selected_broadcasts() {
+    let reg = registry_with_two_peers();
+    assert_eq!(
+      frame_dest(DEST_MASK_ALL, Some(&reg)),
+      CommandDest::Broadcast
+    );
+  }
+
+  #[test]
+  fn no_registry_always_broadcasts() {
+    // Endpoint 侧（peers = None）：即使恰好单目标也恒广播
+    assert_eq!(frame_dest(1 << 0, None), CommandDest::Broadcast);
+    assert_eq!(frame_dest(DEST_MASK_ALL, None), CommandDest::Broadcast);
+    assert_eq!(frame_dest(DEST_MASK_NONE, None), CommandDest::Broadcast);
   }
 }

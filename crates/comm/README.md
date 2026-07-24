@@ -207,9 +207,9 @@ let receiver = Receiver::builder()
 
 | 函数 | 作用 |
 |---|---|
-| `notifier::run_broadcast_loop` | 三路 select（Frame + Command + Response） → `CommLink::send` |
+| `notifier::run_broadcast_loop` | 三路 select（Frame + Command + Response） → `CommLink::send`；入参 `peers: Option<&PeerRegistry>`，`Some(&PEERS)` 时 **Frame 按 `dest_mask` 自动单播/广播**（见下文） |
 | `notifier::run_receive_loop` | `CommLink::recv` → 派发（Response upsert peers / 可选 Command 双身份） |
-| `receiver::run_broadcast_loop` | 复用 notifier 侧同名实现（一份代码两处用） |
+| `receiver::run_broadcast_loop` | 复用 notifier 侧同名实现（一份代码两处用）；Endpoint 无目录，wrapper 恒传 `peers = None` → Frame 恒广播，签名保持 4 参不变 |
 | `receiver::run_receive_loop` | `CommLink::recv` → 派发（Announce 自动回 / AssignId 写 `my_id` / 业务 handler） |
 | `notifier::run_nonce_broadcast_loop` | 周期广播 session nonce（K3 密钥派生的组成部分） |
 
@@ -295,6 +295,31 @@ notifier.send_command_to_mac(peer.mac, CommandBody::ShowToast { len, bytes });
 > `CommandOutSignal` 是 embassy `Signal`（后写覆盖前写）。连续 `send_command_to(a)` → `send_command_to(b)` 若快过 `broadcast_loop` 消费，**只有最后一条能出站**。要"发给多台"请分帧节流（每帧一台），或等命令出站通道升级为有界队列后再支持真正的组播。
 
 > **接收端配套**：单播只解决"送到哪台"。receiver 侧仍需在自己的 `command_handler` 里对相应 `CommandBody` 分支写执行逻辑——`comm` 只自动处理 `Announce` / `AssignId`，业务命令默认不执行（返回 `NoReply` 即被忽略）。
+
+### Frame 寻址：由 `dest_mask` 自动派生的单播 / 广播
+
+`Command` 的寻址是**显式**的（`CommandDest`）；而高频状态流 `Frame` 的寻址是**自动**的——`send_frame(&frame)` 的调用方无需改动，`run_broadcast_loop`（Notifier 侧传入 `Some(&PEERS)`）会在每帧出站前依据其 `dest_mask` 决策：
+
+| `dest_mask` 情况 | 出站方式 | 理由 |
+|---|---|---|
+| **恰好选中单个** receiver（1 个 bit）且其 MAC 已在 `PeerRegistry` | **单播**到该 MAC（复用 `MAX_UNICAST_SEND_RETRIES` 有界重试） | ESP-NOW 单播带 MAC 层 ACK + 重传，单点下发更可靠 |
+| 单个 bit 但该 `receiver_id` 的 MAC 未知 | 广播 | 无法反查目标地址，退回广播 |
+| 0 个 bit / ≥2 个 bit / 全选（`u32::MAX`） | 广播 | `Frame` 是高频流，**绝不** fan-out 成 N 条单播（会拖垮出站节拍） |
+
+```rust,ignore
+// 单目标：只选中 receiver_id=2 → send_frame 透明升级为单播（若该 id 的 MAC 已知）
+notifier.select_targets(1 << 2);
+notifier.send_frame(&frame);
+
+// 多目标 / 全选 → 保持广播
+notifier.select_targets(comm::selector::DEST_MASK_ALL);
+notifier.send_frame(&frame);
+```
+
+**要点**：
+- 决策由 `dest_mask` 派生，**不是**新的显式 API，也不是全局开关——`bit-i ↔ receiver_id == i`，与 `Frame::is_addressed_to` / `Selector` 位映射一致。
+- 单播帧**仍携带原 `dest_mask`**，故接收端的 `dest_mask` 过滤（被选中的那台 bit 已置位）照常放行，收发行为不变。
+- Endpoint（Receiver）侧无 `PeerRegistry`，`receiver::run_broadcast_loop` 恒传 `peers = None`，Frame **一律广播**。
 
 ---
 

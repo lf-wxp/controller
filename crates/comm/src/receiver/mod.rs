@@ -58,11 +58,18 @@ use crate::replay::ReplayGuard;
 
 pub use builder::ReceiverBuilder;
 
-/// Receiver 端出站 loop —— 直接复用 [`crate::notifier::run_broadcast_loop`]
+/// Receiver 端出站 loop —— 复用 [`crate::notifier::run_broadcast_loop`] 的三路 select 编排
 ///
 /// # 复用理由
 /// 出站编排逻辑（三路 select：Frame + Response + Command）与 Notifier 完全一致，
-/// 一份实现两处复用（`proj-pub-use-reexport`），避免维护双份 select 树。
+/// 一份实现两处复用（`proj-pub-use-reexport`），避免维护双份 select 树。本函数只是
+/// 一层极薄 wrapper，把 Notifier 侧多出来的 `peers` 参数固定填 `None`。
+///
+/// # 与 Notifier 侧的差异：Frame 无自动单播
+/// Endpoint（Receiver）**没有** [`PeerRegistry`](crate::PeerRegistry)——无目录、无寻址
+/// 决策权（那是 Coordinator 的职责）。因此本 wrapper 恒传 `peers = None`：出站 `Frame`
+/// **一律广播**，不会触发"单目标自动单播"（详见 [`crate::notifier::run_broadcast_loop`]
+/// 的 `peers` 参数说明）。Receiver 的调用方签名保持 4 参不变。
 ///
 /// # 使用示例
 /// ```ignore
@@ -71,7 +78,19 @@ pub use builder::ReceiverBuilder;
 ///     comm::receiver::run_broadcast_loop(link, &FRAME_SIG, &CMD_SIG, &RESP_SIG).await
 /// }
 /// ```
-pub use crate::notifier::run_broadcast_loop;
+pub async fn run_broadcast_loop<L: CommLink>(
+  link: L,
+  frame_signal: &'static FrameSignal,
+  command_signal: &'static CommandOutSignal,
+  response_signal: &'static ResponseSignal,
+) -> !
+where
+  L::Addr: From<[u8; 6]>,
+{
+  // Endpoint 无 PeerRegistry → peers = None → Frame 恒广播
+  crate::notifier::run_broadcast_loop(link, None, frame_signal, command_signal, response_signal)
+    .await
+}
 
 /// receiver 尚未被 controller 分配 id 的哨兵值
 pub const UNASSIGNED_ID: u8 = u8::MAX;
